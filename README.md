@@ -7,7 +7,8 @@ logging out or rebooting.
 `nvidia_uvm` modules and loads the ones installed on disk while the session
 keeps running. Linux unloads a module only when no program has its devices
 open, so `swap.sh` first takes the GPU away from the programs that hold it.
-It stops system services such as `lactd` for the duration. In gnome-shell,
+It stops the GPU monitoring services `lactd`, `nvidia-persistenced` and
+`nvidia-powerd` for the duration, if they run. In gnome-shell,
 Xwayland and every other program not owned by root it replaces every NVIDIA
 file descriptor with `/dev/null` and every NVIDIA device mapping with empty
 memory, through gdb, which holds each program stopped for 0.1 to 2 seconds in
@@ -57,15 +58,24 @@ never sleeps for more than about a second, and each wake keeps a kernel
 worker busy for about 2 seconds. In `performance` and `power-saver` the EC
 does not send query 0x48.
 
-`pr1299.diff` is NVIDIA/open-gpu-kernel-modules pull request #1299 by Lars
-Nieradzik (lars76), head commit 555c98d1. While the GPU is runtime-suspended,
-the patched driver records the notification and delivers one after the GPU
-next resumes. It also stops the function from releasing a power reference it
-failed to take. The patch applies to 595.99.02, 610.57.04, 615.71.09 and
-615.78.08.
+`build.sh` applies the patches in `patches/` in order:
 
-`build.sh` builds Ubuntu's driver package with this patch, and `swap.sh`
-loads the result into the running system.
+- `0001` is NVIDIA/open-gpu-kernel-modules pull request #1299 by Lars
+  Nieradzik (lars76), head commit 555c98d1, unchanged. While the GPU is
+  runtime-suspended, the patched driver records the notification and
+  delivers one after the GPU next resumes. It also stops the function from
+  releasing a power reference it failed to take.
+- `0002` makes the deferral apply only when the driver runs fine-grained
+  runtime power management (`NVreg_DynamicPowerManagement=2`, as here). The
+  PR's new helper takes the dynamic-power mutex unconditionally, but the
+  driver leaves that mutex NULL and turns power management off when
+  creating it fails, so a notification would dereference NULL; and in
+  coarse mode the original path never resumes the GPU for a notification,
+  so there is nothing to defer.
+
+Both apply to 595.99.02, 610.57.04, 615.71.09 and 615.78.08. `build.sh`
+builds Ubuntu's driver package with them, and `swap.sh` loads the result
+into the running system.
 
 Result on 2026-11-01, driver 595.99.02, `balanced`, after the live swap: the
 EC raised query 0x48 every 6.97 seconds, each notification took 10 to 41
@@ -77,23 +87,33 @@ and the GPU slept for less than a second in every 28.
 
 - `swap.sh [--check]`, as root: the live swap described above. Before any
   change it sorts the processes holding the GPU: holders of the display
-  device stop the swap, root processes inside a systemd system service have
-  their service stopped and started again afterwards, other root processes
-  stop the swap, and processes not owned by root have their handles revoked. During
-  the swap it hides NVIDIA's EGL and Vulkan registration files, so that a
-  program started meanwhile does not open the GPU. If the GPU is still held
-  after the revokes, it restores everything and stops before unloading.
+  device stop the swap; root processes in `lactd`,
+  `nvidia-persistenced` or `nvidia-powerd`, which only watch or tune the
+  GPU, have their service stopped and started again afterwards; any other
+  root process stops the swap, including one in another service, because
+  stopping that could end someone's work; and processes not owned by root
+  have their handles revoked. A registration file left hidden by an
+  interrupted earlier run also stops it. During the swap it hides NVIDIA's EGL and Vulkan
+  registration files, so that a program started meanwhile does not open the
+  GPU. On any failure or signal it loads again every NVIDIA module that was
+  loaded at the start and no longer is, moves the files back, starts the
+  stopped services and exits with a non-zero status. It logs `END` only
+  when every module it loaded has the build ID of its file on disk and the
+  driver contains the patch.
 - `revoke.py [--dry-run] <pid> <path>...`, as root: replaces one process's
   file descriptors on the given paths with `/dev/null` (its own fd 0) and its
   mappings of them with anonymous memory of the same size and protection.
   gdb stops every thread of the process before the descriptors and mappings
-  are read from `/proc`, and each call's result is checked before the next.
-  It refuses PID 1, processes owned by root and processes whose fd 0 is not
-  `/dev/null`.
+  are read from `/proc`, and scheduler locking keeps the other threads
+  stopped while the injected calls run in one thread; each call's result is
+  checked before the next. The injected calls (`dup2`, `mmap`,
+  `__errno_location`) take no locks, so they cannot wait for a stopped
+  thread. It refuses PID 1, processes owned by root and processes whose
+  fd 0 is not `/dev/null`.
 - `lib.sh`: finds the NVIDIA GPU's PCI address, the first display controller
   with NVIDIA's vendor ID.
 - `build.sh [version]`, as root: clones NVIDIA's tag of the version, applies
-  the patch, builds the driver core and installs it in place of the
+  the patches in `patches/`, builds the driver core and installs it in place of the
   precompiled copy in Ubuntu's DKMS source,
   `/usr/src/nvidia-<version>/nvidia/nv-kernel.o_binary`. A dpkg diversion
   keeps Ubuntu's copy as `nv-kernel.o_binary.ubuntu`. It then rebuilds and
@@ -101,9 +121,20 @@ and the GPU slept for less than a second in every 28.
   checks that each installed `nvidia.ko` contains the patch, and exits 1 if
   a kernel had to be skipped for lack of headers. It refuses when Ubuntu's
   kernel-module source differs from NVIDIA's tag.
-- `trace.sh`, as root: watches for 60 seconds the EC queries, the duration
-  of each NVPCF notification in the driver and the GPU's runtime power
-  state. Run it in `balanced`.
+- `trace.sh [seconds]`, as root: watches, for 60 seconds by default, the EC
+  queries, the duration of each NVPCF notification in the driver and the
+  GPU's runtime power state. Run it in `balanced`. The function trace runs
+  in a private tracing instance, and only the EC driver's debug lines that
+  were off get turned on; on exit, including on a signal, the instance is
+  removed and those lines are turned off again.
+- `tests/check_swap.py`: runs `swap.sh` against mocked commands and a fake
+  sysfs, `/proc` and registration-file tree, through refusals, a full swap,
+  a GPU numbered card1/renderD128, every failure path and signals at three
+  points. Needs no root.
+- `tests/check_revoke.py` and `tests/check_trace.py`, as root: run
+  `revoke.py` against a throwaway two-thread process owned by `nobody`, and
+  check that `trace.sh` leaves the tracing and debug settings as it found
+  them, after a normal run and after SIGTERM.
 
 ## After an NVIDIA driver update
 
@@ -119,5 +150,6 @@ restore Ubuntu's copy, so that the package removes its files cleanly:
     rm /usr/src/nvidia-<version>/nvidia/nv-kernel.o_binary
     dpkg-divert --rename --remove /usr/src/nvidia-<version>/nvidia/nv-kernel.o_binary
 
-The same two commands, followed by `dkms build` and `dkms install --force`
-for each kernel, undo the patch.
+The same two commands, followed by `dkms build --force` and
+`dkms install --force` for each kernel, undo the patch. Without `--force`,
+`dkms build` skips a kernel whose modules are already built.

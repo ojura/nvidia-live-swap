@@ -11,12 +11,17 @@
 # place with anonymous zeroed memory of the same size and protection, so code
 # that still holds a pointer into it reads zeros instead of faulting.
 #
-# The replacement runs inside gdb, which stops every thread of the process
-# when it attaches. The descriptors and mappings are read from /proc only
-# after the attach, so they cannot change between reading and replacing, and
-# each call's result is checked before the next call. If a call fails, the
-# calls before it stay in effect and the script exits 1. gdb loads only
-# libc's symbols, which keeps the stop to about two seconds.
+# The replacement runs inside gdb. Attaching stops every thread of the
+# process, and with scheduler locking on, an injected call runs only the
+# thread gdb selected while the others stay stopped; without it, gdb resumes
+# every thread for the duration of each call. The descriptors and mappings
+# are read from /proc after the attach, so no thread can open, close or map
+# anything between the reading and the last call. The injected calls are
+# dup2, mmap and __errno_location: system-call wrappers and a thread-local
+# read that take no locks, so they cannot wait for a lock held by a stopped
+# thread. Each call's result is checked before the next; if a call fails,
+# the calls before it stay in effect and the script exits 1. gdb loads only
+# libc's symbols, which keeps the stop short.
 #
 # Refuses PID 1, processes whose real user is root, and processes whose fd 0
 # is not /dev/null.
@@ -67,6 +72,10 @@ def inside_gdb(gdb):
     try:
         gdb.execute(f"attach {pid}", to_string=True)
         attached = True
+        gdb.execute("set scheduler-locking on", to_string=True)
+        if gdb.parameter("scheduler-locking") != "on":
+            raise RuntimeError("could not turn scheduler locking on")
+        result["scheduler_locking"] = gdb.parameter("scheduler-locking")
         gdb.execute("sharedlibrary libc.so.6", to_string=True)
         if os.readlink(f"/proc/{pid}/fd/0") != "/dev/null":
             raise RuntimeError("fd 0 is not /dev/null")
@@ -139,7 +148,8 @@ def main():
         print(r.stdout[-3000:], r.stderr[-3000:])
         sys.exit(1)
     res = json.loads(m.group(1))
-    print(f"{pid} {comm}: replaced {len(res['fds'])} descriptors and {len(res['maps'])} mappings")
+    print(f"{pid} {comm}: replaced {len(res['fds'])} descriptors and {len(res['maps'])} mappings"
+          f" (scheduler locking {res.get('scheduler_locking', 'not set')})")
     if res["error"]:
         print(f"{pid} {comm}: stopped at an error: {res['error']}")
         sys.exit(1)

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build NVIDIA's driver core with pr1299.diff and install it through Ubuntu's
-# DKMS package for every kernel that has this driver version.
+# Build NVIDIA's driver core with the patches in patches/ and install it
+# through Ubuntu's DKMS package for every kernel that has this driver version.
 #
 # Ubuntu's nvidia-dkms-<branch>-open builds the kernel modules from source,
 # except for the driver core, which it ships precompiled as
@@ -34,8 +34,11 @@ if [ -n "$differences" ]; then
     exit 1
 fi
 
-echo "== applying pr1299.diff and building the driver core"
-git -C "$work/ogkm" apply "$here/pr1299.diff"
+echo "== applying patches/ and building the driver core"
+for patch in "$here"/patches/*.diff; do
+    git -C "$work/ogkm" apply "$patch"
+    echo "   applied ${patch##*/}"
+done
 make -C "$work/ogkm/src/nvidia" -j"$(nproc)" > "$work/build.log" 2>&1 || { tail -30 "$work/build.log"; exit 1; }
 built=$work/ogkm/src/nvidia/_out/Linux_x86_64/nv-kernel.o
 nm "$built" | grep -q ' RmDeferNvpcfNotifyIfIdle$' || { echo "built object lacks the patch"; exit 1; }
