@@ -21,7 +21,10 @@ kernel 7.0, GNOME 46 on Wayland, NVIDIA open kernel modules 595.99.02) in
 running.
 
 `swap.sh --check` only reads: it reports what holds the GPU and whether a
-swap can go ahead now.
+swap can go ahead now. If it reports display-device holders on an unused
+NVIDIA GPU, run `./reapply-layout.py` as the desktop user, without sudo,
+then repeat `sudo ./swap.sh --check`. The layout helper reapplies the active
+monitor configuration temporarily; it does not change the saved layout.
 
 ## What it costs
 
@@ -34,12 +37,13 @@ swap can go ahead now.
   mutter keeps its display state on it, and systemd-logind and systemd hold
   copies of mutter's descriptor. While the device is held, `swap.sh` exits
   at that check, before its first change. mutter opens the device when it
-  appears and releases it after its next display mode set (in mutter 46.2,
-  `meta_kms_impl_device_notify_modes_set`). The mode set at login released
-  it, so the first swap of the session went through; after a swap mutter
-  holds the new device again. According to the source of Ubuntu's mutter
-  46.2, applying the current display layout again goes through that mode
-  set and releases the device; this has not been tried yet.
+  appears and releases its temporary reference after the next display mode
+  set (`meta_kms_impl_device_notify_modes_set` in mutter 46.2).
+  `reapply-layout.py` triggers that mode set with the current layout. On
+  Ubuntu's mutter 46.2-1ubuntu0.24.04.18, with the built-in screen on Intel,
+  this released the descriptors held by gnome-shell, systemd-logind and
+  PID 1 while keeping the same resolution, refresh rate and scaling. An
+  active display driven by NVIDIA still keeps its device in use.
 - A root process that holds the GPU stops the swap, unless it belongs to
   `lactd`, `nvidia-persistenced` or `nvidia-powerd`.
 - When a swap fails after the revokes, the revoked programs stay without the
@@ -116,6 +120,12 @@ and the GPU slept for less than a second in every 28.
   `__errno_location`) do not take user-space locks, so they cannot wait for
   one held by a stopped thread. It refuses PID 1, processes owned by root
   and processes whose fd 0 is not `/dev/null`.
+- `reapply-layout.py [--check]`, as the desktop user: reconstructs the
+  active monitor configuration from Mutter's `GetCurrentState`, asks
+  Mutter to validate it, then applies it temporarily and checks that the
+  active layout stayed the same. It preserves the active modes, positions,
+  scales, transforms, primary monitor and underscanning. `--check` stops
+  after validation. It uses Ubuntu's `/usr/bin/python3` and `python3-gi`.
 - `lib.sh`: finds the NVIDIA GPU's PCI address, the first display
   controller with NVIDIA's vendor ID.
 - `build.sh [version]`, as root: clones NVIDIA's tag of the version, applies
@@ -150,6 +160,10 @@ and the GPU slept for less than a second in every 28.
   are a failing `dkms status`, a version DKMS lists only as `added`, missing
   headers for the running kernel and for another kernel, a mistyped or
   extra argument, and a full build for two kernels.
+- `tests/check_layout.py`, as an ordinary user: checks reconstruction of
+  current modes, mirrored monitors, underscanning, layout capabilities,
+  D-Bus argument types and invalid inputs. `reapply-layout.py --check`
+  validates the reconstructed configuration against the running Mutter.
 - `tests/check_trace_filter.py`, as an ordinary user: runs `trace.sh`
   against ordinary files in place of the tracing and debug control files,
   with a filter write that fails, and checks that it stops before selecting
