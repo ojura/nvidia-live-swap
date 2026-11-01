@@ -22,10 +22,7 @@ running. Later the same day it moved the same session from 595.99.02 to
 615.71.09 in 6.8 seconds.
 
 `swap.sh --check` only reads: it reports what holds the GPU and whether a
-swap can go ahead now. If it reports display-device holders on an unused
-NVIDIA GPU, run `./reapply-layout.py` as the desktop user, without sudo,
-then repeat `sudo ./swap.sh --check`. The layout helper reapplies the active
-monitor configuration temporarily; it does not change the saved layout.
+swap can go ahead now.
 
 ## What it costs
 
@@ -34,17 +31,21 @@ monitor configuration temporarily; it does not change the saved layout.
   the Intel GPU and keeps working, but gnome-shell cannot drive a monitor on
   the HDMI port, or on the DisplayPort or USB-C port wired to the NVIDIA
   GPU, until the next login, and mutter may crash when one is connected.
-- `swap.sh` never takes away the NVIDIA display device (`/dev/dri/cardN`):
+- `swap.sh` never revokes the NVIDIA display device (`/dev/dri/cardN`):
   mutter keeps its display state on it, and systemd-logind and systemd hold
-  copies of mutter's descriptor. While the device is held, `swap.sh` exits
-  at that check, before its first change. mutter opens the device when it
-  appears and releases its temporary reference after the next display mode
-  set (`meta_kms_impl_device_notify_modes_set` in mutter 46.2).
-  `reapply-layout.py` triggers that mode set with the current layout. On
-  Ubuntu's mutter 46.2-1ubuntu0.24.04.18, with the built-in screen on Intel,
-  this released the descriptors held by gnome-shell, systemd-logind and
-  PID 1 while keeping the same resolution, refresh rate and scaling. An
-  active display driven by NVIDIA still keeps its device in use.
+  copies of mutter's descriptor. mutter opens the device when it appears
+  and releases it after its next display mode set
+  (`meta_kms_impl_device_notify_modes_set` in mutter 46.2). When
+  gnome-shell, systemd-logind and systemd are its only holders, the swap
+  first runs `reapply-layout.py` as gnome-shell's user, which applies the
+  current display layout again and so causes that mode set, and waits up
+  to 10 seconds for the release. On Ubuntu's mutter
+  46.2-1ubuntu0.24.04.18, with the built-in screen on Intel, applying the
+  layout again released the device and kept the same resolution, refresh
+  rate and scaling; through `swap.sh` itself, that step has run only in the
+  mocked tests so far. Another holder of the device, a monitor connected to
+  the NVIDIA GPU, or a release that does not come stops the swap before it
+  hides files, stops services or revokes handles.
 - A root process that holds the GPU stops the swap, unless it belongs to
   `lactd`, `nvidia-persistenced` or `nvidia-powerd`.
 - When a swap fails after the revokes, the revoked programs stay without the
@@ -61,8 +62,7 @@ monitor configuration temporarily; it does not change the saved layout.
 This order moved the running session from 595.99.02 to 615.71.09 on
 2026-11-01:
 
-1. `sudo ./swap.sh --check`. If it reports holders of the display device,
-   run `./reapply-layout.py` and check again.
+1. `sudo ./swap.sh --check`.
 2. Restore Ubuntu's driver core of the installed version and remove its
    diversion, with the two commands under "After an NVIDIA driver update"
    below, so that apt removes the old package cleanly.
@@ -128,8 +128,9 @@ in every 28.
 ## Files
 
 - `swap.sh [--check]`, as root: the live swap described above. It rejects
-  any other argument. Before its first change it sorts the processes
-  holding the GPU: holders of the display device stop the swap; root
+  any other argument. It first sorts the processes holding the GPU:
+  mutter's hold on the display device is released as described above, and
+  any other holder of it stops the swap; root
   processes in `lactd`, `nvidia-persistenced` or `nvidia-powerd`, which
   only watch or tune the GPU, have their service stopped and started again
   afterwards; any other root process stops the swap, including one in
@@ -160,6 +161,8 @@ in every 28.
   active layout stayed the same. It preserves the active modes, positions,
   scales, transforms, primary monitor and underscanning. `--check` stops
   after validation. It uses Ubuntu's `/usr/bin/python3` and `python3-gi`.
+  `swap.sh` runs it as gnome-shell's user, on gnome-shell's session bus,
+  when mutter holds the display device; it also runs on its own.
 - `lib.sh`: finds the NVIDIA GPU's PCI address, the first display
   controller with NVIDIA's vendor ID.
 - `build.sh [version]`, as root: clones NVIDIA's tag of the version, applies
@@ -184,11 +187,15 @@ in every 28.
   removed.
 - `tests/check_swap.py`, as an ordinary user: runs `swap.sh` against mocked
   commands and a fake sysfs, `/proc` and registration-file tree. The cases
-  are the refusals (display device held, root holders, an unlisted service,
-  a leftover hidden file, a mistyped or extra argument), `--check`, a full
-  swap, a GPU numbered card1/renderD128, failures to hide a file, revoke,
-  unload and load, a missing patch, a mismatched build ID, and SIGTERM
-  after a service stop, during an `rmmod` and after one.
+  are the refusals (display device held by another process or without
+  gnome-shell, a monitor on the NVIDIA GPU, root holders, an unlisted
+  service, a leftover hidden file, a mistyped or extra argument), `--check`
+  with and without mutter holding the display device, the release through
+  `reapply-layout.py` run as gnome-shell's user, a release that does not
+  come, a failing layout helper, a full swap, a GPU numbered
+  card1/renderD128, failures to hide a file, revoke, unload and load, a
+  missing patch, a mismatched build ID, and SIGTERM after a service stop,
+  during an `rmmod` and after one.
 - `tests/check_build.py`, as an ordinary user: runs `build.sh` against
   mocked commands and a fake `/usr/src` and `/lib/modules` tree. The cases
   are a failing `dkms status`, a version DKMS lists only as `added`, missing

@@ -11,7 +11,12 @@
 # - The GPU's KMS node (/dev/dri/cardN) is never revoked. mutter keeps its
 #   display state on it, and systemd-logind and systemd hold copies of
 #   mutter's descriptor. mutter releases the node after its next display mode
-#   set; until then swap.sh exits at this check, before its first change.
+#   set. When gnome-shell, systemd-logind and systemd are the only holders,
+#   the swap first runs reapply-layout.py as gnome-shell's user, which applies
+#   the current display layout again and so causes that mode set, and waits
+#   for the release. Another holder of the node, a monitor connected to the
+#   NVIDIA GPU, or a release that does not come stops the swap before it
+#   hides files, stops services or revokes handles.
 # - A root process may hold the other NVIDIA nodes only as part of one of the
 #   services in STOPPABLE, which only watch or tune the GPU and start again
 #   cleanly. swap.sh stops those for the swap and starts them again
@@ -57,6 +62,7 @@ holders() {
 uid_of() { awk '/^Uid:/ {print $2}' "/proc/$1/status" 2>/dev/null; }
 unit_of() { sed -nE 's#^0::/system\.slice/([^/]+\.service)(/.*)?$#\1#p' "/proc/$1/cgroup" 2>/dev/null; }
 describe() { echo "$1 $(cat "/proc/$1/comm" 2>/dev/null) (uid $(uid_of "$1")${2:+, $2})"; }
+comm_of() { cat "/proc/$1/comm" 2>/dev/null; }
 contains() {
     local x=$1 y
     shift
@@ -109,7 +115,34 @@ for p in $(holders "${nodes[@]}"); do
 done
 mapfile -t services < <(printf '%s\n' "${services[@]}" | sed '/^$/d' | sort -u)
 
+# gnome-shell holds mutter's descriptor on the KMS node, and systemd-logind
+# and systemd (PID 1) hold copies of it; reapplying the layout makes mutter
+# release it. Any other holder cannot be released that way.
+shell="" kms_other=()
+for p in $kms_holders; do
+    case "$(comm_of "$p")" in
+        gnome-shell) if [ -z "$shell" ]; then shell=$p; else kms_other+=("$p"); fi ;;
+        systemd-logind) ;;
+        systemd) [ "$p" = 1 ] || kms_other+=("$p") ;;
+        *) kms_other+=("$p") ;;
+    esac
+done
+kms_blocked=0
+if [ -n "$kms_holders" ] && { [ -z "$shell" ] || [ ${#kms_other[@]} -gt 0 ]; }; then
+    kms_blocked=1
+fi
+# A monitor on the NVIDIA GPU keeps the KMS node in use and would lose its
+# picture during the swap.
+connected=()
+for s in /sys/bus/pci/devices/"$gpu"/drm/card*/card*-*/status; do
+    [ "$(cat "$s" 2>/dev/null)" = connected ] && connected+=("$(basename "$(dirname "$s")")")
+done
+
 for p in $kms_holders; do log "KMS node held by $(describe "$p")"; done
+for c in "${connected[@]}"; do log "a monitor is connected to $c on the NVIDIA GPU; disconnect it first"; done
+if [ -n "$kms_holders" ] && [ $kms_blocked = 0 ]; then
+    log "the swap would first apply the current display layout again, so that mutter releases the KMS node"
+fi
 for u in "${services[@]}"; do log "service $u holds the GPU; it would be stopped during a swap"; done
 for p in "${users[@]}"; do log "handles to revoke: $(describe "$p")"; done
 for p in "${blockers[@]}"; do
@@ -127,8 +160,7 @@ for f in "${HIDE[@]}"; do
 done
 for f in "${leftovers[@]}"; do log "left hidden by an earlier swap: $f; move it back first"; done
 
-if [ -n "$kms_holders" ] || [ ${#blockers[@]} -gt 0 ] || [ ${#leftovers[@]} -gt 0 ]; then
-    [ -n "$kms_holders" ] && log "mutter releases the KMS node after its next display mode set"
+if [ $kms_blocked = 1 ] || [ ${#connected[@]} -gt 0 ] || [ ${#blockers[@]} -gt 0 ] || [ ${#leftovers[@]} -gt 0 ]; then
     log "a swap cannot go ahead now"
     exit 1
 fi
@@ -181,12 +213,38 @@ cleanup() {
     exit $status
 }
 fail() { log "$*"; exit 1; }
+# Run reapply-layout.py as gnome-shell's user on its session bus, then wait
+# up to 10 seconds for mutter to release the KMS node.
+release_kms() {
+    local uid user home bus i
+    uid=$(uid_of "$shell")
+    user=$(getent passwd "$uid" | cut -d: -f1)
+    home=$(getent passwd "$uid" | cut -d: -f6)
+    [ -n "$user" ] || { log "cannot find the user of gnome-shell $shell"; return 1; }
+    bus=$(tr '\0' '\n' < "/proc/$shell/environ" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')
+    log "applying the current display layout again as $user, so that mutter releases the KMS node"
+    runuser -u "$user" -- env -i HOME="$home" PATH=/usr/bin:/bin XDG_RUNTIME_DIR="/run/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="${bus:-unix:path=/run/user/$uid/bus}" \
+        /usr/bin/python3 -I "$DIR/reapply-layout.py" 2>&1 || return 1
+    for i in $(seq 100); do
+        if [ -z "$(holders "${kms[@]}")" ]; then
+            log "mutter released the KMS node"
+            return 0
+        fi
+        sleep 0.1
+    done
+    log "the KMS node is still held by: $(for p in $(holders "${kms[@]}"); do echo -n "$(describe "$p"); "; done)"
+    return 1
+}
 trap cleanup EXIT
 trap 'fail "interrupted by SIGINT"' INT
 trap 'fail "terminated by SIGTERM"' TERM
 trap 'fail "hung up by SIGHUP"' HUP
 
 log "BEGIN"
+if [ -n "$kms_holders" ]; then
+    release_kms || fail "mutter did not release the KMS node"
+fi
 for m in "${MODULES[@]}"; do
     is_loaded "$m" && initial+=("$m")
 done

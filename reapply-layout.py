@@ -97,7 +97,6 @@ def main():
         if layout_signature(before) != layout_signature(after):
             raise ValueError('The display configuration differs after reapplication')
         print('Reapplied the layout temporarily; the display configuration is unchanged.')
-        print('Run swap.sh --check as root to check whether the KMS device was released.')
         return 0
     except (GLib.Error, ValueError) as error:
         print(f'Could not reapply the layout: {error}', file=sys.stderr)

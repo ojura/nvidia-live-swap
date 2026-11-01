@@ -33,7 +33,7 @@ PROCS = {
     999: ('rogue', 0, '/init.scope'),
 }
 OLD_ID, DISK_ID, STALE_ID = 'aa' * 20, 'bb' * 20, 'cc' * 20
-MODIFYING = {'mv', 'systemctl', 'setsid', 'python3', 'rmmod', 'modprobe'}
+MODIFYING = {'mv', 'systemctl', 'setsid', 'python3', 'rmmod', 'modprobe', 'runuser'}
 
 MOCK = r'''#!/usr/bin/python3 -I
 import json, os, sys, time
@@ -120,12 +120,23 @@ elif cmd == 'modinfo':
     print(root / 'modules' / (args[-1] + '.ko'))
 elif cmd == 'readelf':
     print('    Build ID: ' + 'bb' * 20)
+elif cmd == 'runuser':
+    st = load()
+    if cfg.get('reapply_releases', True) and cfg.get('reapply_rc', 0) == 0:
+        st['kms_holders'] = []
+    save(st)
+    sys.exit(cfg.get('reapply_rc', 0))
+elif cmd == 'getent':
+    if args == ['passwd', '1000']:
+        print('desktop:x:1000:1000::/home/desktop:/bin/bash')
+    else:
+        sys.exit(2)
 elif cmd == 'lsmod':
     print(mods.read_text(), end='')
 '''
 
 
-def build_tree(root, nvidia_drm, patched, leftover):
+def build_tree(root, nvidia_drm, patched, leftover, connected=False):
     sysd = root / 'sys/bus/pci/devices'
     intel = sysd / '0000:00:02.0'
     (intel / 'drm').mkdir(parents=True)
@@ -134,6 +145,11 @@ def build_tree(root, nvidia_drm, patched, leftover):
     nv = sysd / '0000:01:00.0'
     for node in nvidia_drm:
         (nv / 'drm' / node).mkdir(parents=True)
+        if node.startswith('card'):
+            for port in ('HDMI-A-3', 'DP-3'):
+                c = nv / 'drm' / node / f'{node}-{port}'
+                c.mkdir()
+                (c / 'status').write_text('connected\n' if connected and port == 'HDMI-A-3' else 'disconnected\n')
     (nv / 'power').mkdir()
     (nv / 'vendor').write_text('0x10de\n')
     (nv / 'class').write_text('0x030200\n')
@@ -145,6 +161,7 @@ def build_tree(root, nvidia_drm, patched, leftover):
         (d / 'comm').write_text(comm + '\n')
         (d / 'status').write_text(f'Name:\t{comm}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n')
         (d / 'cgroup').write_text(f'0::{cgroup}\n')
+        (d / 'environ').write_bytes(b'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\0XDG_RUNTIME_DIR=/run/user/1000\0')
     (proc / 'modules').write_text(''.join(f'{m} 1 0 - Live 0x0\n' for m in MODULES))
     for m in MODULES:
         notes = root / 'sys/module' / m / 'notes'
@@ -173,16 +190,16 @@ def rewrite(text, root):
 
 
 def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
-        nvidia_drm=('card0', 'renderD129'), patched=True, leftover=False):
+        nvidia_drm=('card0', 'renderD129'), patched=True, leftover=False, connected=False):
     cfg = cfg or {}
     root = Path(tempfile.mkdtemp(prefix=name + '-', dir=BASE))
-    build_tree(root, nvidia_drm, patched, leftover)
+    build_tree(root, nvidia_drm, patched, leftover, connected)
     (root / 'bin').mkdir()
     mock = root / 'mock'
     mock.write_text(MOCK)
     mock.chmod(0o755)
     for cmd in ('mv', 'systemctl', 'fuser', 'setsid', 'python3', 'rmmod', 'modprobe', 'lsmod',
-                'modinfo', 'readelf'):
+                'modinfo', 'readelf', 'runuser', 'getent'):
         (root / 'bin' / cmd).symlink_to(mock)
     (root / 'config.json').write_text(json.dumps(cfg))
     (root / 'state.json').write_text(json.dumps({
@@ -213,6 +230,8 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
         'modifying': [c for c, _ in calls if c in MODIFYING],
         'fuser_args': [a for c, a in calls if c == 'fuser'],
         'revoke_args': [a for c, a in calls if c == 'python3'],
+        'runuser_args': [a for c, a in calls if c == 'runuser'],
+        'order': [c for c, _ in calls if c in MODIFYING],
         'revoked': st['revoked'],
         'rmmod': [a[0] for c, a in calls if c == 'rmmod'],
         'modprobe': [a[0] for c, a in calls if c == 'modprobe'],
@@ -239,9 +258,34 @@ def expect_untouched(r):
 
 SVC = {'service_holders': {'lactd.service': [777]}}
 
-r = run('kms-held', kms_holders=[1, 2045, 4525])
+r = run('kms-held-by-another-process', kms_holders=[1, 2045, 4525, 999])
 check(r, r['exit'] == 1, 'exit 1'); expect_untouched(r)
 check(r, 'a swap cannot go ahead now' in r['out'], 'refusal message')
+
+r = run('kms-held-without-gnome-shell', kms_holders=[1, 2045])
+check(r, r['exit'] == 1, 'exit 1'); expect_untouched(r)
+
+r = run('kms-held-check', kms_holders=[1, 2045, 4525], args=['--check'])
+check(r, r['exit'] == 0, f"exit {r['exit']}"); expect_untouched(r)
+check(r, 'would first apply the current display layout again' in r['out'], 'reports the reapplication')
+
+r = run('kms-released-by-reapply', SVC, kms_holders=[1, 2045, 4525], holders=[777, 4525])
+check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'), f"exit {r['exit']}")
+ru = r['runuser_args']
+check(r, len(ru) == 1 and ru[0][:3] == ['-u', 'desktop', '--'], f'runuser {ru}')
+check(r, any(a == 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus' for a in ru[0]) and ru[0][-1].endswith('reapply-layout.py'),
+      'runs the helper on gnome-shell\'s session bus')
+check(r, r['order'][0] == 'runuser', f"the reapplication comes first: {r['order']}")
+
+r = run('kms-not-released', {'reapply_releases': False}, kms_holders=[1, 2045, 4525])
+check(r, r['exit'] == 1 and 'still held' in r['out'], f"exit {r['exit']}")
+check(r, r['modifying'] == ['runuser'], f"only the reapplication ran: {r['modifying']}")
+
+r = run('reapply-fails', {'reapply_rc': 1}, kms_holders=[1, 2045, 4525])
+check(r, r['exit'] == 1 and r['modifying'] == ['runuser'], f"exit {r['exit']}, {r['modifying']}")
+
+r = run('nvidia-monitor-connected', kms_holders=[1, 2045, 4525], connected=True)
+check(r, r['exit'] == 1 and 'disconnect it first' in r['out'], f"exit {r['exit']}"); expect_untouched(r)
 
 r = run('mistyped-option', args=['--chek'])
 check(r, r['exit'] == 2, f"exit {r['exit']}"); expect_untouched(r)
