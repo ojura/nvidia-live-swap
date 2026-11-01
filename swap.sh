@@ -3,38 +3,45 @@
 # without ending the GNOME session. Run as root.
 #
 # usage: swap.sh [--check]
-#   --check  report what holds the NVIDIA GPU and whether a swap can go
-#            ahead now, and change nothing
+#   --check  only report what holds the NVIDIA GPU and whether a swap can go
+#            ahead now
 #
-# The modules can be unloaded only when no process has an NVIDIA device open
-# or mapped. swap.sh sorts the processes that do:
+# The modules can be unloaded only after every process has closed and
+# unmapped its NVIDIA devices. swap.sh sorts the processes that hold one:
 # - The GPU's KMS node (/dev/dri/cardN) is never revoked. mutter keeps its
 #   display state on it, and systemd-logind and systemd hold copies of
 #   mutter's descriptor. mutter releases the node after its next display mode
-#   set; until then swap.sh stops without changing anything.
+#   set; until then swap.sh exits at this check, before its first change.
 # - A root process may hold the other NVIDIA nodes only as part of one of the
 #   services in STOPPABLE, which only watch or tune the GPU and start again
 #   cleanly. swap.sh stops those for the swap and starts them again
 #   afterwards. Any other root process holding a node, including one in
 #   another service, stops the swap: stopping it could end someone's work.
 # - Processes not owned by root have their handles on /dev/nvidia* and on
-#   the GPU's render node revoked with revoke.py.
+#   the GPU's render node revoked with revoke.py. A revoked process keeps
+#   running without access to the NVIDIA GPU until it restarts.
 #
 # The swap hides NVIDIA's EGL and Vulkan registration files, so that a
 # process started during the swap does not open the GPU, unloads nvidia_drm,
 # nvidia_modeset, nvidia_uvm and nvidia, loads them from disk, and restores
-# the files and the services. On any failure or signal it undoes what it did:
-# it loads the unloaded modules again, moves the files back, starts the
-# services and exits with a non-zero status. It logs END only when every
-# module it loaded has the build ID of its file on disk and the driver
-# contains the patch.
+# the files and the services. On a failure or a signal it exits with a
+# non-zero status after trying to restore three things: it loads from disk
+# every NVIDIA module that was loaded at the start and is missing, which can
+# be a different build from the one it unloaded; it moves the hidden files
+# back; and it starts the stopped services. Revocations stay in effect. It
+# logs END only when every module it loaded has the build ID of its file on
+# disk and the driver contains the patch.
 set -u
+usage() { echo "usage: swap.sh [--check]" >&2; exit 2; }
+check_only=0
+case $# in
+    0) ;;
+    1) [ "$1" = --check ] || usage; check_only=1 ;;
+    *) usage ;;
+esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 . "$DIR/lib.sh"
 cd /tmp
-
-check_only=0
-[ "${1:-}" = --check ] && check_only=1
 
 HIDE=(/usr/share/glvnd/egl_vendor.d/10_nvidia.json
       /usr/share/vulkan/implicit_layer.d/nvidia_layers.json
@@ -73,7 +80,7 @@ disk_build_id() {
     rm -f "$t"
 }
 
-gpu=$(nvidia_gpu) || { log "no NVIDIA GPU found"; exit 1; }
+gpu=$(nvidia_gpu) || { log "cannot find the NVIDIA GPU"; exit 1; }
 kms=() render=()
 for n in /sys/bus/pci/devices/"$gpu"/drm/*; do
     case "${n##*/}" in
@@ -86,7 +93,7 @@ for n in /dev/nvidia* /dev/nvidia-caps/*; do
     [ -c "$n" ] && nodes+=("$n")
 done
 nodes+=("${render[@]}")
-log "NVIDIA GPU $gpu: KMS node ${kms[*]:-none}, other nodes ${nodes[*]}"
+log "NVIDIA GPU $gpu: KMS node ${kms[*]:-missing}, other nodes ${nodes[*]}"
 
 # Sort the current holders.
 kms_holders=$(holders "${kms[@]}")
@@ -131,11 +138,11 @@ if [ $check_only = 1 ]; then
 fi
 
 # The swap. The files to hide and the services to stop are recorded in hidden
-# and stopped, and the NVIDIA modules loaded at the start in initial. The EXIT
-# trap undoes the changes: it loads every module of initial that
-# /proc/modules no longer lists (so a module whose rmmod was killed after the
-# kernel had unloaded it is loaded again too), moves the hidden files back and
-# starts the stopped services. INT, TERM and HUP exit through the same trap.
+# and stopped, and the NVIDIA modules loaded at the start in initial. On a
+# failure the EXIT trap tries to restore them: it loads from disk every module
+# of initial that is missing from /proc/modules (so a module whose rmmod was
+# killed after the kernel had unloaded it is loaded too), moves the hidden
+# files back and starts the stopped services. INT, TERM and HUP exit through the same trap.
 # revoke.py runs in its own session, so that a signal to this script's
 # process group cannot stop gdb in the middle of an injected call.
 MODULES=(nvidia nvidia_modeset nvidia_drm nvidia_uvm)  # load order
@@ -184,7 +191,7 @@ for m in "${MODULES[@]}"; do
     is_loaded "$m" && initial+=("$m")
 done
 # Each change is recorded before it is made, so that a signal arriving
-# after the change but before the command returns still gets it undone.
+# after the change but before the command returns still gets it restored.
 for f in "${HIDE[@]}"; do
     [ -e "$f" ] || continue
     hidden+=("$f")

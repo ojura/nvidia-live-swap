@@ -1,24 +1,53 @@
 #!/bin/bash
 # Build NVIDIA's driver core with the patches in patches/ and install it
-# through Ubuntu's DKMS package for every kernel that has this driver version.
+# through Ubuntu's DKMS package.
 #
 # Ubuntu's nvidia-dkms-<branch>-open builds the kernel modules from source,
 # except for the driver core, which it ships precompiled as
 # /usr/src/nvidia-<version>/nvidia/nv-kernel.o_binary. NVIDIA's GitHub tag of
 # the same version holds the source of that object. This script builds it
-# from the tag with the patch, puts it in place of Ubuntu's copy (a dpkg
+# from the tag with the patches, puts it in place of Ubuntu's copy (a dpkg
 # diversion keeps Ubuntu's copy as nv-kernel.o_binary.ubuntu), and rebuilds
 # the DKMS modules. The new modules load at the next boot, or now with
 # swap.sh.
 #
 # usage (as root): build.sh [version]
-#   version defaults to the newest nvidia version DKMS knows about.
+#   version defaults to the newest nvidia version DKMS lists.
+#
+# The target kernels are every kernel DKMS lists for this driver version,
+# plus the running kernel, which is the one swap.sh loads into. They are
+# worked out before the object is diverted and installed: the script stops
+# if dkms status fails or the running kernel's headers are missing, and
+# exits 1 at the end if it skipped another kernel because its headers are
+# missing.
 set -eu
+usage() { echo "usage: build.sh [version]" >&2; exit 2; }
+[ $# -le 1 ] || usage
 here=$(cd "$(dirname "$0")" && pwd)
-ver=${1:-$(dkms status nvidia | sed -nE 's#^nvidia/([0-9.]+),.*#\1#p' | sort -uV | tail -1)}
+
+status=$(dkms status nvidia) || { echo "dkms status failed"; exit 1; }
+if [ $# = 1 ]; then
+    ver=$1
+else
+    ver=$(printf '%s\n' "$status" | sed -nE 's#^nvidia/([0-9.]+)[,:].*#\1#p' | sort -uV | tail -1)
+fi
+case "$ver" in
+    '' | *[!0-9.]*) echo "cannot tell which driver version to build (got '$ver')"; usage ;;
+esac
 src=/usr/src/nvidia-$ver
 obj=$src/nvidia/nv-kernel.o_binary
 [ -d "$src" ] || { echo "$src does not exist"; exit 1; }
+
+running=$(uname -r)
+ver_re=${ver//./\\.}
+mapfile -t kernels < <({ printf '%s\n' "$status" | sed -nE "s#^nvidia/$ver_re, ([^,]+),.*#\1#p"; echo "$running"; } | sort -u)
+targets=() skipped=()
+for k in "${kernels[@]}"; do
+    if [ -d "/lib/modules/$k/build" ]; then targets+=("$k"); else skipped+=("$k"); fi
+done
+[ -d "/lib/modules/$running/build" ] || { echo "the headers of the running kernel $running are missing"; exit 1; }
+echo "== target kernels: ${targets[*]}"
+[ ${#skipped[@]} -eq 0 ] || echo "== kernels whose headers are missing, not rebuilt: ${skipped[*]}"
 
 work=$(mktemp -d "/tmp/nvidia-nvpcf-$ver-XXXX")
 trap 'rm -rf "$work"' EXIT
@@ -41,7 +70,7 @@ for patch in "$here"/patches/*.diff; do
 done
 make -C "$work/ogkm/src/nvidia" -j"$(nproc)" > "$work/build.log" 2>&1 || { tail -30 "$work/build.log"; exit 1; }
 built=$work/ogkm/src/nvidia/_out/Linux_x86_64/nv-kernel.o
-nm "$built" | grep -q ' RmDeferNvpcfNotifyIfIdle$' || { echo "built object lacks the patch"; exit 1; }
+nm "$built" | grep -q ' RmDeferNvpcfNotifyIfIdle$' || { echo "the built object lacks the patch"; exit 1; }
 
 if ! dpkg-divert --list "$obj" | grep -q .; then
     dpkg-divert --local --rename --divert "$obj.ubuntu" --add "$obj"
@@ -49,17 +78,12 @@ fi
 install -m 644 -o root -g root "$built" "$obj"
 echo "== installed the patched driver core as $obj"
 
-skipped=()
-for k in $(dkms status "nvidia/$ver" | sed -nE "s#^nvidia/$ver, ([^,]+),.*#\1#p"); do
-    if [ ! -d "/lib/modules/$k/build" ]; then
-        echo "== $k: no kernel headers, not rebuilt"
-        skipped+=("$k")
-        continue
-    fi
+for k in "${targets[@]}"; do
     echo "== $k"
     dkms build -m nvidia -v "$ver" -k "$k" --force > "$work/dkms-$k.log" 2>&1 || { tail -20 "$work/dkms-$k.log"; exit 1; }
     dkms install -m nvidia -v "$ver" -k "$k" --force > "$work/dkms-install-$k.log" 2>&1 || { tail -20 "$work/dkms-install-$k.log"; exit 1; }
     ko=$(find "/lib/modules/$k/updates/dkms" -name 'nvidia.ko*' | head -1)
+    [ -n "$ko" ] || { echo "   cannot find nvidia.ko for $k after dkms install"; exit 1; }
     case "$ko" in
         *.zst) zstd -dcq "$ko" > "$work/nvidia.ko" ;;
         *) cp "$ko" "$work/nvidia.ko" ;;

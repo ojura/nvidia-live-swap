@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Run swap.sh against mocked commands and a fake sysfs, /proc and
-registration-file tree. Needs no root.
+registration-file tree. Runs as an ordinary user.
 
 Every command that changes the system (mv, systemctl, setsid and python3 for
 revoke.py, rmmod, modprobe) is a mock on PATH, and the paths swap.sh reads or
@@ -243,6 +243,13 @@ r = run('kms-held', kms_holders=[1, 2045, 4525])
 check(r, r['exit'] == 1, 'exit 1'); expect_untouched(r)
 check(r, 'a swap cannot go ahead now' in r['out'], 'refusal message')
 
+r = run('mistyped-option', args=['--chek'])
+check(r, r['exit'] == 2, f"exit {r['exit']}"); expect_untouched(r)
+check(r, r['fuser_args'] == [], 'stops before inspecting holders')
+
+r = run('extra-argument', args=['--check', 'now'])
+check(r, r['exit'] == 2, f"exit {r['exit']}"); expect_untouched(r)
+
 r = run('check-ok', args=['--check'])
 check(r, r['exit'] == 0, 'exit 0'); expect_untouched(r)
 check(r, 'a swap can go ahead now' in r['out'], 'go-ahead message')
@@ -286,11 +293,11 @@ check(r, '/dev/dri/card1' in used and all('/dev/dri/renderD128' in a for a in r[
 r = run('failed-hide', dict(SVC, fail_hide=True), holders=[777])
 check(r, r['exit'] == 1, 'exit 1')
 check(r, 'systemctl' not in r['modifying'] and r['rmmod'] == [] and r['revoked'] == [], 'stopped before services, revokes and modules')
-check(r, r['hidden'] == [] and r['lactd_active'] is True, 'nothing left changed')
+check(r, r['hidden'] == [] and r['lactd_active'] is True, 'files and service as before')
 
 r = run('failed-revoke', dict(SVC, revoke_rc=1), holders=[777, 4525])
 check(r, r['exit'] == 1, 'exit 1')
-check(r, r['rmmod'] == [], 'no unload')
+check(r, r['rmmod'] == [], 'modules left loaded')
 check(r, r['hidden'] == [] and r['lactd_active'] is True, 'files and service restored')
 
 r = run('failed-unload', {'rmmod_fail': 'nvidia_modeset'})
@@ -312,7 +319,7 @@ check(r, r['hidden'] == [] and r['lactd_active'] is True, 'files and service res
 
 r = run('interrupted-after-stop', dict(SVC, pause_after_stop=True), holders=[777], interrupt=True)
 check(r, r['exit'] == 1, f"exit {r['exit']}")
-check(r, r['rmmod'] == [] and r['hidden'] == [] and r['lactd_active'] is True, 'restored, nothing unloaded')
+check(r, r['rmmod'] == [] and r['hidden'] == [] and r['lactd_active'] is True, 'files and service restored, modules left loaded')
 
 r = run('interrupted-in-rmmod', {'pause_in_rmmod': 'nvidia_modeset'}, interrupt=True)
 check(r, r['exit'] == 1, f"exit {r['exit']}")

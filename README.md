@@ -5,42 +5,46 @@ logging out or rebooting.
 
 `swap.sh` unloads the loaded `nvidia`, `nvidia_modeset`, `nvidia_drm` and
 `nvidia_uvm` modules and loads the ones installed on disk while the session
-keeps running. Linux unloads a module only when no program has its devices
-open, so `swap.sh` first takes the GPU away from the programs that hold it.
-It stops the GPU monitoring services `lactd`, `nvidia-persistenced` and
-`nvidia-powerd` for the duration, if they run. In gnome-shell,
-Xwayland and every other program not owned by root it replaces every NVIDIA
-file descriptor with `/dev/null` and every NVIDIA device mapping with empty
-memory, through gdb, which holds each program stopped for 0.1 to 2 seconds in
-the runs so far.
+keeps running. Linux unloads a module only after every program has closed
+its devices, so `swap.sh` first takes the GPU away from the programs that
+hold it. It stops the GPU monitoring services `lactd`,
+`nvidia-persistenced` and `nvidia-powerd` for the duration, if they run. In
+gnome-shell, Xwayland and every other program not owned by root, it
+replaces each descriptor on `/dev/nvidia*` and on the NVIDIA render node
+with `/dev/null`, and each mapping of those devices with zeroed memory. It
+does this through gdb, which held each program stopped for 0.1 to 2 seconds
+in the runs so far.
 
 On 2026-11-01 it replaced the driver of a Legion 7 16IRX9 (Ubuntu 24.04,
 kernel 7.0, GNOME 46 on Wayland, NVIDIA open kernel modules 595.99.02) in
-6.7 seconds, and gnome-shell, Xwayland and every open window kept
+6.7 seconds, and gnome-shell, Xwayland and every open program kept
 running.
 
-`swap.sh --check` reports what holds the GPU and whether a swap can go ahead
-now, without changing anything.
+`swap.sh --check` only reads: it reports what holds the GPU and whether a
+swap can go ahead now.
 
 ## What it costs
 
 - A program whose GPU handles were taken keeps running but cannot use the
   NVIDIA GPU until it restarts. On this laptop the internal screen runs on
-  the Intel GPU, so nothing visible changes, but gnome-shell cannot drive a
-  monitor on the HDMI port, or on the DisplayPort or USB-C port wired to the
-  NVIDIA GPU, until the next login, and mutter may crash when one is
-  connected.
+  the Intel GPU and keeps working, but gnome-shell cannot drive a monitor on
+  the HDMI port, or on the DisplayPort or USB-C port wired to the NVIDIA
+  GPU, until the next login, and mutter may crash when one is connected.
 - `swap.sh` never takes away the NVIDIA display device (`/dev/dri/cardN`):
   mutter keeps its display state on it, and systemd-logind and systemd hold
-  copies of mutter's descriptor. While the device is held, `swap.sh` stops
-  without changing anything. mutter opens the device when it appears and
-  releases it after its next display mode set (in mutter 46.2,
+  copies of mutter's descriptor. While the device is held, `swap.sh` exits
+  at that check, before its first change. mutter opens the device when it
+  appears and releases it after its next display mode set (in mutter 46.2,
   `meta_kms_impl_device_notify_modes_set`). The mode set at login released
   it, so the first swap of the session went through; after a swap mutter
-  holds the new device again. Whether a display configuration change
-  releases it has not been tested.
-- A root process that holds the GPU outside a systemd system service stops
-  the swap.
+  holds the new device again. According to the source of Ubuntu's mutter
+  46.2, applying the current display layout again goes through that mode
+  set and releases the device; this has not been tried yet.
+- A root process that holds the GPU stops the swap, unless it belongs to
+  `lactd`, `nvidia-persistenced` or `nvidia-powerd`.
+- When a swap fails after the revokes, the revoked programs stay without the
+  NVIDIA GPU, and the modules `swap.sh` loads again come from disk, which
+  can be a different build from the one it unloaded.
 - Only a swap to the same driver version has been tested. A new version also
   replaces NVIDIA's user-space libraries, and NVIDIA's libraries refuse a
   kernel module of another version, so programs started between installing
@@ -69,9 +73,9 @@ does not send query 0x48.
   runtime power management (`NVreg_DynamicPowerManagement=2`, as here). The
   PR's new helper takes the dynamic-power mutex unconditionally, but the
   driver leaves that mutex NULL and turns power management off when
-  creating it fails, so a notification would dereference NULL; and in
-  coarse mode the original path never resumes the GPU for a notification,
-  so there is nothing to defer.
+  creating it fails, so a notification would dereference NULL. In coarse
+  mode the original path does not resume the GPU for a notification, so
+  deferring it would only delay it.
 
 Both apply to 595.99.02, 610.57.04, 615.71.09 and 615.78.08. `build.sh`
 builds Ubuntu's driver package with them, and `swap.sh` loads the result
@@ -85,64 +89,82 @@ and the GPU slept for less than a second in every 28.
 
 ## Files
 
-- `swap.sh [--check]`, as root: the live swap described above. Before any
-  change it sorts the processes holding the GPU: holders of the display
-  device stop the swap; root processes in `lactd`,
-  `nvidia-persistenced` or `nvidia-powerd`, which only watch or tune the
-  GPU, have their service stopped and started again afterwards; any other
-  root process stops the swap, including one in another service, because
-  stopping that could end someone's work; and processes not owned by root
-  have their handles revoked. A registration file left hidden by an
-  interrupted earlier run also stops it. During the swap it hides NVIDIA's EGL and Vulkan
-  registration files, so that a program started meanwhile does not open the
-  GPU. On any failure or signal it loads again every NVIDIA module that was
-  loaded at the start and no longer is, moves the files back, starts the
-  stopped services and exits with a non-zero status. It logs `END` only
-  when every module it loaded has the build ID of its file on disk and the
-  driver contains the patch.
+- `swap.sh [--check]`, as root: the live swap described above. It rejects
+  any other argument. Before its first change it sorts the processes
+  holding the GPU: holders of the display device stop the swap; root
+  processes in `lactd`, `nvidia-persistenced` or `nvidia-powerd`, which
+  only watch or tune the GPU, have their service stopped and started again
+  afterwards; any other root process stops the swap, including one in
+  another service, because stopping that could end someone's work; and
+  processes not owned by root have their handles revoked. A registration
+  file left hidden by an interrupted earlier run also stops it. During the
+  swap it hides NVIDIA's EGL and Vulkan registration files, so that a
+  program started meanwhile does not open the GPU. On a failure or a signal
+  it exits with a non-zero status after trying to restore what it changed:
+  it loads from disk every NVIDIA module that was loaded at the start and
+  is missing, moves the files back and starts the stopped services.
+  Revoked handles stay revoked. It logs `END` only when every module it
+  loaded has the build ID of its file on disk and the driver contains the
+  patch.
 - `revoke.py [--dry-run] <pid> <path>...`, as root: replaces one process's
-  file descriptors on the given paths with `/dev/null` (its own fd 0) and its
-  mappings of them with anonymous memory of the same size and protection.
-  gdb stops every thread of the process before the descriptors and mappings
-  are read from `/proc`, and scheduler locking keeps the other threads
-  stopped while the injected calls run in one thread; each call's result is
-  checked before the next. The injected calls (`dup2`, `mmap`,
-  `__errno_location`) take no locks, so they cannot wait for a stopped
+  file descriptors on the given paths with `/dev/null` (its own fd 0) and
+  its mappings of them with anonymous memory of the same size and
+  protection. gdb stops every thread of the process before the descriptors
+  and mappings are read from `/proc`, and scheduler locking keeps the other
+  threads stopped while the injected calls run in one thread; each call's
+  result is checked before the next. The injected calls (`dup2`, `mmap`,
+  `__errno_location`) do not take locks, so they cannot wait for a stopped
   thread. It refuses PID 1, processes owned by root and processes whose
   fd 0 is not `/dev/null`.
-- `lib.sh`: finds the NVIDIA GPU's PCI address, the first display controller
-  with NVIDIA's vendor ID.
+- `lib.sh`: finds the NVIDIA GPU's PCI address, the first display
+  controller with NVIDIA's vendor ID.
 - `build.sh [version]`, as root: clones NVIDIA's tag of the version, applies
-  the patches in `patches/`, builds the driver core and installs it in place of the
-  precompiled copy in Ubuntu's DKMS source,
+  the patches in `patches/`, builds the driver core and installs it in
+  place of the precompiled copy in Ubuntu's DKMS source,
   `/usr/src/nvidia-<version>/nvidia/nv-kernel.o_binary`. A dpkg diversion
   keeps Ubuntu's copy as `nv-kernel.o_binary.ubuntu`. It then rebuilds and
   installs the DKMS modules for every kernel that has this driver version,
   checks that each installed `nvidia.ko` contains the patch, and exits 1 if
-  a kernel had to be skipped for lack of headers. It refuses when Ubuntu's
-  kernel-module source differs from NVIDIA's tag.
+  it had to skip a kernel whose headers are missing. It refuses when
+  Ubuntu's kernel-module source differs from NVIDIA's tag.
 - `trace.sh [seconds]`, as root: watches, for 60 seconds by default, the EC
   queries, the duration of each NVPCF notification in the driver and the
   GPU's runtime power state. Run it in `balanced`. The function trace runs
   in a private tracing instance, and only the EC driver's debug lines that
-  were off get turned on; on exit, including on a signal, the instance is
-  removed and those lines are turned off again.
-- `tests/check_swap.py`: runs `swap.sh` against mocked commands and a fake
-  sysfs, `/proc` and registration-file tree, through refusals, a full swap,
-  a GPU numbered card1/renderD128, every failure path and signals at three
-  points. Needs no root.
+  were off get turned on. It checks every write to a control file and
+  starts the trace only after the function filter reads back as
+  `nv_acpi_nvpcf_event` alone, because with an empty filter
+  `function_graph` would trace every kernel function. On exit, including on
+  a signal, the instance is removed and those debug lines are turned off
+  again.
+- `tests/check_swap.py`, as an ordinary user: runs `swap.sh` against mocked
+  commands and a fake sysfs, `/proc` and registration-file tree. The cases
+  are the refusals (display device held, root holders, an unlisted service,
+  a leftover hidden file, a mistyped or extra argument), `--check`, a full
+  swap, a GPU numbered card1/renderD128, failures to hide a file, revoke,
+  unload and load, a missing patch, a mismatched build ID, and SIGTERM
+  after a service stop, during an `rmmod` and after one.
+- `tests/check_build.py`, as an ordinary user: runs `build.sh` against
+  mocked commands and a fake `/usr/src` and `/lib/modules` tree. The cases
+  are a failing `dkms status`, a version DKMS lists only as `added`, missing
+  headers for the running kernel and for another kernel, a mistyped or
+  extra argument, and a full build for two kernels.
+- `tests/check_trace_filter.py`, as an ordinary user: runs `trace.sh`
+  against ordinary files in place of the tracing and debug control files,
+  with a filter write that fails, and checks that it stops before selecting
+  `function_graph` and removes the instance.
 - `tests/check_revoke.py` and `tests/check_trace.py`, as root: run
-  `revoke.py` against a throwaway two-thread process owned by `nobody`, and
-  check that `trace.sh` leaves the tracing and debug settings as it found
-  them, after a normal run and after SIGTERM.
+  `revoke.py` against a throwaway two-thread process owned by the user
+  `nobody`, and check that `trace.sh` leaves the tracing and debug settings
+  as it found them, after a normal run and after SIGTERM.
 
 ## After an NVIDIA driver update
 
 A new driver version installs its own `/usr/src/nvidia-<version>` with
 NVIDIA's precompiled core, so the GPU wakes again until `sudo ./build.sh`
-has run for that version. A kernel update needs nothing more: DKMS builds
-the new kernel's modules from `/usr/src/nvidia-<version>`, which holds the
-patched core for as long as the diversion is in place.
+has run for that version. After a kernel update, DKMS builds the new
+kernel's modules from `/usr/src/nvidia-<version>`, which holds the patched
+core for as long as the diversion is in place.
 
 Before a driver version whose source holds the patched core is removed,
 restore Ubuntu's copy, so that the package removes its files cleanly:

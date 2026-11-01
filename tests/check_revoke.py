@@ -1,5 +1,6 @@
 #!/usr/bin/python3
-"""Check revoke.py, as root, against a throwaway process owned by nobody.
+"""Check revoke.py, as root, against a throwaway process owned by the user
+nobody.
 
 revoke.py must refuse PID 1 and root-owned processes without attaching, and
 must replace the descriptors and mappings a two-thread process holds on a
@@ -82,8 +83,8 @@ try:
     check(rc == 0 and 'scheduler locking on' in out, 'revokes with scheduler locking on')
     time.sleep(1)
     targets = [os.readlink(f'/proc/{p.pid}/fd/{fd}') for fd in os.listdir(f'/proc/{p.pid}/fd')]
-    check(str(data) not in targets, 'no descriptor left on the file')
-    check(str(data) not in Path(f'/proc/{p.pid}/maps').read_text(), 'no mapping left of the file')
+    check(str(data) not in targets, 'every descriptor on the file is replaced')
+    check(str(data) not in Path(f'/proc/{p.pid}/maps').read_text(), 'every mapping of the file is replaced')
     check(p.poll() is None, 'the process keeps running')
     lines = log.read_text().split('\n')[-3:-1]
     before, after = (int(l.split()[0]) for l in lines)

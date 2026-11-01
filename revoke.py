@@ -15,11 +15,10 @@
 # process, and with scheduler locking on, an injected call runs only the
 # thread gdb selected while the others stay stopped; without it, gdb resumes
 # every thread for the duration of each call. The descriptors and mappings
-# are read from /proc after the attach, so no thread can open, close or map
-# anything between the reading and the last call. The injected calls are
-# dup2, mmap and __errno_location: system-call wrappers and a thread-local
-# read that take no locks, so they cannot wait for a lock held by a stopped
-# thread. Each call's result is checked before the next; if a call fails,
+# are read from /proc after the attach, so they stay as read until the last
+# call. The injected calls are dup2, mmap and __errno_location: system-call
+# wrappers and a thread-local read that do not take locks, so they cannot
+# wait for a lock held by a stopped thread. Each call's result is checked before the next; if a call fails,
 # the calls before it stay in effect and the script exits 1. gdb loads only
 # libc's symbols, which keeps the stop short.
 #
@@ -104,7 +103,7 @@ def real_uid(pid):
         for line in f:
             if line.startswith("Uid:"):
                 return int(line.split()[1])
-    raise RuntimeError(f"no Uid line for {pid}")
+    raise RuntimeError(f"cannot find the Uid line of {pid}")
 
 
 def main():
