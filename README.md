@@ -24,8 +24,8 @@ driver wakes the GPU for these messages.
 Run the scripts from the repository directory:
 
 - `sudo ./build.sh [version]` builds the patched driver for that NVIDIA driver
-  version, by default the newest one DKMS lists, and installs it for your
-  kernels. It loads at the next boot, or now with `swap.sh`.
+  version, by default the newest one DKMS lists, for the installed kernels. It
+  loads at the next boot, or now with `swap.sh`.
 - `sudo ./swap.sh --check` lists the programs that have the NVIDIA GPU open
   and says whether a swap can go ahead now. It only reads.
 - `sudo ./swap.sh` unloads the NVIDIA kernel modules, loads the ones on disk,
@@ -44,7 +44,7 @@ it runs. `build.sh` needs git to download NVIDIA's source from GitHub.
 
 The NVIDIA driver is four kernel modules (`nvidia`, `nvidia_modeset`,
 `nvidia_drm` and `nvidia_uvm`) plus the libraries that programs load to use
-the GPU. Ubuntu's driver package compiles the modules on your machine with
+the GPU. Ubuntu's driver package compiles the modules on the machine with
 DKMS, the system that builds kernel modules for each installed kernel, except
 the driver core, which it ships precompiled. `build.sh` compiles the core from
 NVIDIA's source with the fix and puts it in place of Ubuntu's copy. A dpkg
@@ -96,10 +96,11 @@ away any program's access, when:
   systemd-logind hold copies of gnome-shell's handle, and `swap.sh` accepts
   those.
 - A root process other than the three services above has the GPU open.
-  Stopping it could end someone's work, so `swap.sh` leaves that to you.
-  `swap.sh --check` names it.
+  `swap.sh --check` names it. `swap.sh` does not stop it, because that could
+  end someone's work.
 - A registration file is still renamed from an interrupted earlier swap.
-  `swap.sh --check` names it. Remove its `.hotswap` suffix before you swap.
+  `swap.sh --check` names it. Remove its `.hotswap` suffix before the next
+  swap.
 
 Swaps have to be at least 20 seconds apart. Each swap makes GNOME ask
 rtkit-daemon, the service that hands out real-time priority, several times to
@@ -121,8 +122,8 @@ old libraries until they restart, gnome-shell until the next login.
 ## Driver and kernel updates
 
 A new NVIDIA driver version comes with Ubuntu's unpatched driver core in its
-own `/usr/src/nvidia-<version>`, so the GPU starts waking again until you run
-`sudo ./build.sh` for that version.
+own `/usr/src/nvidia-<version>`, so the GPU starts waking again until
+`sudo ./build.sh` has run for that version.
 
 A kernel update keeps the fix. DKMS builds the new kernel's modules from
 `/usr/src/nvidia-<version>`, which has the patched core as long as the dpkg
@@ -177,8 +178,8 @@ To remove the fix itself, run the same two commands, then for each kernel:
     dkms build -m nvidia -v <version> -k <kernel> --force
     dkms install -m nvidia -v <version> -k <kernel> --force
 
-`dkms build` skips a kernel whose modules are already built unless you pass
-`--force`. The modules without the fix load at the next boot.
+Without `--force`, `dkms build` skips a kernel whose modules are already
+built. The modules without the fix load at the next boot.
 
 ## Technical details
 
