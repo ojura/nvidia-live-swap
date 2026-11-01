@@ -1,9 +1,14 @@
 #!/usr/bin/python3 -I
-"""Reapply the current GNOME monitor layout to release unused KMS devices.
+"""Make Mutter release the display devices it holds but does not use.
 
-Run as the desktop user. --check asks Mutter to validate the reconstructed
-configuration without applying it. A normal run applies it temporarily and
-checks that the active modes, positions, scales and transforms stayed the same.
+Mutter releases them the next time it sets the display modes, so this script
+applies the current GNOME monitor layout again. Run it as the desktop user.
+It rebuilds the current configuration from Mutter's GetCurrentState and asks
+Mutter to validate it. With --check, it stops there. A normal run then
+applies it with Mutter's temporary method, which neither asks the user to
+confirm the change nor saves it, and checks that the active modes,
+positions, scales, transforms, primary monitor, underscanning and layout
+mode stayed the same.
 """
 import argparse
 import json
@@ -32,13 +37,16 @@ def current_configuration(state):
                 raise ValueError(f'{spec[0]}: expected one current mode, got {current}')
             monitor_properties = {}
             if 'is-underscanning' in props:
-                # Mutter 46's implementation accepts "underscanning" here.
+                # GetCurrentState reports "is-underscanning". The D-Bus
+                # documentation calls the ApplyMonitorsConfig property
+                # "enable_underscanning", but Mutter 46 reads "underscanning".
                 monitor_properties['underscanning'] = props['is-underscanning']
             physical.append((spec[0], current[0], monitor_properties))
         configuration.append((x, y, scale, transform, primary, sorted(physical)))
     global_properties = {}
-    # Mutter rejects this property when the capability is absent, even if
-    # its value is identical to the current layout mode.
+    # Mutter rejects layout-mode unless GetCurrentState reports
+    # supports-changing-layout-mode, even when the value equals the current
+    # layout mode.
     if properties.get('supports-changing-layout-mode', False):
         global_properties['layout-mode'] = properties['layout-mode']
     return serial, configuration, global_properties
@@ -86,17 +94,18 @@ def main():
             'logical-monitors': configuration}), flush=True)
         request('ApplyMonitorsConfig', configuration_variant(
             GLib, serial, 0, configuration, properties))
-        print('Mutter validated the unchanged layout.', flush=True)
+        print('Mutter accepted the current layout as valid.', flush=True)
         if args.check:
             return 0
 
-        # Keep the original serial so Mutter rejects stale resource information.
+        # Reuse the serial from GetCurrentState, so that Mutter refuses the
+        # request if its monitor state has changed since then.
         request('ApplyMonitorsConfig', configuration_variant(
             GLib, serial, 1, configuration, properties))
         after = request('GetCurrentState').unpack()
         if layout_signature(before) != layout_signature(after):
-            raise ValueError('The display configuration differs after reapplication')
-        print('Reapplied the layout temporarily; the display configuration is unchanged.')
+            raise ValueError('Reapplying the layout changed the display configuration')
+        print('Reapplied the layout; the display configuration is unchanged.')
         return 0
     except (GLib.Error, ValueError) as error:
         print(f'Could not reapply the layout: {error}', file=sys.stderr)

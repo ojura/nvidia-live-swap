@@ -1,4 +1,6 @@
-/* Render and read back a pixel with NVIDIA's EGL device platform.
+/* Check that a new program can render with the NVIDIA driver, for example
+ * after a swap. It draws with a shader through NVIDIA's EGL device platform
+ * and reads one pixel back.
  *
  * Build: cc -std=c11 -Wall -Wextra -Werror -O2 tests/check_egl.c \
  *          -o /tmp/check-nvidia-egl $(pkg-config --cflags --libs egl glesv2)
@@ -69,7 +71,7 @@ int main(void)
         (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
     if (!query_devices || !platform_display ||
         !query_devices(16, devices, &count) || count < 1) {
-        fprintf(stderr, "NVIDIA EGL device enumeration failed: 0x%x\n", eglGetError());
+        fprintf(stderr, "Could not find an NVIDIA EGL device: 0x%x\n", eglGetError());
         return 1;
     }
     display = platform_display(EGL_PLATFORM_DEVICE_EXT, devices[0], NULL);
@@ -84,7 +86,8 @@ int main(void)
     context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attributes);
     if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT ||
         !eglMakeCurrent(display, surface, surface, context)) {
-        fprintf(stderr, "EGL context creation failed: 0x%x\n", eglGetError());
+        fprintf(stderr, "Could not set up the pbuffer and the EGL context: 0x%x\n",
+                eglGetError());
         goto cleanup;
     }
     current = 1;
@@ -92,7 +95,8 @@ int main(void)
     const char *renderer = (const char *)glGetString(GL_RENDERER);
     const char *version = (const char *)glGetString(GL_VERSION);
     if (!vendor || !renderer || !version || !strstr(vendor, "NVIDIA")) {
-        fprintf(stderr, "The context is not a working NVIDIA context\n");
+        fprintf(stderr, "The GL context does not report NVIDIA as its vendor, "
+                        "or lacks a renderer or version string\n");
         goto cleanup;
     }
     printf("EGL %d.%d, %s\nRenderer: %s\nGL: %s\n", major, minor,
@@ -151,14 +155,15 @@ int main(void)
         goto cleanup;
     }
     printf("Rendered pixel: %u %u %u %u\n", pixel[0], pixel[1], pixel[2], pixel[3]);
-    /* Allow one unit for floating-point to RGBA8 rounding. */
+    /* Allow a difference of 1 in each channel, because converting the shader's
+     * floating-point color to 8 bits per channel can round either way. */
     for (int i = 0; i < 4; i++) {
         if (abs((int)pixel[i] - expected[i]) > 1) {
             fprintf(stderr, "The rendered pixel differs from the shader's color\n");
             goto cleanup;
         }
     }
-    puts("Headless NVIDIA shader rendering and readback passed.");
+    puts("Passed: the NVIDIA GPU rendered the shader's color without Wayland or X11.");
     result = 0;
 
 cleanup:

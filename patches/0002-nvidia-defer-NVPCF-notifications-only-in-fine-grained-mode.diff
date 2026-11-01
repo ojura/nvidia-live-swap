@@ -1,20 +1,23 @@
 From: Juraj Oršulić <juraj.orsulic@fer.hr>
 Subject: [PATCH] nvidia: defer NVPCF notifications only in fine-grained mode
 
-RmDeferNvpcfNotifyIfIdle(), added by NVIDIA PR #1299, takes the dynamic
-power mutex unconditionally. os_ref_dynamic_power(nv, NV_DYNAMIC_PM_FINE),
-which it replaces on that path, returns without locking when the
-configured mode is coarse or NV_DYNAMIC_PM_NEVER, and
-rm_init_dynamic_power_management() selects NV_DYNAMIC_PM_NEVER when
-creating the mutex fails, leaving it NULL. An NVPCF notification would
-then dereference NULL, and in coarse mode notifications would be
-deferred although the GPU is not resumed for them.
+RmDeferNvpcfNotifyIfIdle(), added by open-gpu-kernel-modules pull
+request #1299, takes the dynamic power mutex unconditionally.
+rm_acpi_nvpcf_notify() calls the new function before
+os_ref_dynamic_power(nv, NV_DYNAMIC_PM_FINE), which returns without
+locking when the configured mode is coarse or NV_DYNAMIC_PM_NEVER.
+rm_init_dynamic_power_management() selects NV_DYNAMIC_PM_NEVER when it
+fails to create the mutex, and leaves the mutex NULL, so in that case an
+NVPCF notification would dereference NULL. In coarse mode,
+os_ref_dynamic_power() does not resume the GPU for a notification, so
+deferring the notification would only delay it.
 
-Return NV_FALSE in both modes, so the original path handles them.
+Return NV_FALSE in both modes, so that rm_acpi_nvpcf_notify() calls
+os_ref_dynamic_power() and delivers the notification right away.
 
 ---
 diff --git a/src/nvidia/arch/nvalloc/unix/src/dynamic-power.c b/src/nvidia/arch/nvalloc/unix/src/dynamic-power.c
-index c999c92..6056485 100644
+index c999c92..d5e6837 100644
 --- a/src/nvidia/arch/nvalloc/unix/src/dynamic-power.c
 +++ b/src/nvidia/arch/nvalloc/unix/src/dynamic-power.c
 @@ -1532,7 +1532,14 @@ NvBool RmDeferNvpcfNotifyIfIdle(
@@ -23,11 +26,11 @@ index c999c92..6056485 100644
  
 -    if (nvp == NULL)
 +    /*
-+     * Defer only where os_ref_dynamic_power(nv, NV_DYNAMIC_PM_FINE) would
-+     * take the mutex and could resume the GPU. In coarse mode it returns
-+     * without doing either, and in NV_DYNAMIC_PM_NEVER the mutex may not
-+     * exist: rm_init_dynamic_power_management() selects that mode when creating
-+     * the mutex fails.
++     * Defer only when os_ref_dynamic_power(nv, NV_DYNAMIC_PM_FINE) would
++     * take the mutex and could resume the GPU. In coarse mode it does
++     * neither. In NV_DYNAMIC_PM_NEVER mode the mutex can be NULL, because
++     * rm_init_dynamic_power_management() selects that mode when it fails
++     * to create the mutex.
 +     */
 +    if ((nvp == NULL) || (NV_DYNAMIC_PM_FINE > nvp->dynamic_power.mode))
      {

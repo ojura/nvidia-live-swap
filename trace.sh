@@ -1,18 +1,32 @@
 #!/bin/bash
-# Watch, as root, the EC queries the firmware raises, how long the NVIDIA
-# driver takes for each NVPCF notification, and the GPU's runtime power
-# state. A notification that wakes the GPU takes about 2 seconds; one that
-# leaves it asleep takes microseconds.
+# Show whether the firmware's power-limit notifications wake the NVIDIA
+# GPU. Run as root.
 #
 # usage: trace.sh [seconds]   (default 60)
 #
-# The function trace runs in a private tracing instance, so the global
-# tracer settings stay as they are, and only the EC driver's debug lines that
-# are off get turned on. Every write to a control file is checked, and the
-# trace starts only after the instance's function filter reads back as
-# nv_acpi_nvpcf_event alone; with an empty filter, function_graph would trace
-# every kernel function. On exit, including on a signal, the instance is
-# removed and the debug lines it turned on are turned off again.
+# For the given number of seconds, trace.sh shows:
+# - the events the laptop's embedded controller (EC) raises, which the
+#   kernel logs as EC queries;
+# - how long the NVIDIA driver takes to handle each NVPCF notification, the
+#   firmware's power-limit message to the driver;
+# - whether the GPU is active or suspended (its runtime power state).
+# It prints the platform profile first. On the Legion 7 16IRX9, the EC
+# raises query 0x48 about every 7 seconds in the balanced profile, and the
+# firmware sends an NVPCF notification with each one. A notification that
+# wakes the GPU takes about 2 seconds to handle; one that leaves it asleep
+# takes microseconds.
+#
+# The durations come from a function_graph trace of nv_acpi_nvpcf_event,
+# the driver's handler for the notification. The trace runs in a private
+# tracing instance, so the global tracer settings stay as they are. It
+# starts only after the instance's function filter reads back as
+# nv_acpi_nvpcf_event alone, because with an empty filter, function_graph
+# would trace every kernel function. The kernel logs EC queries only as
+# debug messages of the EC driver, so trace.sh turns on the EC driver's
+# debug lines that are off, and only those. It checks every write to a
+# control file, except the two that reset the instance just before it is
+# removed. On exit, including on a signal, it removes the instance and
+# turns off the debug lines it turned on.
 set -u
 usage() { echo "usage: trace.sh [seconds]" >&2; exit 2; }
 [ $# -le 1 ] || usage
@@ -70,7 +84,8 @@ while [ "$(date +%s)" -lt $end ]; do
     if [ "$s" != "$prev" ]; then echo "$(date +%T.%N | cut -c1-12) gpu $s"; prev=$s; fi
     sleep 0.1
 done
-# Stop both sources before printing, so the output covers exactly the sample.
+# Stop the trace and the EC debug lines before printing, so that the output
+# covers exactly the measured period.
 echo 0 > "$I/tracing_on" || fail "could not stop the trace"
 for l in "${ec_off[@]}"; do
     echo "file drivers/acpi/ec.c line $l -p" > "$C" || fail "could not turn EC debug line $l off again"

@@ -1,31 +1,36 @@
 #!/usr/bin/env python3
-# Revoke a process's handles on device nodes, so the kernel module behind
-# them can be unloaded while the process keeps running.
+# Revoke a process's file descriptors and memory mappings on device files,
+# so that the kernel module behind them can be unloaded while the process
+# keeps running.
 #
 # usage (as root): revoke.py [--dry-run] <pid> <path> [<path> ...]
+#   --dry-run  only list the descriptors and mappings it would replace
 #
 # Every file descriptor the process has open on one of the paths is replaced
 # with /dev/null through dup2 from the process's own fd 0, which must be
-# /dev/null. The number stays taken, so a later ioctl on it fails instead of
-# reaching some other file. Every mapping of one of the paths is replaced in
-# place with anonymous zeroed memory of the same size and protection, so code
-# that still holds a pointer into it reads zeros instead of faulting.
+# /dev/null. The descriptor number stays in use, so a later open in the
+# process cannot reuse it, and a later ioctl on it fails instead of reaching
+# some other file. Every mapping of one of the paths is replaced in place
+# with anonymous zeroed memory of the same size and protection, so code that
+# still holds a pointer into it reads zeros instead of faulting.
 #
-# The replacement runs inside gdb. Attaching stops every thread of the
-# process, and with scheduler locking on, an injected call runs only the
-# thread gdb selected while the others stay stopped; without it, gdb resumes
-# every thread for the duration of each call. The descriptors and mappings
-# are read from /proc after the attach, so they stay as read until the last
-# call. The injected calls are dup2, mmap and __errno_location: system-call
-# wrappers and a thread-local read that do not take user-space locks, so they
-# cannot wait for a user-space lock held by a stopped thread. (The system
-# calls take kernel locks; a thread in a ptrace stop does not hold those.)
-# Each call's result is checked before the next; if a call fails, the calls
-# before it stay in effect and the script exits 1. gdb loads only libc's
-# symbols, which keeps the stop short.
+# The replacement runs inside gdb, which attaches to the process and calls
+# functions inside it (injected calls). Attaching stops every thread of the
+# process. With gdb's scheduler locking on, only the thread gdb selected
+# runs during an injected call, and the other threads stay stopped; without
+# it, gdb would resume every thread for the duration of each call. The
+# script reads the descriptors and mappings from /proc after attaching,
+# while every thread is stopped, so the lists stay valid until the last
+# call. The injected calls are dup2 and mmap, which wrap system calls, and
+# __errno_location, which returns the address of the thread's errno. They
+# do not take user-space locks, so they cannot wait for one held by a
+# stopped thread. (The system calls take kernel locks; a thread in a ptrace
+# stop does not hold those.) Each call's result is checked before the next
+# call. If a call fails, the calls before it stay in effect and the script
+# exits 1. gdb loads only libc's symbols, which keeps the stop short.
 #
-# Refuses PID 1, processes whose real user is root, and processes whose fd 0
-# is not /dev/null.
+# It refuses PID 1, processes whose real user is root, and processes whose
+# fd 0 is not /dev/null.
 #
 # gdb runs this same file (gdb -x); the code at the bottom chooses between
 # the command-line entry point and the part that runs inside gdb.
@@ -105,7 +110,7 @@ def real_uid(pid):
         for line in f:
             if line.startswith("Uid:"):
                 return int(line.split()[1])
-    raise RuntimeError(f"cannot find the Uid line of {pid}")
+    raise RuntimeError(f"cannot find the Uid line in /proc/{pid}/status")
 
 
 def main():

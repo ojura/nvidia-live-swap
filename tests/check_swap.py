@@ -1,11 +1,15 @@
 #!/usr/bin/python3
-"""Run swap.sh against mocked commands and a fake sysfs, /proc and
-registration-file tree. Runs as an ordinary user.
+"""Run swap.sh as an ordinary user, with mock commands and, for each case, a
+throwaway directory in place of /sys, /proc and NVIDIA's EGL and Vulkan
+registration files.
 
-Every command that changes the system (mv, systemctl, setsid and python3 for
-revoke.py, rmmod, modprobe) is a mock on PATH, and the paths swap.sh reads or
-renames under /sys, /proc and /usr/share are rewritten into a throwaway tree.
-The real /dev nodes are only tested with [ -c ]."""
+Every command that changes the system (mv, systemctl, runuser for
+reapply-layout.py, setsid and python3 for revoke.py, rmmod, modprobe) is a
+mock placed first on PATH. The test runs copies of swap.sh and lib.sh,
+edited so that the files they read, write or rename under /sys, /proc, /run
+and /usr/share are the ones in the throwaway directory. swap.sh still looks
+in the real /dev, but only to test with [ -c ] which NVIDIA device nodes
+exist."""
 import json
 import os
 from pathlib import Path
@@ -224,9 +228,11 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
         deadline = time.monotonic() + 10
         while not (root / 'paused').exists():
             if p.poll() is not None or time.monotonic() > deadline:
-                raise RuntimeError(f'{name}: the script did not reach the pause')
+                raise RuntimeError(f'{name}: swap.sh did not reach the mock command that pauses it')
             time.sleep(0.01)
-        os.killpg(p.pid, signal.SIGTERM)  # the session Popen created above
+        # start_new_session gave swap.sh a process group whose ID is its PID,
+        # so this signals swap.sh and the paused mock command.
+        os.killpg(p.pid, signal.SIGTERM)
     out, _ = p.communicate(timeout=30)
     calls = [json.loads(l) for l in (root / 'calls.jsonl').read_text().splitlines()]
     st = json.loads((root / 'state.json').read_text())
@@ -261,142 +267,168 @@ def check(r, cond, what):
 
 
 def expect_untouched(r):
-    check(r, r['modifying'] == [], f"modifying commands ran: {r['modifying']}")
+    check(r, r['modifying'] == [], f"leaves the system unchanged, got the commands {r['modifying']}")
 
 
 SVC = {'service_holders': {'lactd.service': [777]}}
 
 r = run('kms-held-by-another-process', kms_holders=[1, 2045, 4525, 999])
-check(r, r['exit'] == 1, 'exit 1'); expect_untouched(r)
-check(r, 'a swap cannot go ahead now' in r['out'], 'refusal message')
+check(r, r['exit'] == 1, 'exits with status 1'); expect_untouched(r)
+check(r, 'a swap cannot go ahead now' in r['out'], 'says that a swap cannot go ahead now')
 
 r = run('kms-held-without-gnome-shell', kms_holders=[1, 2045])
-check(r, r['exit'] == 1, 'exit 1'); expect_untouched(r)
+check(r, r['exit'] == 1, 'exits with status 1'); expect_untouched(r)
 
 r = run('kms-held-check', kms_holders=[1, 2045, 4525], args=['--check'])
-check(r, r['exit'] == 0, f"exit {r['exit']}"); expect_untouched(r)
-check(r, 'would first apply the current display layout again' in r['out'], 'reports the reapplication')
+check(r, r['exit'] == 0, f"exits with status 0, got {r['exit']}"); expect_untouched(r)
+check(r, 'would first apply the current display layout again' in r['out'],
+      'says that the swap would first apply the display layout again')
 
 r = run('kms-released-by-reapply', SVC, kms_holders=[1, 2045, 4525], holders=[777, 4525])
-check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'), f"exit {r['exit']}")
+check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'),
+      f"exits with status 0 and ends with END, got status {r['exit']}")
 ru = r['runuser_args']
-check(r, len(ru) == 1 and ru[0][:3] == ['-u', 'desktop', '--'], f'runuser {ru}')
+check(r, len(ru) == 1 and ru[0][:3] == ['-u', 'desktop', '--'], f'calls runuser once with -u desktop, got {ru}')
 check(r, any(a == 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus' for a in ru[0]) and ru[0][-1].endswith('reapply-layout.py'),
-      'runs the helper on gnome-shell\'s session bus')
-check(r, r['order'][0] == 'runuser', f"the reapplication comes first: {r['order']}")
+      'runs reapply-layout.py on gnome-shell\'s session bus')
+check(r, r['order'][0] == 'runuser', f"runs reapply-layout.py before any other change, got the order {r['order']}")
 
 r = run('kms-not-released', {'reapply_releases': False}, kms_holders=[1, 2045, 4525])
-check(r, r['exit'] == 1 and 'still held' in r['out'], f"exit {r['exit']}")
-check(r, r['modifying'] == ['runuser'], f"only the reapplication ran: {r['modifying']}")
+check(r, r['exit'] == 1 and 'still held' in r['out'],
+      f"exits with status 1 and says the KMS node is still held, got status {r['exit']}")
+check(r, r['modifying'] == ['runuser'], f"stops after running reapply-layout.py, got the commands {r['modifying']}")
 
 r = run('reapply-fails', {'reapply_rc': 1}, kms_holders=[1, 2045, 4525])
-check(r, r['exit'] == 1 and r['modifying'] == ['runuser'], f"exit {r['exit']}, {r['modifying']}")
+check(r, r['exit'] == 1 and r['modifying'] == ['runuser'],
+      f"stops with status 1 after reapply-layout.py fails, got status {r['exit']} and the commands {r['modifying']}")
 
 r = run('nvidia-monitor-connected', kms_holders=[1, 2045, 4525], connected=True)
-check(r, r['exit'] == 1 and 'disconnect it first' in r['out'], f"exit {r['exit']}"); expect_untouched(r)
+check(r, r['exit'] == 1 and 'disconnect it first' in r['out'],
+      f"exits with status 1 and says to disconnect the monitor first, got status {r['exit']}"); expect_untouched(r)
 
 r = run('mistyped-option', args=['--chek'])
-check(r, r['exit'] == 2, f"exit {r['exit']}"); expect_untouched(r)
-check(r, r['fuser_args'] == [], 'stops before inspecting holders')
+check(r, r['exit'] == 2, f"exits with status 2, got {r['exit']}"); expect_untouched(r)
+check(r, r['fuser_args'] == [], 'stops before it runs fuser to look for processes that hold the GPU')
 
 r = run('extra-argument', args=['--check', 'now'])
-check(r, r['exit'] == 2, f"exit {r['exit']}"); expect_untouched(r)
+check(r, r['exit'] == 2, f"exits with status 2, got {r['exit']}"); expect_untouched(r)
 
 r = run('check-ok', args=['--check'])
-check(r, r['exit'] == 0, 'exit 0'); expect_untouched(r)
-check(r, 'a swap can go ahead now' in r['out'], 'go-ahead message')
+check(r, r['exit'] == 0, 'exits with status 0'); expect_untouched(r)
+check(r, 'a swap can go ahead now' in r['out'], 'says that a swap can go ahead now')
 
 r = run('check-with-holders', SVC, holders=[777, 4525], args=['--check'])
-check(r, r['exit'] == 0, 'exit 0'); expect_untouched(r)
-check(r, 'service lactd.service holds the GPU' in r['out'] and 'handles to revoke: 4525' in r['out'], 'holder report')
+check(r, r['exit'] == 0, 'exits with status 0'); expect_untouched(r)
+check(r, 'service lactd.service holds the GPU' in r['out'] and 'handles to revoke: 4525' in r['out'],
+      'reports that lactd.service would be stopped and gnome-shell\'s handles revoked')
 
 r = run('root-outside-service', holders=[999])
-check(r, r['exit'] == 1, 'exit 1'); expect_untouched(r)
+check(r, r['exit'] == 1, 'exits with status 1'); expect_untouched(r)
 
 r = run('unknown-service', holders=[778])
-check(r, r['exit'] == 1, 'exit 1'); expect_untouched(r)
+check(r, r['exit'] == 1, 'exits with status 1'); expect_untouched(r)
 check(r, 'does not stop cuda-job.service' in r['out'], 'names the service it will not stop')
 
 r = run('leftover', leftover=True)
-check(r, r['exit'] == 1, 'exit 1'); expect_untouched(r)
-check(r, 'left hidden by an earlier swap' in r['out'], 'leftover message')
+check(r, r['exit'] == 1, 'exits with status 1'); expect_untouched(r)
+check(r, 'left hidden by an earlier swap' in r['out'], 'reports the file an earlier swap left hidden')
 
 r = run('success', SVC, holders=[777, 4525, 5019])
-check(r, r['exit'] == 0, 'exit 0')
-check(r, r['revoked'] == [4525, 5019], f"revoked {r['revoked']}")
-check(r, r['rmmod'] == ['nvidia_drm', 'nvidia_modeset', 'nvidia_uvm', 'nvidia'], f"rmmod {r['rmmod']}")
-check(r, r['modprobe'] == MODULES, f"modprobe {r['modprobe']}")
-check(r, r['hidden'] == [] and r['lactd_active'] is True, 'files and service restored')
-check(r, sorted(r['loaded']) == sorted(MODULES), f"loaded {r['loaded']}")
+check(r, r['exit'] == 0, 'exits with status 0')
+check(r, r['revoked'] == [4525, 5019], f"revokes the handles of 4525 and 5019, got {r['revoked']}")
+check(r, r['rmmod'] == ['nvidia_drm', 'nvidia_modeset', 'nvidia_uvm', 'nvidia'],
+      f"unloads nvidia_drm, nvidia_modeset, nvidia_uvm and nvidia in that order, got {r['rmmod']}")
+check(r, r['modprobe'] == MODULES,
+      f"loads nvidia, nvidia_modeset, nvidia_drm and nvidia_uvm in that order, got {r['modprobe']}")
+check(r, r['hidden'] == [] and r['lactd_active'] is True, 'moves the files back and starts lactd.service again')
+check(r, sorted(r['loaded']) == sorted(MODULES), f"ends with all four modules loaded, got {r['loaded']}")
 check(r, r['out'].rstrip().endswith('END'), 'ends with END')
-check(r, 'every loaded module has the build ID of its file on disk' in r['out'], 'build IDs checked')
+check(r, 'every loaded module has the build ID of its file on disk' in r['out'],
+      'reports that the build IDs match the files on disk')
 
 r = run('stale-module', dict(SVC, stale_module='nvidia'), holders=[777])
-check(r, r['exit'] == 1, 'exit 1')
-check(r, 'is not the file on disk' in r['out'] and 'END (failed)' in r['out'], 'mismatch reported')
-check(r, r['hidden'] == [] and r['lactd_active'] is True, 'files and service restored')
+check(r, r['exit'] == 1, 'exits with status 1')
+check(r, 'is not the file on disk' in r['out'] and 'END (failed)' in r['out'],
+      'reports that the loaded nvidia module does not match its file on disk, and ends with END (failed)')
+check(r, r['hidden'] == [] and r['lactd_active'] is True, 'moves the files back and starts lactd.service again')
 
 r = run('nvidia-card1', holders=[4525], nvidia_drm=('card1', 'renderD128'))
-check(r, r['exit'] == 0, 'exit 0')
+check(r, r['exit'] == 0, 'exits with status 0')
 used = [x for args in r['fuser_args'] + r['revoke_args'] for x in args]
-check(r, '/dev/dri/card0' not in used and '/dev/dri/renderD129' not in used, 'never touches the Intel nodes')
-check(r, '/dev/dri/card1' in used and all('/dev/dri/renderD128' in a for a in r['revoke_args']), 'uses card1 and renderD128')
+check(r, '/dev/dri/card0' not in used and '/dev/dri/renderD129' not in used,
+      'does not pass the Intel GPU\'s card0 or renderD129 to fuser or revoke.py')
+check(r, '/dev/dri/card1' in used and all('/dev/dri/renderD128' in a for a in r['revoke_args']),
+      'passes card1 to fuser and renderD128 to every revoke.py call')
 
 r = run('failed-hide', dict(SVC, fail_hide=True), holders=[777])
-check(r, r['exit'] == 1, 'exit 1')
-check(r, 'systemctl' not in r['modifying'] and r['rmmod'] == [] and r['revoked'] == [], 'stopped before services, revokes and modules')
-check(r, r['hidden'] == [] and r['lactd_active'] is True, 'files and service as before')
+check(r, r['exit'] == 1, 'exits with status 1')
+check(r, 'systemctl' not in r['modifying'] and r['rmmod'] == [] and r['revoked'] == [],
+      'exits before stopping services, revoking handles or unloading modules')
+check(r, r['hidden'] == [] and r['lactd_active'] is True, 'leaves the files in place and lactd.service running')
 
 r = run('failed-revoke', dict(SVC, revoke_rc=1), holders=[777, 4525])
-check(r, r['exit'] == 1, 'exit 1')
-check(r, r['rmmod'] == [], 'modules left loaded')
-check(r, r['hidden'] == [] and r['lactd_active'] is True, 'files and service restored')
+check(r, r['exit'] == 1, 'exits with status 1')
+check(r, r['rmmod'] == [], 'leaves the modules loaded')
+check(r, r['hidden'] == [] and r['lactd_active'] is True, 'moves the files back and starts lactd.service again')
 
 r = run('failed-unload', {'rmmod_fail': 'nvidia_modeset'})
-check(r, r['exit'] == 1, 'exit 1')
-check(r, r['modprobe'] == ['nvidia_drm'], f"reloaded {r['modprobe']}")
-check(r, sorted(r['loaded']) == sorted(MODULES), f"loaded {r['loaded']}")
-check(r, r['hidden'] == [], 'files restored')
+check(r, r['exit'] == 1, 'exits with status 1')
+check(r, r['modprobe'] == ['nvidia_drm'], f"loads only nvidia_drm again, got {r['modprobe']}")
+check(r, sorted(r['loaded']) == sorted(MODULES), f"ends with all four modules loaded, got {r['loaded']}")
+check(r, r['hidden'] == [], 'moves the files back')
 
 r = run('failed-load', {'modprobe_fail': 'nvidia_modeset'})
-check(r, r['exit'] == 1, 'exit 1')
-check(r, r['modprobe'] == ['nvidia', 'nvidia_modeset', 'nvidia_modeset', 'nvidia_drm', 'nvidia_uvm'], f"modprobe {r['modprobe']}")
-check(r, r['hidden'] == [] and 'END (failed)' in r['out'], 'files restored, failure reported')
+check(r, r['exit'] == 1, 'exits with status 1')
+check(r, r['modprobe'] == ['nvidia', 'nvidia_modeset', 'nvidia_modeset', 'nvidia_drm', 'nvidia_uvm'],
+      f"after nvidia_modeset fails to load, tries it again and loads nvidia_drm and nvidia_uvm, got {r['modprobe']}")
+check(r, r['hidden'] == [] and 'END (failed)' in r['out'], 'moves the files back and ends with END (failed)')
 
 r = run('missing-patch', SVC, holders=[777], patched=False)
-check(r, r['exit'] == 1, 'exit 1')
-check(r, 'lacks the patch' in r['out'] and 'END (failed)' in r['out'], 'failure reported')
-check(r, r['modprobe'] == MODULES, f"modprobe {r['modprobe']}")
-check(r, r['hidden'] == [] and r['lactd_active'] is True, 'files and service restored')
+check(r, r['exit'] == 1, 'exits with status 1')
+check(r, 'lacks the patch' in r['out'] and 'END (failed)' in r['out'],
+      'reports the missing patch and ends with END (failed)')
+check(r, r['modprobe'] == MODULES,
+      f"loads nvidia, nvidia_modeset, nvidia_drm and nvidia_uvm in that order, got {r['modprobe']}")
+check(r, r['hidden'] == [] and r['lactd_active'] is True, 'moves the files back and starts lactd.service again')
 
 r = run('interrupted-after-stop', dict(SVC, pause_after_stop=True), holders=[777], interrupt=True)
-check(r, r['exit'] == 1, f"exit {r['exit']}")
-check(r, r['rmmod'] == [] and r['hidden'] == [] and r['lactd_active'] is True, 'files and service restored, modules left loaded')
+check(r, r['exit'] == 1, f"exits with status 1, got {r['exit']}")
+check(r, r['rmmod'] == [] and r['hidden'] == [] and r['lactd_active'] is True,
+      'moves the files back, starts lactd.service again and leaves the modules loaded')
 
 r = run('interrupted-in-rmmod', {'pause_in_rmmod': 'nvidia_modeset'}, interrupt=True)
-check(r, r['exit'] == 1, f"exit {r['exit']}")
-check(r, r['modprobe'] == ['nvidia_drm'], f"reloaded {r['modprobe']}")
-check(r, sorted(r['loaded']) == sorted(MODULES) and r['hidden'] == [], 'modules and files restored')
+check(r, r['exit'] == 1, f"exits with status 1, got {r['exit']}")
+check(r, r['modprobe'] == ['nvidia_drm'], f"loads only nvidia_drm again, got {r['modprobe']}")
+check(r, sorted(r['loaded']) == sorted(MODULES) and r['hidden'] == [],
+      'ends with all four modules loaded and the files moved back')
 
 r = run('interrupted-after-rmmod', {'pause_after_rmmod': 'nvidia_modeset'}, interrupt=True)
-check(r, r['exit'] == 1, f"exit {r['exit']}")
-check(r, r['modprobe'] == ['nvidia_modeset', 'nvidia_drm'], f"reloaded {r['modprobe']}")
-check(r, sorted(r['loaded']) == sorted(MODULES) and r['hidden'] == [], 'modules and files restored')
+check(r, r['exit'] == 1, f"exits with status 1, got {r['exit']}")
+check(r, r['modprobe'] == ['nvidia_modeset', 'nvidia_drm'],
+      f"loads nvidia_modeset and nvidia_drm again, got {r['modprobe']}")
+check(r, sorted(r['loaded']) == sorted(MODULES) and r['hidden'] == [],
+      'ends with all four modules loaded and the files moved back')
 
 r = run('recent-swap-waits', last_swap_age=5)
-check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'), f"exit {r['exit']}")
-check(r, len(r['long_sleeps']) == 1 and 14 <= r['long_sleeps'][0] <= 16, f"waited {r['long_sleeps']}")
-check(r, r['stamp'] is not None and abs(int(r['stamp']) - time.time()) < 30, f"stamp {r['stamp']}")
+check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'),
+      f"exits with status 0 and ends with END, got status {r['exit']}")
+check(r, len(r['long_sleeps']) == 1 and 14 <= r['long_sleeps'][0] <= 16,
+      f"waits once, for about 15 seconds, got {r['long_sleeps']}")
+check(r, r['stamp'] is not None and abs(int(r['stamp']) - time.time()) < 30,
+      f"records when the run ended, got {r['stamp']}")
 
 r = run('recent-swap-check', last_swap_age=5, args=['--check'])
-check(r, r['exit'] == 0 and 'would first wait' in r['out'], f"exit {r['exit']}"); expect_untouched(r)
-check(r, r['long_sleeps'] == [], f"--check waited {r['long_sleeps']}")
+check(r, r['exit'] == 0 and 'would first wait' in r['out'],
+      f"exits with status 0 and says it would first wait, got status {r['exit']}"); expect_untouched(r)
+check(r, r['long_sleeps'] == [], f"does not wait with --check, got {r['long_sleeps']}")
 
 r = run('old-swap-no-wait', last_swap_age=60)
-check(r, r['exit'] == 0 and r['long_sleeps'] == [], f"exit {r['exit']}, waited {r['long_sleeps']}")
+check(r, r['exit'] == 0 and r['long_sleeps'] == [],
+      f"exits with status 0 without waiting, got status {r['exit']} and the sleeps {r['long_sleeps']}")
 
 r = run('stamp-after-failure', {'fail_hide': True})
-check(r, r['exit'] == 1 and r['stamp'] is not None, f"exit {r['exit']}, stamp {r['stamp']}")
+check(r, r['exit'] == 1 and r['stamp'] is not None,
+      f"exits with status 1 and still records when the run ended, got status {r['exit']} and end time {r['stamp']}")
 
 if failures:
     print(f"{len(failures)} failures; the cases are in {BASE}")

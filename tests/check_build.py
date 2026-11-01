@@ -1,8 +1,9 @@
 #!/usr/bin/python3
-"""Run build.sh against mocked commands and a fake /usr/src and /lib/modules
-tree, as an ordinary user. It checks how build.sh works out the target
-kernels, and that it stops before the dpkg diversion and the install when it
-cannot work them out."""
+"""Run build.sh as an ordinary user, with mock commands and, for each case, a
+throwaway directory in place of /usr/src and /lib/modules. The cases check
+which kernels build.sh builds the modules for, and that it stops before the
+dpkg diversion and before installing the patched driver core when dkms
+status fails or the running kernel's headers are missing."""
 import json
 import os
 from pathlib import Path
@@ -111,31 +112,38 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=()):
 
 
 r = run('status-fails', {'status_fails': True})
-check(r, r['exit'] == 1 and 'dkms status failed' in r['out'], 'stops on a failed dkms status')
-check(r, r['changing'] == [] and 'git' not in r['calls'], f"calls {r['calls']}")
+check(r, r['exit'] == 1 and 'dkms status failed' in r['out'], 'exits with status 1 when dkms status fails')
+check(r, r['changing'] == [] and 'git' not in r['calls'],
+      f"stops before cloning or changing anything, got the calls {r['calls']}")
 
 r = run('added-only', {'status': ADDED, 'clone_fails': True})
 check(r, f'target kernels: {RUNNING}\n' in r['out'], 'targets the running kernel')
-check(r, r['exit'] != 0 and r['changing'] == [], f"exit {r['exit']}, changes {r['changing']}")
+check(r, r['exit'] != 0 and r['changing'] == [],
+      f"fails before changing anything, got exit status {r['exit']} and the changes {r['changing']}")
 
 r = run('running-headers-missing', {'status': INSTALLED}, headers=(OTHER,))
 check(r, r['exit'] == 1 and 'headers of the running kernel' in r['out'], 'stops when the running kernel lacks headers')
-check(r, r['changing'] == [] and 'git' not in r['calls'], f"calls {r['calls']}")
+check(r, r['changing'] == [] and 'git' not in r['calls'],
+      f"stops before cloning or changing anything, got the calls {r['calls']}")
 
 r = run('extra-argument', {'status': INSTALLED}, args=(VER, 'extra'))
-check(r, r['exit'] == 2 and r['calls'] == [], f"exit {r['exit']}, calls {r['calls']}")
+check(r, r['exit'] == 2 and r['calls'] == [],
+      f"exits with status 2 before running any command, got status {r['exit']} and the calls {r['calls']}")
 
 r = run('mistyped-option', {'status': INSTALLED}, args=('--chek',))
-check(r, r['exit'] == 2 and r['changing'] == [] and 'git' not in r['calls'], f"exit {r['exit']}, calls {r['calls']}")
+check(r, r['exit'] == 2 and r['changing'] == [] and 'git' not in r['calls'],
+      f"exits with status 2 before cloning or changing anything, got status {r['exit']} and the calls {r['calls']}")
 
 r = run('success', {'status': INSTALLED})
-check(r, r['exit'] == 0 and '== done' in r['out'], 'exit 0 with the done line')
-check(r, sorted(r['built_for']) == sorted([RUNNING, OTHER]), f"built for {r['built_for']}")
-check(r, r['object'] == 'patched object' and 'dpkg-divert --add' in r['calls'], 'object installed behind a diversion')
+check(r, r['exit'] == 0 and '== done' in r['out'], 'exits with status 0 and reports that it is done')
+check(r, sorted(r['built_for']) == sorted([RUNNING, OTHER]), f"builds for both kernels, got {r['built_for']}")
+check(r, r['object'] == 'patched object' and 'dpkg-divert --add' in r['calls'],
+      'diverts Ubuntu\'s nv-kernel.o_binary and installs the patched object in its place')
 
 r = run('other-headers-missing', {'status': INSTALLED}, headers=(RUNNING,))
-check(r, r['exit'] == 1 and f'headers are missing: {OTHER}' in r['out'], 'exit 1 naming the skipped kernel')
-check(r, r['built_for'] == [RUNNING], f"built for {r['built_for']}")
+check(r, r['exit'] == 1 and f'headers are missing: {OTHER}' in r['out'],
+      'exits with status 1 and names the kernel it skipped')
+check(r, r['built_for'] == [RUNNING], f"builds only for the running kernel, got {r['built_for']}")
 
 if failures:
     print(f'{len(failures)} failures; the cases are in {BASE}')

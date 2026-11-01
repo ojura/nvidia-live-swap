@@ -1,8 +1,9 @@
 #!/usr/bin/python3 -IB
-"""Check reconstruction of Mutter's current monitor configuration.
+"""Check how reapply-layout.py rebuilds Mutter's current monitor configuration.
 
-These tests exercise the conversion without connecting to a desktop. Run
-reapply-layout.py --check in the session to validate the result with Mutter.
+The tests give it hand-written GetCurrentState answers and do not connect to
+a desktop session. To have Mutter itself validate the result, run
+reapply-layout.py --check in the session.
 """
 import copy
 import importlib.util
@@ -45,7 +46,7 @@ class CurrentLayoutTests(unittest.TestCase):
         self.assertEqual(layout.current_configuration(value)[1][0][:5],
                          (-1920, 120, 2.0, 6, False))
 
-    def test_layout_mode_requires_the_capability(self):
+    def test_layout_mode_is_sent_only_when_mutter_supports_changing_it(self):
         value = state()
         self.assertEqual(layout.current_configuration(value)[2], {})
         value[3]['supports-changing-layout-mode'] = True
@@ -68,25 +69,25 @@ class CurrentLayoutTests(unittest.TestCase):
         self.assertEqual(physical, [('DP-1', 'external-current', {}),
                                     ('eDP-1', 'current', {})])
 
-    def test_missing_active_layout_is_rejected(self):
+    def test_configuration_without_an_active_monitor_is_rejected(self):
         value = state()
         value[2] = []
         with self.assertRaisesRegex(ValueError, 'active monitor'):
             layout.current_configuration(value)
 
-    def test_missing_monitor_is_rejected(self):
+    def test_configuration_with_an_unlisted_monitor_is_rejected(self):
         value = state()
         value[1] = []
         with self.assertRaisesRegex(ValueError, 'missing from the monitor list'):
             layout.current_configuration(value)
 
-    def test_missing_current_mode_is_rejected(self):
+    def test_monitor_without_a_current_mode_is_rejected(self):
         value = state()
         value[1][0][1][1][-1]['is-current'] = False
         with self.assertRaisesRegex(ValueError, 'expected one current mode'):
             layout.current_configuration(value)
 
-    def test_ambiguous_current_mode_is_rejected(self):
+    def test_monitor_with_two_current_modes_is_rejected(self):
         value = state()
         value[1][0][1][0][-1]['is-current'] = True
         with self.assertRaisesRegex(ValueError, 'expected one current mode'):
@@ -108,7 +109,7 @@ class CurrentLayoutTests(unittest.TestCase):
         after[3]['layout-mode'] = 1
         self.assertNotEqual(layout.layout_signature(before), layout.layout_signature(after))
 
-    def test_variant_uses_the_runtime_api_types(self):
+    def test_glib_variant_has_the_argument_types_of_apply_monitors_config(self):
         from gi.repository import GLib
         value = state()
         value[3]['supports-changing-layout-mode'] = True

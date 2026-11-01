@@ -1,9 +1,11 @@
 #!/usr/bin/python3
-"""Run trace.sh as an ordinary user with ordinary files in place of the
-tracing and debug control files, and a function-filter write that fails the
-way tracefs rejects an unknown function name. trace.sh must stop before it
-selects function_graph and remove the instance. Adapted from a fixture by
-the crazy-binary-patching-mofo session."""
+"""Run trace.sh as an ordinary user, with regular files in place of the
+tracing and dynamic debug control files. trace.sh creates its tracing
+instance through a mock mkdir, which makes set_ftrace_filter a symbolic
+link to /dev/full. Writing the function filter therefore fails, as it does
+when tracefs rejects an unknown function name. trace.sh must then stop
+before it selects the function_graph tracer, and it must remove the
+instance."""
 import os
 from pathlib import Path
 import shutil
@@ -51,7 +53,7 @@ echoed = (root / 'echo.log').read_text().splitlines()
 failures = []
 for cond, what in [
     (r.returncode != 0, 'exits with a failure status'),
-    ('could not set the function filter' in r.stdout, 'reports the filter failure'),
+    ('could not set the function filter' in r.stdout, 'reports that setting the function filter failed'),
     ('function_graph' not in echoed, 'never selects function_graph'),
     (not any(l.endswith(' +p') for l in echoed), 'never turns EC debug lines on'),
     (os.listdir(root / 'instances') == [], 'removes the instance'),

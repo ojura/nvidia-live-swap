@@ -1,11 +1,13 @@
 #!/bin/bash
-# Build NVIDIA's driver core with the patches in patches/ and install it
-# through Ubuntu's DKMS package.
+# Build Ubuntu's NVIDIA kernel modules with the patches in patches/, which
+# stop the driver from waking the sleeping GPU for each power-limit
+# notification from the firmware.
 #
-# Ubuntu's nvidia-dkms-<branch>-open builds the kernel modules from source,
-# except for the driver core, which it ships precompiled as
-# /usr/src/nvidia-<version>/nvidia/nv-kernel.o_binary. NVIDIA's GitHub tag of
-# the same version holds the source of that object. This script builds it
+# Ubuntu's nvidia-dkms-<branch>-open package builds the kernel modules from
+# source, except for the driver core, which the package contains only as a
+# precompiled object, /usr/src/nvidia-<version>/nvidia/nv-kernel.o_binary.
+# The tag of the same version in NVIDIA's open-gpu-kernel-modules repository
+# on GitHub holds the source of that object. This script builds the object
 # from the tag with the patches, puts it in place of Ubuntu's copy (a dpkg
 # diversion keeps Ubuntu's copy as nv-kernel.o_binary.ubuntu), and rebuilds
 # the DKMS modules. The new modules load at the next boot, or now with
@@ -14,12 +16,12 @@
 # usage (as root): build.sh [version]
 #   version defaults to the newest nvidia version DKMS lists.
 #
-# The target kernels are every kernel DKMS lists for this driver version,
-# plus the running kernel, which is the one swap.sh loads into. They are
-# worked out before the object is diverted and installed: the script stops
-# if dkms status fails or the running kernel's headers are missing, and
-# exits 1 at the end if it skipped another kernel because its headers are
-# missing.
+# build.sh rebuilds the modules for every kernel DKMS lists for this driver
+# version, plus the running kernel, which is the one swap.sh loads them
+# into. It works out these kernels first, and stops before it diverts and
+# replaces the object if dkms status fails or the running kernel's headers
+# are missing. When another kernel's headers are missing, it skips that
+# kernel and exits 1 at the end.
 set -eu
 usage() { echo "usage: build.sh [version]" >&2; exit 2; }
 [ $# -le 1 ] || usage
@@ -47,7 +49,7 @@ for k in "${kernels[@]}"; do
 done
 [ -d "/lib/modules/$running/build" ] || { echo "the headers of the running kernel $running are missing"; exit 1; }
 echo "== target kernels: ${targets[*]}"
-[ ${#skipped[@]} -eq 0 ] || echo "== kernels whose headers are missing, not rebuilt: ${skipped[*]}"
+[ ${#skipped[@]} -eq 0 ] || echo "== skipping kernels whose headers are missing: ${skipped[*]}"
 
 work=$(mktemp -d "/tmp/nvidia-nvpcf-$ver-XXXX")
 trap 'rm -rf "$work"' EXIT

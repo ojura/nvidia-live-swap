@@ -6,43 +6,55 @@
 #   --check  only report what holds the NVIDIA GPU and whether a swap can go
 #            ahead now
 #
-# The modules can be unloaded only after every process has closed and
-# unmapped its NVIDIA devices. swap.sh sorts the processes that hold one:
-# - The GPU's KMS node (/dev/dri/cardN) is never revoked. mutter keeps its
-#   display state on it, and systemd-logind and systemd hold copies of
-#   mutter's descriptor. mutter releases the node after its next display mode
-#   set. When gnome-shell, systemd-logind and systemd are the only holders,
-#   the swap first runs reapply-layout.py as gnome-shell's user, which applies
-#   the current display layout again and so causes that mode set, and waits
-#   for the release. Another holder of the node, a monitor connected to the
-#   NVIDIA GPU, or a release that does not come stops the swap before it
-#   hides files, stops services or revokes handles.
-# - A root process may hold the other NVIDIA nodes only as part of one of the
-#   services in STOPPABLE, which only watch or tune the GPU and start again
-#   cleanly. swap.sh stops those for the swap and starts them again
-#   afterwards. Any other root process holding a node, including one in
-#   another service, stops the swap: stopping it could end someone's work.
-# - Processes not owned by root have their handles on /dev/nvidia* and on
-#   the GPU's render node revoked with revoke.py. A revoked process keeps
-#   running without access to the NVIDIA GPU until it restarts.
+# The modules can be unloaded only after every process has closed its
+# NVIDIA devices and removed its memory mappings of them. swap.sh deals
+# with the processes that hold one in three ways:
+# - swap.sh never revokes handles on the GPU's display device,
+#   /dev/dri/cardN (its KMS node). mutter, which runs inside gnome-shell,
+#   keeps its display state on it, and systemd-logind and systemd hold
+#   copies of mutter's descriptor. mutter releases the device the next time
+#   it sets the display modes. When gnome-shell, systemd-logind and systemd
+#   are the only holders, swap.sh first runs reapply-layout.py as
+#   gnome-shell's user. That script applies the current display layout
+#   again, which makes mutter set the modes, and swap.sh waits up to 10
+#   seconds for the release. If the device has another holder, if a monitor
+#   is connected to the NVIDIA GPU, or if mutter does not release the
+#   device, swap.sh exits before it hides files, stops services or revokes
+#   handles.
+# - The other NVIDIA devices are /dev/nvidia*, /dev/nvidia-caps/* and the
+#   GPU's render node. swap.sh accepts a root process as a holder of these
+#   only if the process belongs to one of the services in STOPPABLE. Those
+#   services only watch or tune the GPU and start again cleanly, so swap.sh
+#   stops them for the swap and starts them again afterwards. swap.sh
+#   refuses to swap when any other root process holds one of these devices,
+#   including a process in another service, because stopping that process
+#   could end someone's work.
+# - For processes not owned by root, revoke.py revokes their handles on
+#   these devices. A revoked process keeps running, but cannot use the
+#   NVIDIA GPU until it restarts.
 #
-# Each swap makes mutter switch its KMS thread out of real-time scheduling
-# and back several times, through rtkit-daemon, which by default allows 25
-# such requests per user in 20 seconds. Two swaps started 17 seconds apart
-# reached that limit, and mutter probed the reloaded device with the thread
-# still real-time. swap.sh therefore records when each run ends and starts a
-# swap at least GAP seconds after the previous one.
+# Each swap makes mutter ask rtkit-daemon several times to take its KMS
+# thread (the thread that sends display updates to the kernel) out of
+# real-time scheduling and to make it real-time again. rtkit-daemon by
+# default allows 25 such requests per user in 20 seconds. Two swaps started
+# 17 seconds apart reached that limit, and mutter probed the reloaded device
+# with the thread still real-time. swap.sh therefore records when each swap
+# ends, and starts the next swap only after GAP seconds have passed since
+# then.
 #
-# The swap hides NVIDIA's EGL and Vulkan registration files, so that a
-# process started during the swap does not open the GPU, unloads nvidia_drm,
-# nvidia_modeset, nvidia_uvm and nvidia, loads them from disk, and restores
-# the files and the services. On a failure or a signal it exits with a
-# non-zero status after trying to restore three things: it loads from disk
-# every NVIDIA module that was loaded at the start and is missing, which can
-# be a different build from the one it unloaded; it moves the hidden files
-# back; and it starts the stopped services. Revocations stay in effect. It
-# logs END only when every module it loaded has the build ID of its file on
-# disk and the driver contains the patch.
+# Once the display device is free, a swap hides the files that register
+# NVIDIA's EGL and Vulkan libraries with their loaders (HIDE), so that a
+# process started during the swap does not open the GPU. It then stops the
+# services, revokes the handles, unloads nvidia_drm, nvidia_modeset,
+# nvidia_uvm and nvidia, loads them from disk, and restores the files and
+# the services. On a failure or a signal, it tries to restore the modules,
+# the files and the services, and exits with a non-zero status. It loads
+# from disk every NVIDIA module that was loaded at the start and is now
+# missing, so a module it loads again can be a different build from the
+# one it unloaded. Revoked handles stay revoked. It logs END only when
+# every module it loaded has the same build ID as its file on disk, and the
+# loaded driver contains RmDeferNvpcfNotifyIfIdle and RmReplayNvpcfNotify,
+# two of the functions that patch 0001 adds.
 set -u
 usage() { echo "usage: swap.sh [--check]" >&2; exit 2; }
 check_only=0
@@ -59,8 +71,8 @@ HIDE=(/usr/share/glvnd/egl_vendor.d/10_nvidia.json
       /usr/share/vulkan/implicit_layer.d/nvidia_layers.json
       /usr/share/vulkan/icd.d/nvidia_icd.json)
 STOPPABLE=(lactd.service nvidia-persistenced.service nvidia-powerd.service)
-STAMP=/run/nvidia-live-swap.last  # end time of the previous run, in seconds
-GAP=20                            # rtkit-daemon's default burst window
+STAMP=/run/nvidia-live-swap.last  # when the previous swap ended (date +%s)
+GAP=20                            # rtkit-daemon's --actions-burst-sec default
 
 log() { echo "$(date +%T.%N | cut -c1-12) $*"; }
 
@@ -108,9 +120,11 @@ for n in /dev/nvidia* /dev/nvidia-caps/*; do
     [ -c "$n" ] && nodes+=("$n")
 done
 nodes+=("${render[@]}")
-log "NVIDIA GPU $gpu: KMS node ${kms[*]:-missing}, other nodes ${nodes[*]}"
+log "NVIDIA GPU $gpu: display device ${kms[*]:-missing}, other devices ${nodes[*]}"
 
-# Sort the current holders.
+# Find the holders of the display device. Group the holders of the other
+# devices into processes not owned by root, services to stop, and root
+# processes that make swap.sh refuse.
 kms_holders=$(holders "${kms[@]}")
 services=() users=() blockers=()
 for p in $(holders "${nodes[@]}"); do
@@ -124,9 +138,11 @@ for p in $(holders "${nodes[@]}"); do
 done
 mapfile -t services < <(printf '%s\n' "${services[@]}" | sed '/^$/d' | sort -u)
 
-# gnome-shell holds mutter's descriptor on the KMS node, and systemd-logind
-# and systemd (PID 1) hold copies of it; reapplying the layout makes mutter
-# release it. Any other holder cannot be released that way.
+# mutter runs inside gnome-shell, so gnome-shell holds mutter's descriptor
+# on the display device, and systemd-logind and systemd (PID 1) hold copies
+# of it. After the layout is applied again, all three close the device.
+# swap.sh refuses when the device has any other holder, because applying
+# the layout again would not make that holder close it.
 shell="" kms_other=()
 for p in $kms_holders; do
     case "$(comm_of "$p")" in
@@ -140,26 +156,26 @@ kms_blocked=0
 if [ -n "$kms_holders" ] && { [ -z "$shell" ] || [ ${#kms_other[@]} -gt 0 ]; }; then
     kms_blocked=1
 fi
-# A monitor on the NVIDIA GPU keeps the KMS node in use and would lose its
-# picture during the swap.
+# A monitor connected to the NVIDIA GPU keeps the display device in use, and
+# it would lose its picture during the swap.
 connected=()
 for s in /sys/bus/pci/devices/"$gpu"/drm/card*/card*-*/status; do
     [ "$(cat "$s" 2>/dev/null)" = connected ] && connected+=("$(basename "$(dirname "$s")")")
 done
 
-for p in $kms_holders; do log "KMS node held by $(describe "$p")"; done
+for p in $kms_holders; do log "display device held by $(describe "$p")"; done
 for c in "${connected[@]}"; do log "a monitor is connected to $c on the NVIDIA GPU; disconnect it first"; done
 if [ -n "$kms_holders" ] && [ $kms_blocked = 0 ]; then
-    log "the swap would first apply the current display layout again, so that mutter releases the KMS node"
+    log "the swap would first apply the current display layout again, so that mutter releases the display device"
 fi
 for u in "${services[@]}"; do log "service $u holds the GPU; it would be stopped during a swap"; done
 for p in "${users[@]}"; do log "handles to revoke: $(describe "$p")"; done
 for p in "${blockers[@]}"; do
     u=$(unit_of "$p")
     if [ -n "$u" ]; then
-        log "held by $(describe "$p" "$u"); swap.sh does not stop $u, stop it yourself if that is safe"
+        log "the GPU is held by $(describe "$p" "$u"); swap.sh does not stop $u, so stop it yourself if that is safe"
     else
-        log "held by a root process outside a service: $(describe "$p" "$(sed -n 's/^0:://p' "/proc/$p/cgroup")")"
+        log "the GPU is held by a root process outside a service: $(describe "$p" "$(sed -n 's/^0:://p' "/proc/$p/cgroup")")"
     fi
 done
 
@@ -187,15 +203,17 @@ if [ $check_only = 1 ]; then
     exit 0
 fi
 
-# The swap. The files to hide and the services to stop are recorded in hidden
-# and stopped, and the NVIDIA modules loaded at the start in initial. On a
-# failure the EXIT trap tries to restore them: it loads from disk every module
-# of initial that is missing from /proc/modules (so a module whose rmmod was
-# killed after the kernel had unloaded it is loaded too), moves the hidden
-# files back and starts the stopped services. INT, TERM and HUP exit
-# through the same trap. revoke.py runs in its own session, so that a signal
-# to this script's process group cannot stop gdb in the middle of an
-# injected call.
+# The rest of the script does the swap. It records the files it hides in
+# the array hidden, the services it stops in the array stopped, and the
+# NVIDIA modules loaded at the start in the array initial. On a failure, the
+# EXIT trap tries to restore all three: it loads from disk every module in
+# initial that is missing from /proc/modules (this also reloads a module
+# whose rmmod was killed after the kernel had already unloaded it), moves
+# the hidden files back and starts the stopped services. SIGINT, SIGTERM
+# and SIGHUP make the script exit, which runs the same trap. revoke.py runs
+# in its own session, so that a signal to this script's process group
+# cannot stop gdb in the middle of a call it injected into the target
+# process.
 MODULES=(nvidia nvidia_modeset nvidia_drm nvidia_uvm)  # load order
 hidden=() stopped=() initial=()
 succeeded=0
@@ -233,8 +251,8 @@ cleanup() {
     exit $status
 }
 fail() { log "$*"; exit 1; }
-# Run reapply-layout.py as gnome-shell's user on its session bus, then wait
-# up to 10 seconds for mutter to release the KMS node.
+# Run reapply-layout.py as gnome-shell's user, on gnome-shell's session bus,
+# then wait up to 10 seconds for mutter to release the display device.
 release_kms() {
     local uid user home bus i
     uid=$(uid_of "$shell")
@@ -242,18 +260,18 @@ release_kms() {
     home=$(getent passwd "$uid" | cut -d: -f6)
     [ -n "$user" ] || { log "cannot find the user of gnome-shell $shell"; return 1; }
     bus=$(tr '\0' '\n' < "/proc/$shell/environ" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')
-    log "applying the current display layout again as $user, so that mutter releases the KMS node"
+    log "applying the current display layout again as $user, so that mutter releases the display device"
     runuser -u "$user" -- env -i HOME="$home" PATH=/usr/bin:/bin XDG_RUNTIME_DIR="/run/user/$uid" \
         DBUS_SESSION_BUS_ADDRESS="${bus:-unix:path=/run/user/$uid/bus}" \
         /usr/bin/python3 -I "$DIR/reapply-layout.py" 2>&1 || return 1
     for i in $(seq 100); do
         if [ -z "$(holders "${kms[@]}")" ]; then
-            log "mutter released the KMS node"
+            log "mutter released the display device"
             return 0
         fi
         sleep 0.1
     done
-    log "the KMS node is still held by: $(for p in $(holders "${kms[@]}"); do echo -n "$(describe "$p"); "; done)"
+    log "the display device is still held by: $(for p in $(holders "${kms[@]}"); do echo -n "$(describe "$p"); "; done)"
     return 1
 }
 trap cleanup EXIT
@@ -267,7 +285,7 @@ if [ $wait_s -gt 0 ]; then
     sleep "$wait_s"
 fi
 if [ -n "$kms_holders" ]; then
-    release_kms || fail "mutter did not release the KMS node"
+    release_kms || fail "mutter did not release the display device"
 fi
 for m in "${MODULES[@]}"; do
     is_loaded "$m" && initial+=("$m")
@@ -322,6 +340,6 @@ done
 log "every loaded module has the build ID of its file on disk"
 patched=$(grep -c -P ' (RmDeferNvpcfNotifyIfIdle|RmReplayNvpcfNotify)\t' /proc/kallsyms)
 [ "$patched" = 2 ] || fail "the loaded driver lacks the patch ($patched of 2 symbols found)"
-log "patched code present"
+log "the loaded driver contains the patch"
 succeeded=1
 log "END"

@@ -2,10 +2,10 @@
 """Check revoke.py, as root, against a throwaway process owned by the user
 nobody.
 
-revoke.py must refuse PID 1 and root-owned processes without attaching, and
-must replace the descriptors and mappings a two-thread process holds on a
-test file, with scheduler locking on, while the process keeps running and
-its second thread keeps reading through them."""
+revoke.py must refuse PID 1 and root-owned processes without attaching gdb
+to them. In a process with two threads, it must replace the descriptors and
+mappings the process holds on a test file, with scheduler locking on, while
+the process keeps running and its second thread keeps reading through them."""
 import os
 from pathlib import Path
 import shutil
