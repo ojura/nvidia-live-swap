@@ -83,9 +83,12 @@ away from the programs that have it open.
   every monitor runs on the Intel GPU, and opens it again right after each swap.
   `swap.sh` makes GNOME close it by applying the current screen layout again,
   with the same resolution, refresh rate and scaling.
-- A program started during the swap does not use the NVIDIA GPU. Programs find
-  NVIDIA's graphics libraries through three registration files, and `swap.sh`
-  renames these files until the swap ends.
+- During the swap, `swap.sh` renames three registration files, through which
+  programs find NVIDIA's graphics libraries, and gives them their names back
+  at the end. A program that starts during the swap therefore does not load
+  NVIDIA's graphics libraries. A program that opens the GPU's device files
+  directly, such as `nvidia-smi`, can still open the GPU during the swap and
+  make the swap fail.
 
 ## Limitations
 
