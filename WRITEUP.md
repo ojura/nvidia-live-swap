@@ -1,7 +1,5 @@
 # nvidia-live-swap: technical details
 
-This file describes the firmware and driver code behind the Legion 7 16IRX9
-problem, the two patches, the measurements, and how each script and test works.
 [README.md](README.md) explains how to use the scripts.
 
 ## Firmware and driver
@@ -53,16 +51,16 @@ the deferral to the fine-grained mode of the driver's runtime power management,
 driver powers the GPU down after the GPU has been idle for some time. In the
 coarse-grained mode, `NVreg_DynamicPowerManagement=1`, the driver powers the GPU
 down only while the GPU is uninitialized, that is, while every program has
-closed it. The unpatched driver does not resume the GPU for a notification in
-this mode, so deferring the notification would only delay it. The pull request's
-`RmDeferNvpcfNotifyIfIdle` also locks `dynamic_power.mutex` without checking the
-mode first. `os_ref_dynamic_power` and `os_unref_dynamic_power` check the mode
-before they lock the mutex. If the driver fails to create the mutex, it leaves
-the mutex NULL and turns runtime power management off. The two existing
-functions then return before locking, but the new function would dereference
-NULL at the next notification. `0002` gives the new function the same mode
-check, so the coarse-grained and disabled modes keep the existing notification
-path.
+closed it. In that mode, `os_ref_dynamic_power(nv, NV_DYNAMIC_PM_FINE)`, which
+the notification path calls, returns before it takes a power reference. The
+pull request's `RmDeferNvpcfNotifyIfIdle` also locks `dynamic_power.mutex`
+without checking the mode first. `os_ref_dynamic_power` and
+`os_unref_dynamic_power` check the mode before they lock the mutex. If the
+driver fails to create the mutex, it leaves the mutex NULL and turns runtime
+power management off. The two existing functions then return before locking,
+but the new function would dereference NULL at the next notification. `0002`
+gives the new function the same mode check, so the coarse-grained and disabled
+modes keep the existing notification path.
 
 ## Measurements
 
@@ -82,9 +80,14 @@ notifications and the GPU's power state.
 
 A swap from the unpatched 595.99.02 to 595.99.02 with patch 0001 takes 6.7
 seconds. A swap from that build to 615.71.09 with both patches takes 6.8
-seconds. Two swaps that reload the same 615.71.09 build take 6.1 and 4.6
-seconds. gnome-shell, Xwayland and the other open programs keep running through
-all four swaps.
+seconds. Two swaps that reload the same 615.71.09 build, started 17 seconds
+apart, take 6.1 and 4.6 seconds. gnome-shell, Xwayland and the other open
+programs keep running through all four swaps.
+
+During the second of the two 615.71.09 swaps, rtkit-daemon refuses four of
+mutter's requests, and mutter reads the state of the reloaded display device
+with its KMS thread still real-time. The 20-second wait in `swap.sh` prevents
+this case.
 
 ## Old firmware package during a version change
 
@@ -191,17 +194,17 @@ the CPU for 200 milliseconds without blocking. mutter takes the thread out of
 real-time scheduling while it reads a display device's state, sets its modes or
 disables it, and makes it real-time again afterwards
 (`meta_thread_inhibit_realtime_in_impl` in mutter 46.2). It asks rtkit-daemon
-for each of these changes, and a swap makes it ask several times. With two
-swaps 17 seconds apart on 615.71.09, rtkit-daemon refuses four of mutter's
-requests, and mutter reads the state of the reloaded device with the thread
-still real-time. gnome-shell keeps running.
+for each of these changes, and a swap makes it ask several times. When
+rtkit-daemon refuses a request, the thread stays real-time during these calls.
+Two swaps less than 20 seconds apart can use up the 25 requests.
 
-On a failure or a signal (SIGINT, SIGTERM or SIGHUP), `swap.sh` loads from disk
-every NVIDIA module that was loaded at the start and is now missing. It renames
-the files back, starts the stopped services, and exits with a non-zero status.
-Revoked handles stay revoked. `swap.sh` records each change before it makes the
-change. So when a signal arrives after a change has taken effect, but before its
-command has returned, `swap.sh` still undoes the change.
+On a failure or a signal (SIGINT, SIGTERM or SIGHUP), `swap.sh` tries to load
+from disk every NVIDIA module that was loaded at the start and is now missing.
+It tries to rename the files back and to start the stopped services, logs each
+step that fails, and exits with a non-zero status. Revoked handles stay revoked.
+`swap.sh` records each change before it makes the change. So when a signal
+arrives after a change has taken effect, but before its command has returned,
+`swap.sh` still tries to undo the change.
 
 `swap.sh` logs `END` only when every module it loaded has the same build ID as
 its file on disk, and the loaded driver contains the patch. Otherwise it logs
@@ -228,9 +231,7 @@ function calls into it. gdb stops every thread when it attaches, and
 default, gdb resumes every thread for the duration of each injected call.
 `revoke.py` turns gdb's scheduler locking on, and stops if gdb does not confirm
 the setting. With scheduler locking on, the other threads stay stopped while the
-injected calls run in one thread. A worker thread that increments a counter in
-a loop advances it 87 times during one injected 100 ms `usleep` call with gdb's
-default setting, and 0 times with scheduler locking on.
+injected calls run in one thread.
 
 `revoke.py` checks each call's result before it makes the next call. If a call
 fails, the calls before it stay in effect, and `revoke.py` exits with status 1.
@@ -280,7 +281,9 @@ of the same version. `build.sh` clones that tag. It compares the tag's
 refuses to continue if they differ. The comparison skips `dkms.conf`,
 `.gitignore` and the files that only Ubuntu's tree has, such as the patches with
 Ubuntu's build fixes. If the sources differed, the driver core built from the
-tag might not match the rest of the modules.
+tag might not match the rest of the modules. For 615.71.09, Ubuntu's
+`nvidia-dkms-615-open` adds two build fixes for 7.0 kernels. They change only
+the code between the driver and the kernel, and leave the driver core as it is.
 
 `build.sh` then applies the patches in `patches/`, builds the driver core, and
 checks that the result contains `RmDeferNvpcfNotifyIfIdle`. It adds a dpkg

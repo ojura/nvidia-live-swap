@@ -2,10 +2,9 @@
 
 `swap.sh` replaces the loaded NVIDIA kernel driver with the driver installed on
 disk, while the GNOME session keeps running. So a new or patched driver can be
-loaded without a logout or a reboot. The programs in the session keep running as
-well. A program that had the NVIDIA GPU open loses its access to the GPU, and
-gets it back when it restarts. gnome-shell, the program that runs the GNOME
-desktop, gets it back at the next login.
+loaded without a logout or a reboot. A program that had the NVIDIA GPU open
+loses its access to the GPU, and gets it back when it restarts. gnome-shell, the
+program that runs the GNOME desktop, gets it back at the next login.
 
 `build.sh` builds Ubuntu's NVIDIA driver with a fix for the Lenovo Legion 7
 16IRX9 laptop. In GNOME's Balanced power mode, the laptop's firmware sends its
@@ -18,9 +17,9 @@ stays asleep. In the Performance and Power Saver modes, the firmware does not
 send these messages.
 
 The fix is [pull request #1299][pr1299] to NVIDIA's open-gpu-kernel-modules
-repository, by Lars Nieradzik. A second patch from this repository limits the
-fix to one setting of the driver's power management. In that setting, which the
-Legion uses, the unpatched driver wakes the GPU for these messages.
+repository, by Lars Nieradzik. A second patch from this repository fixes a crash
+in the pull request's code. The crash can happen only if a memory allocation
+fails while the driver loads.
 
 The scripts are tested on a Legion 7 16IRX9 (RTX 4070 Laptop GPU) with Ubuntu
 24.04, kernel 7.0, GNOME 46 on Wayland, and Ubuntu's packages of NVIDIA's open
@@ -38,10 +37,8 @@ Run the scripts from the repository directory.
 - `sudo ./swap.sh --check` lists the programs that have the NVIDIA GPU open, and
   says whether a swap can go ahead now. It only reads the state of the system.
 - `sudo ./swap.sh` unloads the NVIDIA kernel modules and loads the modules
-  installed on disk. Kernel modules are the parts of a driver that run inside
-  the Linux kernel. The NVIDIA driver's modules are `nvidia`, `nvidia_modeset`,
-  `nvidia_drm` and `nvidia_uvm`. After loading them, `swap.sh` checks that the
-  loaded modules match the files on disk and contain the fix.
+  installed on disk. Then it checks that the loaded modules match the files on
+  disk and contain the fix.
 - `sudo ./trace.sh [seconds]` records the firmware's messages to the driver for
   60 seconds, or for the given number of seconds. It shows each message, how
   long the driver takes to handle it, and when the GPU goes to sleep or wakes
@@ -65,7 +62,10 @@ away from the programs that have it open.
 - A program that does not run as root loses its access to the GPU. `swap.sh`
   replaces the program's NVIDIA file handles with handles to `/dev/null`, an
   empty device, and the program pauses for 0.1 to 2 seconds while this happens.
-  The program keeps running, but it cannot use the NVIDIA GPU until it restarts.
+  `swap.sh` does not stop the program, but the program's later calls to the
+  NVIDIA GPU fail until it restarts. A program that does not handle these
+  failures can crash. On the Legion, gnome-shell, Xwayland and two Electron
+  programs keep running.
 - gnome-shell and Xwayland lose their access too. Xwayland is the server that
   lets X11 programs run on Wayland. On Wayland, gnome-shell is the display
   server itself, so restarting it ends everything that draws on the screen.
@@ -80,16 +80,12 @@ away from the programs that have it open.
   starts them again after the swap. LACT is a tool that monitors and tunes the
   GPU.
 - GNOME keeps the NVIDIA GPU's display device, `/dev/dri/cardN`, open even while
-  every monitor runs on the Intel GPU. GNOME uses this device file to show a
-  picture on monitors that are connected to the NVIDIA GPU. It closes the file
-  only the next time it sets up the screens. `swap.sh` makes GNOME do that by
-  applying the current screen layout again, with the same resolution, refresh
-  rate and scaling. Then `swap.sh` waits up to 10 seconds for GNOME to close the
-  file. GNOME opens the new display device right after the swap, so every later
-  swap repeats this step.
-- Programs find NVIDIA's graphics libraries through three registration files.
-  `swap.sh` renames the registration files during the swap, so that a program
-  started during the swap does not load NVIDIA's libraries and open the GPU.
+  every monitor runs on the Intel GPU, and opens it again right after each swap.
+  `swap.sh` makes GNOME close it by applying the current screen layout again,
+  with the same resolution, refresh rate and scaling.
+- A program started during the swap does not use the NVIDIA GPU. Programs find
+  NVIDIA's graphics libraries through three registration files, and `swap.sh`
+  renames these files until the swap ends.
 
 ## Limitations
 
@@ -110,25 +106,21 @@ before it renames files, stops services or takes the GPU away from any program.
   `swap.sh --check` names the file. Remove its `.hotswap` suffix before the next
   swap.
 
-Swaps have to be at least 20 seconds apart. GNOME's display thread runs with
-real-time priority, which lets a thread run ahead of ordinary threads. GNOME
-takes the thread off real-time priority while it reads or changes the state of
-a display device, and gives the priority back afterwards. For each of these
-changes it asks rtkit-daemon, the service that grants real-time priority, and a
-swap makes GNOME ask several times. By default, rtkit-daemon accepts 25 such
-requests per user in 20 seconds and refuses the rest. After a refusal, the
-thread keeps real-time priority while GNOME sets up the new driver's display
-device. If the thread then uses the CPU for 200 milliseconds without waiting
-for anything, the kernel kills gnome-shell, which ends the session. So if the
-previous swap ended less than 20 seconds earlier, `swap.sh` waits for the rest
-of the 20 seconds. `swap.sh --check` shows how long that wait would be.
+Swaps have to be at least 20 seconds apart. During a swap, GNOME asks
+rtkit-daemon, the service that grants real-time priority to threads, several
+times to change the priority of its display thread. rtkit-daemon accepts 25
+such requests per user in 20 seconds. When it refuses one, the kernel can kill
+gnome-shell, which ends the session. [WRITEUP.md](WRITEUP.md#swapsh) explains
+how. So if the previous swap ended less than 20 seconds earlier, `swap.sh`
+waits for the rest of the 20 seconds. `swap.sh --check` shows how long that
+wait would be.
 
-If a swap fails or is interrupted, `swap.sh` loads from disk every NVIDIA module
-that was loaded before the swap and is now missing. It renames the registration
-files back, starts the services it stopped, and exits with an error. The modules
-it loads come from disk, so they can be a different build from the modules it
-unloaded. A program that lost its access to the GPU keeps running without it
-until it restarts.
+If a swap fails or is interrupted, `swap.sh` tries to load from disk every
+NVIDIA module that was loaded before the swap and is now missing. It also tries
+to rename the registration files back and to start the services it stopped.
+Then it exits with an error. The modules it loads come from disk, so they can be
+a different build from the modules it unloaded. A program that lost its access
+to the GPU gets it back only when it restarts.
 
 A new driver version also installs new NVIDIA libraries, which programs load to
 use the GPU. These libraries work only with kernel modules of the same version.
@@ -187,11 +179,6 @@ These steps change the driver version of the running session, for example from
    cc -std=c11 -Wall -Wextra -Werror -O2 tests/check_egl.c -o /tmp/check-nvidia-egl $(pkg-config --cflags --libs egl glesv2)
    /tmp/check-nvidia-egl
    ```
-
-For the move from 595.99.02 to 615.71.09, apt replaces 20 NVIDIA packages with
-21, including the 32-bit libraries. Ubuntu's `nvidia-dkms-615-open` adds two
-build fixes for 7.0 kernels. These fixes change only the code between the driver
-and the kernel. The driver core, which `build.sh` replaces, stays as it is.
 
 ## Restoring Ubuntu's driver core
 
