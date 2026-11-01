@@ -4,9 +4,12 @@
 # power state. A notification that wakes the GPU takes about 2 seconds; one
 # that does not takes microseconds.
 set -u
+DIR=$(cd "$(dirname "$0")" && pwd)
+. "$DIR/lib.sh"
+gpu=$(nvidia_gpu) || { echo "no NVIDIA GPU found"; exit 1; }
 C=/sys/kernel/debug/dynamic_debug/control
 T=/sys/kernel/tracing
-G=/sys/bus/pci/devices/0000:01:00.0/power/runtime_status
+G=/sys/bus/pci/devices/$gpu/power/runtime_status
 echo "platform profile: $(cat /sys/firmware/acpi/platform_profile)"
 echo 0 > $T/tracing_on; echo > $T/trace
 echo function_graph > $T/current_tracer

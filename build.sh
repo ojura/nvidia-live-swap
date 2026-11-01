@@ -46,8 +46,13 @@ fi
 install -m 644 -o root -g root "$built" "$obj"
 echo "== installed the patched driver core as $obj"
 
+skipped=()
 for k in $(dkms status "nvidia/$ver" | sed -nE "s#^nvidia/$ver, ([^,]+),.*#\1#p"); do
-    [ -d "/lib/modules/$k/build" ] || { echo "== $k: no headers, skipped"; continue; }
+    if [ ! -d "/lib/modules/$k/build" ]; then
+        echo "== $k: no kernel headers, not rebuilt"
+        skipped+=("$k")
+        continue
+    fi
     echo "== $k"
     dkms build -m nvidia -v "$ver" -k "$k" --force > "$work/dkms-$k.log" 2>&1 || { tail -20 "$work/dkms-$k.log"; exit 1; }
     dkms install -m nvidia -v "$ver" -k "$k" --force > "$work/dkms-install-$k.log" 2>&1 || { tail -20 "$work/dkms-install-$k.log"; exit 1; }
@@ -62,4 +67,8 @@ for k in $(dkms status "nvidia/$ver" | sed -nE "s#^nvidia/$ver, ([^,]+),.*#\1#p"
         echo "   $ko lacks the patch"; exit 1
     fi
 done
+if [ ${#skipped[@]} -gt 0 ]; then
+    echo "== these kernels still have modules without the patch: ${skipped[*]}"
+    exit 1
+fi
 echo "== done; the patched modules load at the next boot, or now with $here/swap.sh"
