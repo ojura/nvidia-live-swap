@@ -11,16 +11,16 @@
 # with the processes that hold one in three ways:
 # - swap.sh never revokes handles on the GPU's display device,
 #   /dev/dri/cardN (its KMS node). mutter, which runs inside gnome-shell,
-#   keeps its display state on it, and systemd-logind and systemd hold
-#   copies of mutter's descriptor. mutter releases the device the next time
-#   it sets the display modes. When gnome-shell, systemd-logind and systemd
-#   are the only holders, swap.sh first runs reapply-layout.py as
-#   gnome-shell's user. That script applies the current display layout
-#   again, which makes mutter set the modes, and swap.sh waits up to 10
-#   seconds for the release. If the device has another holder, if a monitor
-#   is connected to the NVIDIA GPU, or if mutter does not release the
-#   device, swap.sh exits before it hides files, stops services or revokes
-#   handles.
+#   drives the monitors on the NVIDIA GPU's ports through it, and
+#   systemd-logind and systemd hold copies of mutter's descriptor. mutter
+#   releases the device the next time it sets the display modes. When
+#   gnome-shell, systemd-logind and systemd are the only holders, swap.sh
+#   first runs reapply-layout.py as gnome-shell's user. That script applies
+#   the current display layout again, which makes mutter set the modes, and
+#   swap.sh waits up to 10 seconds for the release. If the device has
+#   another holder, if a monitor is connected to the NVIDIA GPU, or if
+#   mutter does not release the device, swap.sh exits before it hides
+#   files, stops services or revokes handles.
 # - The other NVIDIA devices are /dev/nvidia*, /dev/nvidia-caps/* and the
 #   GPU's render node. swap.sh accepts a root process as a holder of these
 #   only if the process belongs to one of the services in STOPPABLE. Those
@@ -35,12 +35,15 @@
 #
 # Each swap makes mutter ask rtkit-daemon several times to take its KMS
 # thread (the thread that sends display updates to the kernel) out of
-# real-time scheduling and to make it real-time again. rtkit-daemon by
-# default allows 25 such requests per user in 20 seconds. Two swaps started
-# 17 seconds apart reached that limit, and mutter probed the reloaded device
-# with the thread still real-time. swap.sh therefore records when each swap
-# ends, and starts the next swap only after GAP seconds have passed since
-# then.
+# real-time scheduling and to make it real-time again. mutter takes the
+# thread out while it reads a display device's state, sets its modes or
+# disables it. rtkit-daemon by default allows 25 such requests per user in
+# 20 seconds and refuses the rest. After a refusal the thread stays
+# real-time during those calls. mutter sets RLIMIT_RTTIME to rtkit-daemon's
+# RTTimeUSecMax, 200 ms by default, so the kernel kills gnome-shell if the
+# real-time thread uses the CPU for 200 ms without blocking. swap.sh
+# therefore records when each swap ends, and starts the next swap only
+# after GAP seconds have passed since then.
 #
 # Once the display device is free, a swap hides the files that register
 # NVIDIA's EGL and Vulkan libraries with their loaders (HIDE), so that a
