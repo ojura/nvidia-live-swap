@@ -4,8 +4,9 @@ nobody.
 
 revoke.py must refuse PID 1 and root-owned processes without attaching gdb
 to them. In a process with two threads, it must replace the descriptors and
-mappings the process holds on a test file, with scheduler locking on, while
-the process keeps running and its second thread keeps reading through them."""
+mappings the process holds on a test file, with scheduler locking on. After
+gdb detaches, the process must keep running, and its second thread must keep
+reading through the replaced descriptor and mapping."""
 import os
 from pathlib import Path
 import shutil

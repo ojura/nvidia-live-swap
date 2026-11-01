@@ -1,14 +1,10 @@
 #!/usr/bin/python3 -I
-"""Make Mutter release the display devices it holds but does not use.
+"""Apply the current GNOME display layout again, so that Mutter releases the
+display devices it holds but does not use.
 
-Mutter releases them the next time it sets the display modes, so this script
-applies the current GNOME monitor layout again. Run it as the desktop user.
-It rebuilds the current configuration from Mutter's GetCurrentState and asks
-Mutter to validate it. With --check, it stops there. A normal run then
-applies it with Mutter's temporary method, which neither asks the user to
-confirm the change nor saves it, and checks that the active modes,
-positions, scales, transforms, primary monitor, underscanning and layout
-mode stayed the same.
+Run as the desktop user. The script asks Mutter to validate the current
+layout, applies it without saving it or asking for confirmation, and checks
+that the active layout stays the same.
 """
 import argparse
 import json

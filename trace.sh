@@ -23,10 +23,9 @@
 # nv_acpi_nvpcf_event alone, because with an empty filter, function_graph
 # would trace every kernel function. The kernel logs EC queries only as
 # debug messages of the EC driver, so trace.sh turns on the EC driver's
-# debug lines that are off, and only those. It checks every write to a
-# control file, except the two that reset the instance just before it is
-# removed. On exit, including on a signal, it removes the instance and
-# turns off the debug lines it turned on.
+# debug lines that are off, and only those. On exit, including on a
+# signal, it removes the instance and turns off the debug lines it turned
+# on.
 set -u
 usage() { echo "usage: trace.sh [seconds]" >&2; exit 2; }
 [ $# -le 1 ] || usage

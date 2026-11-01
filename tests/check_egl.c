@@ -4,8 +4,8 @@
  *
  * Build: cc -std=c11 -Wall -Wextra -Werror -O2 tests/check_egl.c \
  *          -o /tmp/check-nvidia-egl $(pkg-config --cflags --libs egl glesv2)
- * Run as the desktop user. The test uses NVIDIA's EGL vendor library and
- * a pbuffer, without connecting to Wayland or X11.
+ * Run as the desktop user. The test uses NVIDIA's EGL vendor library and an
+ * off-screen buffer (a pbuffer). It does not connect to Wayland or X11.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <EGL/egl.h>
@@ -95,8 +95,11 @@ int main(void)
     const char *renderer = (const char *)glGetString(GL_RENDERER);
     const char *version = (const char *)glGetString(GL_VERSION);
     if (!vendor || !renderer || !version || !strstr(vendor, "NVIDIA")) {
-        fprintf(stderr, "The GL context does not report NVIDIA as its vendor, "
-                        "or lacks a renderer or version string\n");
+        fprintf(stderr, "Expected an NVIDIA GL context.\nVendor: %s\n"
+                        "Renderer: %s\nVersion: %s\n",
+                vendor ? vendor : "(missing)",
+                renderer ? renderer : "(missing)",
+                version ? version : "(missing)");
         goto cleanup;
     }
     printf("EGL %d.%d, %s\nRenderer: %s\nGL: %s\n", major, minor,

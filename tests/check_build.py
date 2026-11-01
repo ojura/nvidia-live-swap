@@ -1,9 +1,11 @@
 #!/usr/bin/python3
 """Run build.sh as an ordinary user, with mock commands and, for each case, a
-throwaway directory in place of /usr/src and /lib/modules. The cases check
-which kernels build.sh builds the modules for, and that it stops before the
-dpkg diversion and before installing the patched driver core when dkms
-status fails or the running kernel's headers are missing."""
+throwaway directory in place of /usr/src and /lib/modules.
+
+The cases check the kernels that build.sh builds the modules for. They also
+check that build.sh stops before it adds the dpkg diversion or installs the
+patched driver core when dkms status fails or the running kernel's headers
+are missing."""
 import json
 import os
 from pathlib import Path

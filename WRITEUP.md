@@ -316,14 +316,12 @@ the notifications with ftrace, the kernel's built-in tracer. ftrace's
 `function_graph` tracer records how long each call to a traced function takes,
 and `trace.sh` traces only `nv_acpi_nvpcf_event`, the driver function that
 receives the notification. The trace runs in a private tracing instance, so the
-global tracer settings stay as they are. `trace.sh` checks every write to a
-control file, except the two writes in its exit handler that reset the instance
-just before it is removed. It starts tracing only after the function filter
-reads back as `nv_acpi_nvpcf_event` alone, because with an empty filter
-`function_graph` would trace every kernel function. Before printing, it stops
-the trace and turns the debug messages off again, so the output covers exactly
-the measured period. On exit, including on a signal, it removes the instance and
-turns off the debug messages it turned on.
+global tracer settings stay as they are. It starts tracing only after the
+function filter reads back as `nv_acpi_nvpcf_event` alone, because with an empty
+filter `function_graph` would trace every kernel function. Before printing, it
+stops the trace and turns the debug messages off again, so the output covers
+exactly the measured period. On exit, including on a signal, it removes the
+instance and turns off the debug messages it turned on.
 
 ## Tests
 

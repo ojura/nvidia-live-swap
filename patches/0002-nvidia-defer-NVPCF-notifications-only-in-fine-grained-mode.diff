@@ -2,18 +2,17 @@ From: Juraj Oršulić <juraj.orsulic@fer.hr>
 Subject: [PATCH] nvidia: defer NVPCF notifications only in fine-grained mode
 
 RmDeferNvpcfNotifyIfIdle(), added by open-gpu-kernel-modules pull
-request #1299, takes the dynamic power mutex unconditionally.
-rm_acpi_nvpcf_notify() calls the new function before
-os_ref_dynamic_power(nv, NV_DYNAMIC_PM_FINE), which returns without
-locking when the configured mode is coarse or NV_DYNAMIC_PM_NEVER.
-rm_init_dynamic_power_management() selects NV_DYNAMIC_PM_NEVER when it
-fails to create the mutex, and leaves the mutex NULL, so in that case an
-NVPCF notification would dereference NULL. In coarse mode,
-os_ref_dynamic_power() does not resume the GPU for a notification, so
-deferring the notification would only delay it.
+request #1299, takes the dynamic power mutex without checking the power
+management mode first. rm_acpi_nvpcf_notify() calls the new function
+before os_ref_dynamic_power(nv, NV_DYNAMIC_PM_FINE), which returns
+before it locks the mutex or takes a power reference when the configured
+mode is coarse or NV_DYNAMIC_PM_NEVER. rm_init_dynamic_power_management()
+selects NV_DYNAMIC_PM_NEVER when it fails to create the mutex, and leaves
+the mutex NULL, so in that case an NVPCF notification would dereference
+NULL.
 
-Return NV_FALSE in both modes, so that rm_acpi_nvpcf_notify() calls
-os_ref_dynamic_power() and delivers the notification right away.
+Return NV_FALSE in both modes, so that rm_acpi_nvpcf_notify() keeps its
+existing path there and delivers the notification right away.
 
 ---
 diff --git a/src/nvidia/arch/nvalloc/unix/src/dynamic-power.c b/src/nvidia/arch/nvalloc/unix/src/dynamic-power.c

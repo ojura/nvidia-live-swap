@@ -187,7 +187,7 @@ if last=$(cat "$STAMP" 2>/dev/null) && [[ $last =~ ^[0-9]+$ ]]; then
     age=$(( $(date +%s) - last ))
     if [ "$age" -ge 0 ] && [ "$age" -lt $GAP ]; then
         wait_s=$(( GAP - age ))
-        log "the previous swap ended $age s ago; the swap would first wait $wait_s s, so that rtkit-daemon accepts mutter's scheduling requests"
+        log "the previous swap ended $age s ago, so the swap would first wait $wait_s s"
     fi
 fi
 
