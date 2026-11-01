@@ -165,11 +165,12 @@ A swap runs these steps in order:
    `/usr/share/vulkan/implicit_layer.d/nvidia_layers.json` and
    `/usr/share/vulkan/icd.d/nvidia_icd.json` by adding `.hotswap` to their
    names. The EGL and Vulkan loaders, which programs use to set up graphics on a
-   GPU, find NVIDIA's libraries through these files. So a program that starts
-   during the swap does not load NVIDIA's EGL or Vulkan libraries. Programs
+   GPU, find NVIDIA's libraries through these files, so they do not find them
+   while the files are renamed. GLX finds its vendor library by name, and a
+   program can load a library itself, so neither uses these files. Programs
    that open `/dev/nvidia*` directly, such as CUDA programs and `nvidia-smi`,
-   can still open the GPU. If one does after the check in step 5, the `rmmod`
-   in step 6 fails, and `swap.sh` stops and restores what it can.
+   can still open the GPU. If one holds it open when step 6 unloads the
+   modules, `rmmod` fails, and `swap.sh` stops and restores what it can.
 4. It stops the services.
 5. It revokes the handles, and checks that every process has closed the device
    files.

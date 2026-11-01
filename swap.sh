@@ -46,20 +46,21 @@
 # after GAP seconds have passed since then.
 #
 # Once the display device is free, a swap hides the files that register
-# NVIDIA's EGL and Vulkan libraries with their loaders (HIDE), so that a
-# process started during the swap does not load those libraries. A process
-# that opens /dev/nvidia* directly, such as nvidia-smi, can still open the
-# GPU. If it does so after the holder check, rmmod fails and the swap stops.
-# After hiding the files, a swap stops the services, revokes the handles,
-# unloads nvidia_drm, nvidia_modeset, nvidia_uvm and nvidia, loads them from
-# disk, and restores the files and the services. On a failure or a signal,
-# it tries to restore the modules, the files and the services, and exits
-# with a non-zero status. It loads from disk every NVIDIA module that was
-# loaded at the start and is now missing, so a module it loads again can be
-# a different build from the one it unloaded. Revoked handles stay revoked.
-# It logs END only when every module it loaded has the same build ID as its
-# file on disk, and the loaded driver contains RmDeferNvpcfNotifyIfIdle and
-# RmReplayNvpcfNotify, two of the functions that patch 0001 adds.
+# NVIDIA's EGL and Vulkan libraries with their loaders (HIDE), so that these
+# loaders do not find the libraries during the swap. GLX, a program's own
+# dlopen and direct opens of /dev/nvidia*, as by nvidia-smi, do not use
+# these files. A process that holds /dev/nvidia* open when the modules are
+# unloaded makes rmmod fail, and the swap stops. After hiding the files, a
+# swap stops the services, revokes the handles, unloads nvidia_drm,
+# nvidia_modeset, nvidia_uvm and nvidia, loads them from disk, and restores
+# the files and the services. On a failure or a signal, it tries to restore
+# the modules, the files and the services, and exits with a non-zero status.
+# It loads from disk every NVIDIA module that was loaded at the start and is
+# now missing, so a module it loads again can be a different build from the
+# one it unloaded. Revoked handles stay revoked. It logs END only when every
+# module it loaded has the same build ID as its file on disk, and the loaded
+# driver contains RmDeferNvpcfNotifyIfIdle and RmReplayNvpcfNotify, two of
+# the functions that patch 0001 adds.
 set -u
 usage() { echo "usage: swap.sh [--check]" >&2; exit 2; }
 check_only=0
