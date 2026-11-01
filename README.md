@@ -42,8 +42,11 @@ swap can go ahead now.
   to 10 seconds for the release. On Ubuntu's mutter
   46.2-1ubuntu0.24.04.18, with the built-in screen on Intel, applying the
   layout again released the device and kept the same resolution, refresh
-  rate and scaling; through `swap.sh` itself, that step has run only in the
-  mocked tests so far. Another holder of the device, a monitor connected to
+  rate and scaling, once with 595.99.02 and once with 615.71.09; both runs
+  started `reapply-layout.py` by hand. The command `swap.sh` builds for it
+  ran live as root in validation mode (`--check`, as the desktop user on
+  gnome-shell's session bus). A full release from inside a swap has run
+  only in the mocked tests. Another holder of the device, a monitor connected to
   the NVIDIA GPU, or a release that does not come stops the swap before it
   hides files, stops services or revokes handles.
 - A root process that holds the GPU stops the swap, unless it belongs to
@@ -78,6 +81,8 @@ This order moved the running session from 595.99.02 to 615.71.09 on
 5. `sudo ./build.sh <version>`.
 6. `sudo ./swap.sh`.
 7. `sudo apt-get remove nvidia-firmware-<old branch>-<old version>`.
+8. `tests/check_egl.c` (see Files) checks that a program started after the
+   swap renders with the new driver.
 
 For 615.71.09, apt replaced 20 NVIDIA packages with 21, including the
 32-bit libraries. `nvidia-dkms-615-open` adds two Ubuntu build fixes for
@@ -209,6 +214,16 @@ in every 28.
   against ordinary files in place of the tracing and debug control files,
   with a filter write that fails, and checks that it stops before selecting
   `function_graph` and removes the instance.
+- `tests/check_egl.c`, as the desktop user: renders a shader into a
+  pbuffer through NVIDIA's EGL device platform, with NVIDIA's EGL vendor
+  library selected and `DISPLAY` and `WAYLAND_DISPLAY` unset, so it uses
+  the GPU without Wayland or X11, and checks the pixel it reads back.
+  Build it with `cc -std=c11 -Wall -Wextra -Werror -O2 tests/check_egl.c
+  -o /tmp/check-nvidia-egl $(pkg-config --cflags --libs egl glesv2)` and
+  run `/tmp/check-nvidia-egl`. After the swap to 615.71.09 it printed EGL
+  1.5 NVIDIA, the RTX 4070 Laptop GPU and OpenGL ES 3.2 NVIDIA 615.71.09,
+  and read back the expected pixel 64 127 191 255. Programs started before
+  a swap keep the old libraries, so this checks new programs only.
 - `tests/check_revoke.py` and `tests/check_trace.py`, as root: run
   `revoke.py` against a throwaway two-thread process owned by the user
   `nobody`, and check that `trace.sh` leaves the tracing and debug settings
