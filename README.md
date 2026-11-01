@@ -113,9 +113,9 @@ and the GPU slept for less than a second in every 28.
   and mappings are read from `/proc`, and scheduler locking keeps the other
   threads stopped while the injected calls run in one thread; each call's
   result is checked before the next. The injected calls (`dup2`, `mmap`,
-  `__errno_location`) do not take locks, so they cannot wait for a stopped
-  thread. It refuses PID 1, processes owned by root and processes whose
-  fd 0 is not `/dev/null`.
+  `__errno_location`) do not take user-space locks, so they cannot wait for
+  one held by a stopped thread. It refuses PID 1, processes owned by root
+  and processes whose fd 0 is not `/dev/null`.
 - `lib.sh`: finds the NVIDIA GPU's PCI address, the first display
   controller with NVIDIA's vendor ID.
 - `build.sh [version]`, as root: clones NVIDIA's tag of the version, applies
@@ -134,9 +134,10 @@ and the GPU slept for less than a second in every 28.
   were off get turned on. It checks every write to a control file and
   starts the trace only after the function filter reads back as
   `nv_acpi_nvpcf_event` alone, because with an empty filter
-  `function_graph` would trace every kernel function. On exit, including on
-  a signal, the instance is removed and those debug lines are turned off
-  again.
+  `function_graph` would trace every kernel function. It stops the trace and
+  turns those debug lines off again before printing, so the output covers
+  exactly the sample. On exit, including on a signal, the instance is
+  removed.
 - `tests/check_swap.py`, as an ordinary user: runs `swap.sh` against mocked
   commands and a fake sysfs, `/proc` and registration-file tree. The cases
   are the refusals (display device held, root holders, an unlisted service,

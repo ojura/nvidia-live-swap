@@ -20,6 +20,7 @@ seconds=${1:-60}
 case "$seconds" in
     '' | *[!0-9]*) usage ;;
 esac
+seconds=$((10#$seconds))  # a leading zero would otherwise mean octal
 DIR=$(cd "$(dirname "$0")" && pwd)
 . "$DIR/lib.sh"
 gpu=$(nvidia_gpu) || { echo "cannot find the NVIDIA GPU"; exit 1; }
@@ -69,9 +70,16 @@ while [ "$(date +%s)" -lt $end ]; do
     if [ "$s" != "$prev" ]; then echo "$(date +%T.%N | cut -c1-12) gpu $s"; prev=$s; fi
     sleep 0.1
 done
+# Stop both sources before printing, so the output covers exactly the sample.
+echo 0 > "$I/tracing_on" || fail "could not stop the trace"
+for l in "${ec_off[@]}"; do
+    echo "file drivers/acpi/ec.c line $l -p" > "$C" || fail "could not turn EC debug line $l off again"
+done
+ec_off=()  # turned off already; the EXIT trap leaves them as they are
+records=$(grep nv_acpi_nvpcf_event "$I/trace")
 echo "--- EC queries:"
 dmesg --time-format iso | grep -E "Query\(0x[0-9a-f]+\) started" | awk -v s="$since" '$1 >= s' \
     | sed -E 's/^[^T]+T([^,]+),([0-9]{3}).*(Query\(0x[0-9a-f]+\)).*/\1.\2 \3/'
 echo "--- NVPCF notifications (CPU, duration):"
-grep nv_acpi_nvpcf_event "$I/trace"
-echo "$(grep -c nv_acpi_nvpcf_event "$I/trace") notifications"
+[ -z "$records" ] || printf '%s\n' "$records"
+echo "$(printf '%s' "$records" | grep -c nv_acpi_nvpcf_event) notifications"

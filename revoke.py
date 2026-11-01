@@ -17,10 +17,12 @@
 # every thread for the duration of each call. The descriptors and mappings
 # are read from /proc after the attach, so they stay as read until the last
 # call. The injected calls are dup2, mmap and __errno_location: system-call
-# wrappers and a thread-local read that do not take locks, so they cannot
-# wait for a lock held by a stopped thread. Each call's result is checked before the next; if a call fails,
-# the calls before it stay in effect and the script exits 1. gdb loads only
-# libc's symbols, which keeps the stop short.
+# wrappers and a thread-local read that do not take user-space locks, so they
+# cannot wait for a user-space lock held by a stopped thread. (The system
+# calls take kernel locks; a thread in a ptrace stop does not hold those.)
+# Each call's result is checked before the next; if a call fails, the calls
+# before it stay in effect and the script exits 1. gdb loads only libc's
+# symbols, which keeps the stop short.
 #
 # Refuses PID 1, processes whose real user is root, and processes whose fd 0
 # is not /dev/null.

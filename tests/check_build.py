@@ -134,7 +134,7 @@ check(r, sorted(r['built_for']) == sorted([RUNNING, OTHER]), f"built for {r['bui
 check(r, r['object'] == 'patched object' and 'dpkg-divert --add' in r['calls'], 'object installed behind a diversion')
 
 r = run('other-headers-missing', {'status': INSTALLED}, headers=(RUNNING,))
-check(r, r['exit'] == 1 and f'without the patch: {OTHER}' in r['out'], 'exit 1 naming the skipped kernel')
+check(r, r['exit'] == 1 and f'headers are missing: {OTHER}' in r['out'], 'exit 1 naming the skipped kernel')
 check(r, r['built_for'] == [RUNNING], f"built for {r['built_for']}")
 
 if failures:

@@ -31,8 +31,9 @@ def snapshot():
 
 
 before = snapshot()
-r = subprocess.run(['/bin/bash', str(TRACE), '3'], capture_output=True, text=True)
-check(r.returncode == 0 and '--- NVPCF notifications' in r.stdout, 'a 3-second run completes')
+r = subprocess.run(['/bin/bash', str(TRACE), '03'], capture_output=True, text=True)
+check(r.returncode == 0 and '--- NVPCF notifications' in r.stdout and ' notifications' in r.stdout,
+      'a 3-second run given as 03 completes')
 check(snapshot() == before, 'settings unchanged after a normal run')
 
 p = subprocess.Popen(['/bin/bash', str(TRACE), '30'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

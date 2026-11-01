@@ -110,7 +110,7 @@ done
 mapfile -t services < <(printf '%s\n' "${services[@]}" | sed '/^$/d' | sort -u)
 
 for p in $kms_holders; do log "KMS node held by $(describe "$p")"; done
-for u in "${services[@]}"; do log "service $u holds the GPU; it is stopped for the swap"; done
+for u in "${services[@]}"; do log "service $u holds the GPU; it would be stopped during a swap"; done
 for p in "${users[@]}"; do log "handles to revoke: $(describe "$p")"; done
 for p in "${blockers[@]}"; do
     u=$(unit_of "$p")

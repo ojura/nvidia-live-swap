@@ -95,7 +95,7 @@ for k in "${targets[@]}"; do
     fi
 done
 if [ ${#skipped[@]} -gt 0 ]; then
-    echo "== these kernels still have modules without the patch: ${skipped[*]}"
+    echo "== these kernels were not rebuilt because their headers are missing: ${skipped[*]}"
     exit 1
 fi
 echo "== done; the patched modules load at the next boot, or now with $here/swap.sh"
