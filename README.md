@@ -18,7 +18,8 @@ in the runs so far.
 On 2026-11-01 it replaced the driver of a Legion 7 16IRX9 (Ubuntu 24.04,
 kernel 7.0, GNOME 46 on Wayland, NVIDIA open kernel modules 595.99.02) in
 6.7 seconds, and gnome-shell, Xwayland and every open program kept
-running.
+running. Later the same day it moved the same session from 595.99.02 to
+615.71.09 in 6.8 seconds.
 
 `swap.sh --check` only reads: it reports what holds the GPU and whether a
 swap can go ahead now. If it reports display-device holders on an unused
@@ -49,10 +50,40 @@ monitor configuration temporarily; it does not change the saved layout.
 - When a swap fails after the revokes, the revoked programs stay without the
   NVIDIA GPU, and the modules `swap.sh` loads again come from disk, which
   can be a different build from the one it unloaded.
-- Only a swap to the same driver version has been tested. A new version also
-  replaces NVIDIA's user-space libraries, and NVIDIA's libraries refuse a
-  kernel module of another version, so programs started between installing
-  the new packages and the swap cannot use the NVIDIA GPU.
+- A new driver version also replaces NVIDIA's user-space libraries, and
+  NVIDIA's libraries refuse a kernel module of another version. Programs
+  started between installing the new packages and the swap cannot use the
+  NVIDIA GPU, and programs that were running before keep the old libraries
+  until they restart; for gnome-shell, until the next login.
+
+## Moving to a new driver version
+
+This order moved the running session from 595.99.02 to 615.71.09 on
+2026-11-01:
+
+1. `sudo ./swap.sh --check`. If it reports holders of the display device,
+   run `./reapply-layout.py` and check again.
+2. Restore Ubuntu's driver core of the installed version and remove its
+   diversion, with the two commands under "After an NVIDIA driver update"
+   below, so that apt removes the old package cleanly.
+3. `sudo apt-get install nvidia-driver-<branch>-open`. apt replaces the old
+   packages, keeps the old firmware package and marks it for autoremove.
+   Keep it until after the swap: the old driver reads its GSP firmware from
+   disk whenever it initializes the GPU, which happens when a program opens
+   the GPU after the last one has closed it (`nv_open_device` calls
+   `rm_init_adapter` while the device is uninitialized).
+4. Ubuntu's DKMS hook builds the new version only for the running kernel.
+   For every other kernel that should keep an NVIDIA driver, run
+   `sudo dkms install -m nvidia -v <version> -k <kernel>`.
+5. `sudo ./build.sh <version>`.
+6. `sudo ./swap.sh`.
+7. `sudo apt-get remove nvidia-firmware-<old branch>-<old version>`.
+
+For 615.71.09, apt replaced 20 NVIDIA packages with 21, including the
+32-bit libraries. `nvidia-dkms-615-open` adds two Ubuntu build fixes for
+7.0 kernels, which change only the Linux interface code, not the driver
+core. The swap needed only `lactd` stopped, because the earlier swap had
+already revoked the other holders.
 
 ## The driver fix it was built for
 
@@ -85,11 +116,14 @@ Both apply to 595.99.02, 610.57.04, 615.71.09 and 615.78.08. `build.sh`
 builds Ubuntu's driver package with them, and `swap.sh` loads the result
 into the running system.
 
-Result on 2026-11-01, driver 595.99.02, `balanced`, after the live swap: the
-EC raised query 0x48 every 6.97 seconds, each notification took 10 to 41
-microseconds, and the GPU suspended at 13:55:08 and stayed suspended. Before
-the patch, two of eight notifications in a minute took 2.0 and 2.1 seconds,
-and the GPU slept for less than a second in every 28.
+Results on 2026-11-01 in `balanced`, after each live swap: with 595.99.02
+the EC raised query 0x48 every 6.97 seconds, each notification took 10 to
+41 microseconds, and the GPU suspended at 13:55:08 and stayed suspended.
+With 615.71.09 the queries came every 6.98 seconds, the nine notifications
+in a minute took 10 to 29 microseconds, and the GPU suspended at 15:30:16
+and stayed suspended. Before the patch, two of eight notifications in a
+minute took 2.0 and 2.1 seconds, and the GPU slept for less than a second
+in every 28.
 
 ## Files
 
