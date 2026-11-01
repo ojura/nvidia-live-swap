@@ -126,6 +126,8 @@ elif cmd == 'runuser':
         st['kms_holders'] = []
     save(st)
     sys.exit(cfg.get('reapply_rc', 0))
+elif cmd == 'sleep':
+    pass
 elif cmd == 'getent':
     if args == ['passwd', '1000']:
         print('desktop:x:1000:1000::/home/desktop:/bin/bash')
@@ -184,22 +186,26 @@ def build_tree(root, nvidia_drm, patched, leftover, connected=False):
 
 
 def rewrite(text, root):
+    text = text.replace('/run/nvidia-live-swap.last', str(root / 'last-swap'))
     for f in HIDE:
         text = text.replace(f, str(root / 'files' / f.lstrip('/')))
     return text.replace('/proc/', f'{root}/proc/').replace('/sys/', f'{root}/sys/')
 
 
 def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
-        nvidia_drm=('card0', 'renderD129'), patched=True, leftover=False, connected=False):
+        nvidia_drm=('card0', 'renderD129'), patched=True, leftover=False, connected=False,
+        last_swap_age=None):
     cfg = cfg or {}
     root = Path(tempfile.mkdtemp(prefix=name + '-', dir=BASE))
     build_tree(root, nvidia_drm, patched, leftover, connected)
+    if last_swap_age is not None:
+        (root / 'last-swap').write_text(f'{int(time.time()) - last_swap_age}\n')
     (root / 'bin').mkdir()
     mock = root / 'mock'
     mock.write_text(MOCK)
     mock.chmod(0o755)
     for cmd in ('mv', 'systemctl', 'fuser', 'setsid', 'python3', 'rmmod', 'modprobe', 'lsmod',
-                'modinfo', 'readelf', 'runuser', 'getent'):
+                'modinfo', 'readelf', 'runuser', 'getent', 'sleep'):
         (root / 'bin' / cmd).symlink_to(mock)
     (root / 'config.json').write_text(json.dumps(cfg))
     (root / 'state.json').write_text(json.dumps({
@@ -231,6 +237,8 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
         'fuser_args': [a for c, a in calls if c == 'fuser'],
         'revoke_args': [a for c, a in calls if c == 'python3'],
         'runuser_args': [a for c, a in calls if c == 'runuser'],
+        'long_sleeps': [float(a[0]) for c, a in calls if c == 'sleep' and float(a[0]) >= 1],
+        'stamp': (root / 'last-swap').read_text().strip() if (root / 'last-swap').exists() else None,
         'order': [c for c, _ in calls if c in MODIFYING],
         'revoked': st['revoked'],
         'rmmod': [a[0] for c, a in calls if c == 'rmmod'],
@@ -374,6 +382,21 @@ r = run('interrupted-after-rmmod', {'pause_after_rmmod': 'nvidia_modeset'}, inte
 check(r, r['exit'] == 1, f"exit {r['exit']}")
 check(r, r['modprobe'] == ['nvidia_modeset', 'nvidia_drm'], f"reloaded {r['modprobe']}")
 check(r, sorted(r['loaded']) == sorted(MODULES) and r['hidden'] == [], 'modules and files restored')
+
+r = run('recent-swap-waits', last_swap_age=5)
+check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'), f"exit {r['exit']}")
+check(r, len(r['long_sleeps']) == 1 and 14 <= r['long_sleeps'][0] <= 16, f"waited {r['long_sleeps']}")
+check(r, r['stamp'] is not None and abs(int(r['stamp']) - time.time()) < 30, f"stamp {r['stamp']}")
+
+r = run('recent-swap-check', last_swap_age=5, args=['--check'])
+check(r, r['exit'] == 0 and 'would first wait' in r['out'], f"exit {r['exit']}"); expect_untouched(r)
+check(r, r['long_sleeps'] == [], f"--check waited {r['long_sleeps']}")
+
+r = run('old-swap-no-wait', last_swap_age=60)
+check(r, r['exit'] == 0 and r['long_sleeps'] == [], f"exit {r['exit']}, waited {r['long_sleeps']}")
+
+r = run('stamp-after-failure', {'fail_hide': True})
+check(r, r['exit'] == 1 and r['stamp'] is not None, f"exit {r['exit']}, stamp {r['stamp']}")
 
 if failures:
     print(f"{len(failures)} failures; the cases are in {BASE}")

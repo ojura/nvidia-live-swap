@@ -42,15 +42,22 @@ swap can go ahead now.
   to 10 seconds for the release. On Ubuntu's mutter
   46.2-1ubuntu0.24.04.18, with the built-in screen on Intel, applying the
   layout again released the device and kept the same resolution, refresh
-  rate and scaling, once with 595.99.02 and once with 615.71.09; both runs
-  started `reapply-layout.py` by hand. The command `swap.sh` builds for it
-  ran live as root in validation mode (`--check`, as the desktop user on
-  gnome-shell's session bus). A full release from inside a swap has run
-  only in the mocked tests. Another holder of the device, a monitor connected to
+  rate and scaling, once with 595.99.02 and once with 615.71.09, both times
+  with `reapply-layout.py` started by hand. On 2026-11-01 at 15:59 a swap
+  did it by itself: `swap.sh` ran the helper as the desktop user, mutter
+  released the device 0.45 seconds later, the swap went on, and the display
+  configuration afterwards was the same as before. Another holder of the device, a monitor connected to
   the NVIDIA GPU, or a release that does not come stops the swap before it
   hides files, stops services or revokes handles.
 - A root process that holds the GPU stops the swap, unless it belongs to
   `lactd`, `nvidia-persistenced` or `nvidia-powerd`.
+- A swap starts at least 20 seconds after the previous one ended, and
+  waits out the rest otherwise. Each swap makes mutter switch its KMS thread
+  out of real-time scheduling and back several times through rtkit-daemon,
+  which by default allows 25 such requests per user in 20 seconds. Two
+  swaps started 17 seconds apart reached that limit, and mutter probed the
+  reloaded device with the thread still real-time; the session kept
+  running.
 - When a swap fails after the revokes, the revoked programs stay without the
   NVIDIA GPU, and the modules `swap.sh` loads again come from disk, which
   can be a different build from the one it unloaded.
@@ -141,8 +148,9 @@ in every 28.
   afterwards; any other root process stops the swap, including one in
   another service, because stopping that could end someone's work; and
   processes not owned by root have their handles revoked. A registration
-  file left hidden by an interrupted earlier run also stops it. During the
-  swap it hides NVIDIA's EGL and Vulkan registration files, so that a
+  file left hidden by an interrupted earlier run also stops it. It records
+  when each run ends in `/run/nvidia-live-swap.last` and waits until 20
+  seconds have passed since then. During the swap it hides NVIDIA's EGL and Vulkan registration files, so that a
   program started meanwhile does not open the GPU. On a failure or a signal
   it exits with a non-zero status after trying to restore what it changed:
   it loads from disk every NVIDIA module that was loaded at the start and
@@ -199,8 +207,10 @@ in every 28.
   `reapply-layout.py` run as gnome-shell's user, a release that does not
   come, a failing layout helper, a full swap, a GPU numbered
   card1/renderD128, failures to hide a file, revoke, unload and load, a
-  missing patch, a mismatched build ID, and SIGTERM after a service stop,
-  during an `rmmod` and after one.
+  missing patch, a mismatched build ID, SIGTERM after a service stop,
+  during an `rmmod` and after one, the wait after a recent swap (in a swap
+  and in `--check`), an immediate start after an older one, and the end
+  time recorded after a failed swap.
 - `tests/check_build.py`, as an ordinary user: runs `build.sh` against
   mocked commands and a fake `/usr/src` and `/lib/modules` tree. The cases
   are a failing `dkms status`, a version DKMS lists only as `added`, missing

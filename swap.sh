@@ -26,6 +26,13 @@
 #   the GPU's render node revoked with revoke.py. A revoked process keeps
 #   running without access to the NVIDIA GPU until it restarts.
 #
+# Each swap makes mutter switch its KMS thread out of real-time scheduling
+# and back several times, through rtkit-daemon, which by default allows 25
+# such requests per user in 20 seconds. Two swaps started 17 seconds apart
+# reached that limit, and mutter probed the reloaded device with the thread
+# still real-time. swap.sh therefore records when each run ends and starts a
+# swap at least GAP seconds after the previous one.
+#
 # The swap hides NVIDIA's EGL and Vulkan registration files, so that a
 # process started during the swap does not open the GPU, unloads nvidia_drm,
 # nvidia_modeset, nvidia_uvm and nvidia, loads them from disk, and restores
@@ -52,6 +59,8 @@ HIDE=(/usr/share/glvnd/egl_vendor.d/10_nvidia.json
       /usr/share/vulkan/implicit_layer.d/nvidia_layers.json
       /usr/share/vulkan/icd.d/nvidia_icd.json)
 STOPPABLE=(lactd.service nvidia-persistenced.service nvidia-powerd.service)
+STAMP=/run/nvidia-live-swap.last  # end time of the previous run, in seconds
+GAP=20                            # rtkit-daemon's default burst window
 
 log() { echo "$(date +%T.%N | cut -c1-12) $*"; }
 
@@ -154,6 +163,15 @@ for p in "${blockers[@]}"; do
     fi
 done
 
+wait_s=0
+if last=$(cat "$STAMP" 2>/dev/null) && [[ $last =~ ^[0-9]+$ ]]; then
+    age=$(( $(date +%s) - last ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt $GAP ]; then
+        wait_s=$(( GAP - age ))
+        log "the previous swap ended $age s ago; the swap would first wait $wait_s s, so that rtkit-daemon accepts mutter's scheduling requests"
+    fi
+fi
+
 leftovers=()
 for f in "${HIDE[@]}"; do
     [ -e "$f.hotswap" ] && leftovers+=("$f.hotswap")
@@ -174,9 +192,10 @@ fi
 # failure the EXIT trap tries to restore them: it loads from disk every module
 # of initial that is missing from /proc/modules (so a module whose rmmod was
 # killed after the kernel had unloaded it is loaded too), moves the hidden
-# files back and starts the stopped services. INT, TERM and HUP exit through the same trap.
-# revoke.py runs in its own session, so that a signal to this script's
-# process group cannot stop gdb in the middle of an injected call.
+# files back and starts the stopped services. INT, TERM and HUP exit
+# through the same trap. revoke.py runs in its own session, so that a signal
+# to this script's process group cannot stop gdb in the middle of an
+# injected call.
 MODULES=(nvidia nvidia_modeset nvidia_drm nvidia_uvm)  # load order
 hidden=() stopped=() initial=()
 succeeded=0
@@ -201,6 +220,7 @@ restore() {
 cleanup() {
     local status=$? m
     trap - EXIT INT TERM HUP
+    date +%s > "$STAMP" || log "could not write $STAMP"
     [ $succeeded = 1 ] && exit 0
     for m in "${MODULES[@]}"; do
         if contains "$m" "${initial[@]}" && ! is_loaded "$m"; then
@@ -242,6 +262,10 @@ trap 'fail "terminated by SIGTERM"' TERM
 trap 'fail "hung up by SIGHUP"' HUP
 
 log "BEGIN"
+if [ $wait_s -gt 0 ]; then
+    log "waiting $wait_s s after the previous swap"
+    sleep "$wait_s"
+fi
 if [ -n "$kms_holders" ]; then
     release_kms || fail "mutter did not release the KMS node"
 fi
