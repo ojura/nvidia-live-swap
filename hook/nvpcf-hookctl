@@ -1,0 +1,33 @@
+#!/usr/bin/python3 -I
+"""Read hook status or request prepare, detach, resume or loss acknowledgement."""
+import argparse
+import os
+import sys
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--device', default='/dev/nvpcf-hook')
+    parser.add_argument('command', choices=('status', 'prepare', 'detach', 'resume', 'acknowledge-loss'))
+    args = parser.parse_args()
+    try:
+        if args.command == 'status':
+            with open(args.device, encoding='utf-8') as stream:
+                sys.stdout.write(stream.read())
+        else:
+            command = (args.command + '\n').encode()
+            fd = os.open(args.device, os.O_WRONLY | os.O_CLOEXEC)
+            try:
+                written = os.write(fd, command)
+                if written != len(command):
+                    raise OSError('incomplete control write')
+            finally:
+                os.close(fd)
+    except OSError as error:
+        print(f'nvpcf-hookctl: {args.command} failed: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
