@@ -27,6 +27,7 @@
 #include "state.h"
 #include "text.h"
 #include "lifecycle.h"
+#include "build_id.h"
 
 #if !defined(CONFIG_X86_64) || !defined(CONFIG_DYNAMIC_FTRACE_WITH_REGS) || \
     !defined(CONFIG_KRETPROBES) || !defined(CONFIG_PM_SLEEP)
@@ -48,6 +49,11 @@ static const char * const phase_names[] = {
 	"starting", "waiting", "active", "quiesced", "suspended", "guard-only",
 	"unavailable", "detached"
 };
+
+static char *expected_nvidia_build_id;
+module_param(expected_nvidia_build_id, charp, 0400);
+MODULE_PARM_DESC(expected_nvidia_build_id,
+	"Required GNU build-ID descriptor of the checked NVIDIA module (hex)");
 
 static struct {
 	/* Lifecycle order: system sleep/device locks, then action, then delivery. */
@@ -104,6 +110,9 @@ static struct {
 	bool fine_held;
 	int fine_release_error;
 	struct module *nvidia_module;
+	struct nh_build_id expected_build_id;
+	char actual_build_id[NH_BUILD_ID_HEX_SIZE];
+	bool build_id_verified;
 	char nvidia_version[64];
 	nvpcf_callback original;
 	acpi_handle handle;
@@ -126,6 +135,7 @@ static int hold_active(void);
 static void release_active(bool driver_gone);
 static void unpin_nvidia(void);
 static int initial_rollback(void *unused);
+static int verify_nvidia_build_id(void);
 
 static void unlock_action(void)
 {
@@ -391,6 +401,10 @@ static int start_guards(void)
 	if (!nh_instance_attach_allowed(h.retirement_failed, h.guards_registered,
 		h.nvidia_module != NULL))
 		return -EUCLEAN;
+	if (!h.nvidia_ref || !h.nvidia_module)
+		return -ENODEV;
+	if (!h.build_id_verified)
+		return -ESTALE;
 	if (h.guards_registered)
 		return 0;
 	ret = check_legacy_methods();
@@ -764,7 +778,7 @@ static void activate_capture(void)
 	h.accepting = nh_capture_ready(h.owner.held, h.observer_registered,
 		h.event_registered && h.guards_registered, READ_ONCE(h.legacy_safe));
 	active = nh_activate_replay(&h.replay, h.accepting,
-		h.fine_verified && !h.fine_release_error,
+		h.fine_verified && !h.fine_release_error && h.build_id_verified,
 		&h.phase, &h.last_error);
 	if (h.replay.enabled && nh_pending(&h.state))
 		queue_work(h.replay_wq, &h.replay_work);
@@ -943,21 +957,74 @@ static int quiesce_flush(void)
 	return result.error;
 }
 
-static int read_text(const char *name, char *buf, size_t size)
+static ssize_t read_blob(const char *name, void *buf, size_t size)
 {
 	struct file *file;
 	loff_t pos = 0;
-	ssize_t n;
+	ssize_t n = 0;
+	size_t total = 0;
 
 	file = filp_open(name, O_RDONLY, 0);
 	if (IS_ERR(file))
 		return PTR_ERR(file);
-	n = kernel_read(file, buf, size - 1, &pos);
+	while (total < size) {
+		n = kernel_read(file, (char *)buf + total, size - total, &pos);
+		if (n <= 0)
+			break;
+		total += (size_t)n;
+	}
 	__fput_sync(file);
+	return n < 0 ? n : (ssize_t)total;
+}
+
+static int read_text(const char *name, char *buf, size_t size)
+{
+	ssize_t n = read_blob(name, buf, size - 1);
+
 	if (n < 0)
 		return n;
 	buf[n] = '\0';
 	return 0;
+}
+
+/* The LIVE instance is pinned before this read, so unload/replacement cannot
+ * change the module between its note check and private calls/probe registration.
+ */
+static int verify_nvidia_build_id(void)
+{
+	struct nh_build_id actual = { { 0 }, 0 };
+	unsigned char *note;
+	ssize_t size;
+	int ret;
+
+	h.build_id_verified = false;
+	h.actual_build_id[0] = '\0';
+	if (!h.nvidia_ref || !h.nvidia_module ||
+	    READ_ONCE(h.nvidia_module->state) != MODULE_STATE_LIVE)
+		return -ENODEV;
+	note = kmalloc(4097, GFP_KERNEL);
+	if (!note)
+		return -ENOMEM;
+	size = read_blob("/sys/module/nvidia/notes/.note.gnu.build-id", note, 4097);
+	if (size < 0) {
+		ret = (int)size;
+	} else if (size > 4096) {
+		ret = -E2BIG;
+	} else {
+		ret = nh_note_build_id(note, (size_t)size, &actual);
+		if (!ret) {
+			nh_build_id_hex(&actual, h.actual_build_id);
+			ret = nh_compare_build_id(&actual, &h.expected_build_id);
+		}
+	}
+	kfree(note);
+	if (ret)
+		pr_err("nvpcf_hook: NVIDIA build-ID validation failed (%d): expected=%s actual=%s\n",
+			ret, expected_nvidia_build_id,
+			h.actual_build_id[0] ? h.actual_build_id : "unavailable");
+	else
+		h.build_id_verified = true;
+	return ret;
 }
 
 static int kernel_notifier_mode(void)
@@ -1073,6 +1140,9 @@ static int attach_locked(bool activate)
 
 	if (attachment_blocked())
 		return -EUCLEAN;
+	ret = verify_nvidia_build_id();
+	if (ret)
+		return ret;
 	if (!READ_ONCE(h.legacy_safe)) {
 		h.legacy_blocked = true;
 		pr_crit("nvpcf_hook: legacy ACPI methods changed during attachment; retaining ownership\n");
@@ -1132,7 +1202,7 @@ static int pin_nvidia_locked(void)
 	/* try_module_get also accepts COMING, whose failed init can free its
 	 * code despite references. Only attach to a completely loaded driver.
 	 */
-	if (!owner || !nh_may_pin_driver(READ_ONCE(owner->state) == MODULE_STATE_LIVE,
+	if (!owner || strcmp(module_name(owner), "nvidia") || !nh_may_pin_driver(READ_ONCE(owner->state) == MODULE_STATE_LIVE,
 		!h.nvidia_module || h.nvidia_module == owner))
 		return -ENODEV;
 	if (!h.nvidia_ref) {
@@ -1143,7 +1213,7 @@ static int pin_nvidia_locked(void)
 	h.nvidia_module = owner;
 	strscpy(h.nvidia_version, owner->version ? owner->version : "unknown",
 		sizeof(h.nvidia_version));
-	return 0;
+	return verify_nvidia_build_id();
 }
 
 static void unpin_nvidia(void)
@@ -1293,6 +1363,7 @@ static void resume_work(struct work_struct *work)
 /* The loader still owns NVIDIA text until this GOING callback returns. */
 static void invalidate_nvidia_symbols(void)
 {
+	h.build_id_verified = false;
 	h.nvidia_module = NULL;
 	h.original = NULL;
 	h.original_open = NULL;
@@ -1524,6 +1595,9 @@ static int status_show(struct seq_file *seq, void *unused)
 	seq_printf(seq, "stack_ready: %u\nreplay_paused: %u\n", h.owner.stack_ready,
 		READ_ONCE(h.replay.paused));
 	seq_printf(seq, "nvidia_power_reference: %u\nnvidia_power_release_error: %d\n", fine_held, fine_error);
+	seq_printf(seq, "expected_nvidia_build_id: %s\nactual_nvidia_build_id: %s\n",
+		expected_nvidia_build_id, h.actual_build_id[0] ? h.actual_build_id : "unavailable");
+	seq_printf(seq, "build_id_verified: %u\n", h.build_id_verified);
 	seq_printf(seq, "retirement_failed: %u\n", h.retirement_failed);
 	seq_printf(seq, "guards_registered: %u\ninitialization_blocked: %u\nnvidia_reference: %u\npower_reference: %u\n",
 		h.guards_registered, READ_ONCE(h.block_initialization), h.nvidia_ref,
@@ -1596,6 +1670,9 @@ static int retry_retirement(void)
 			    !try_module_get(h.nvidia_module))
 				return -ENODEV;
 			h.nvidia_ref = true;
+			ret = verify_nvidia_build_id();
+			if (ret)
+				return ret;
 		}
 		if (h.owner.held) {
 			ret = hold_active();
@@ -1663,7 +1740,7 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 		if (h.state.stale || h.guard_poisoned || h.legacy_blocked || h.retirement_failed) {
 			ret = -EUCLEAN;
 		} else if (!nh_monitoring_active(READ_ONCE(h.phase), &h.replay,
-			READ_ONCE(h.accepting), h.fine_verified && !READ_ONCE(h.fine_release_error))) {
+			READ_ONCE(h.accepting), h.fine_verified && !READ_ONCE(h.fine_release_error) && h.build_id_verified)) {
 			if (!h.self_ref) {
 				__module_get(THIS_MODULE);
 				h.self_ref = true;
@@ -1708,9 +1785,11 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 			 * acquires action. A temporary ref excludes exit during prep.
 			 */
 			if (!h.nvidia_ref) {
-				if (try_module_get(h.nvidia_module))
+				if (READ_ONCE(h.nvidia_module->state) == MODULE_STATE_LIVE &&
+				    try_module_get(h.nvidia_module)) {
 					h.nvidia_ref = true;
-				else
+					ret = verify_nvidia_build_id();
+				} else
 					ret = -ENODEV;
 			}
 			if (!ret)
@@ -1846,6 +1925,11 @@ static int __init hook_init(void)
 	unsigned int sleep_flags;
 	int ret;
 
+	ret = nh_parse_build_id(expected_nvidia_build_id, &h.expected_build_id);
+	if (ret) {
+		pr_err("nvpcf_hook: expected_nvidia_build_id requires 2..128 unseparated hex characters (%d)\n", ret);
+		return ret;
+	}
 	mutex_init(&h.action);
 	mutex_init(&h.delivery);
 	spin_lock_init(&h.lock);

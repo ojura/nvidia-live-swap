@@ -16,6 +16,11 @@ that context alive.
 
 Attachment requires these conditions:
 
+- The read-only `expected_nvidia_build_id` parameter contains the exact GNU
+  build-ID descriptor checked by the loader, as 2 through 128 unseparated hex
+  characters (1 through 64 bytes). Both hex cases are accepted. Missing or
+  malformed input fails module initialization.
+
 - Exactly one NVIDIA display-class PCI device, reported as fixed and not
   attached through Thunderbolt. A second NVIDIA GPU appearing stops capture
   before its driver probe can replace NVIDIA's global ACPI context.
@@ -53,6 +58,31 @@ NVIDIA WARN-checks an external-kernel-client count update but does not return it
 failure. Successful acquisition establishes device ownership, not proof that
 the count update succeeded. Prepare and detach before planned reset or drain.
 Arbitrary privileged resets and physical hardware loss can invalidate the GPU.
+
+## Build ID at loading
+
+A loader must check the exact loaded NVIDIA artifact before loading the helper,
+then pass its descriptor as `expected_nvidia_build_id`. The helper pins a fully
+LIVE `nvidia` module and reads `/sys/module/nvidia/notes/.note.gnu.build-id` before
+private calls or probe registration. It parses the note header, bounds and
+four-byte alignment, accepts GNU ld's unpadded final descriptor, and compares
+the descriptor bytes with the parameter. It does not depend on the optional
+`struct module` build-ID field.
+
+Each new ownership or attachment/revalidation attempt repeats the comparison,
+including manual resume after module replacement. Missing notes propagate the
+read errno; malformed/truncated notes return `EBADMSG`, unsupported sizes return
+`E2BIG`, missing GNU descriptors return `ENODATA`, and mismatches return `ESTALE`.
+Failures are logged with expected and actual IDs. Status shows cached values and
+`build_id_verified`; reading status does not read the note or retry validation.
+A failed revalidation retains owned callback context but cannot report active
+monitoring. Loading a different NVIDIA artifact needs a helper load with its
+new checked descriptor; the parameter cannot be changed through sysfs.
+
+The descriptor identifies the checked artifact. It does not prove ABI correctness
+by itself. The loader must also run the matching linked-module, kernel-open and
+upstream dispatcher-source checks. This does not require a persistent version
+or artifact allowlist.
 
 ## Control interface
 
@@ -278,6 +308,9 @@ pointer for `:mod:`. The 6.8 entry-address adjustment matches its ENDBR helper;
 - `state`: `starting`, `waiting`, `active`, `quiesced`, `suspended`, `guard-only`,
   `unavailable` or `detached`.
 - `pci`, `gpu_uuid`, `nvidia_version`: selected device and actual loaded version.
+- `expected_nvidia_build_id`, `actual_nvidia_build_id`, `build_id_verified`:
+  the required descriptor, the latest successfully parsed note and validation
+  state for the current attachment attempt.
 - `device_reference`, `stack_ready`, `nvidia_reference`, `power_reference`:
   separate ownership records. A successfully allocated NVIDIA stack can be NULL.
 - `guards_registered`, `initialization_blocked`, `replay_paused`: lifecycle state.
@@ -396,6 +429,13 @@ arguments throughout. A deliberately premature-invalidation mutation must fail.
 This checks C operation order, not live kernel RCU progress. The same harness
 models Linux ACTIVE separately from NVIDIA IN_USE and tests stock/patched
 preflight/detach, conditional deferral and temporary-reference failures/recovery.
+
+Build-ID tests cover every supported descriptor length, hex input, malformed
+and truncated headers/notes, name/descriptor alignment, duplicate GNU notes and
+replacement mismatch. GNU ld produces real notes at seven descriptor lengths,
+including its unpadded one/three-byte forms. Production-body tests check LIVE
+module identity and note comparison before private resolution and repeat the
+check for retained-owner revalidation.
 
 These tests execute shared logic and model kernel ordering. They do not execute
 kernel attachment, ACPI, runtime PM or NVIDIA. The source checker reads archives

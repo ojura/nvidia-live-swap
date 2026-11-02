@@ -21,16 +21,19 @@ PREFIX = r'''
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/types.h>
 #ifdef NEGATIVE_ORDER_TEST
 #undef assert
 #define assert(e) ((e) ? (void)0 : _Exit(77))
 #endif
 #include "lifecycle.h"
+#include "build_id.h"
 typedef unsigned char u8;
 typedef void (*nvpcf_callback)(void *, unsigned int, void *);
 typedef int (*nv_start_callback)(void *, void *);
 typedef void (*nv_shutdown_callback)(void *, void *, void *);
-struct module { int state; const char *version; };
+struct module { int state; const char *version, *name; };
+#define module_name(m) ((m)->name)
 struct notifier_block { int unused; };
 struct work_struct { int unused; };
 struct ftrace_ops { int unused; };
@@ -65,12 +68,19 @@ typedef void *acpi_handle;
 #define WARN_ON(x) assert(!(x))
 #define THIS_MODULE (&helper)
 #define queue_work(...) (++queued)
+#define GFP_KERNEL 0
+#define kmalloc(size, flags) malloc(size)
+#define kfree(ptr) free(ptr)
 static struct module helper, old_module, new_module;
 static struct driver driver;
 static struct pci_dev pci;
 static int queued, capture_error, guard_error, rollback_error, drains, self_puts;
 static int old_calls, new_calls, resolutions;
 static int config_error, config_checks, system_barriers, resume_queued, work_joins;
+static char *expected_nvidia_build_id = "000102";
+static unsigned char note_bytes[128];
+static size_t note_size;
+static int note_error, note_reads;
 static int token;
 static bool linux_active, internal_in_use, patched, tls_failure, present, power_emits_event;
 static int linux_refs, native_refs, block_error, unblock_error, block_calls, unblock_calls;
@@ -94,6 +104,9 @@ static struct {
     void *dispatch_task;
     bool dispatch_seen;
     struct module *nvidia_module;
+    struct nh_build_id expected_build_id;
+    char actual_build_id[NH_BUILD_ID_HEX_SIZE];
+    bool build_id_verified;
     struct pci_dev *pci;
     bool accepting, fine_verified, observer_registered, event_registered;
     bool guards_registered, guard_accepting, legacy_safe, target_unavailable;
@@ -248,10 +261,21 @@ static int check_configuration(void) { config_checks++; return config_error; }
 static int register_kretprobe(void *probe) { (void)probe; return 0; }
 static int prepare_open_locked(void) { return 0; }
 static void unpin_nvidia(void) { h.nvidia_ref = false; }
+static ssize_t read_blob(const char *name, void *data, size_t size)
+{
+    assert(h.nvidia_ref && h.nvidia_module && h.nvidia_module->state == MODULE_STATE_LIVE);
+    assert(!strcmp(name, "/sys/module/nvidia/notes/.note.gnu.build-id"));
+    note_reads++;
+    if (note_error) return note_error;
+    assert(note_size <= size);
+    memcpy(data, note_bytes, note_size);
+    return (ssize_t)note_size;
+}
 static int check_legacy_methods(void) { return 0; }
 static unsigned long event_symaddr(unsigned long address) { return address; }
 static int resolve_nvidia(const char *name, unsigned long *address)
 {
+    assert(h.build_id_verified && h.nvidia_ref && note_reads > 0);
     resolutions++;
     *address = (unsigned long)dummy;
     if (!strcmp(name, "nvidia:nvidia_dev_get_uuid"))
@@ -268,6 +292,7 @@ static int register_ftrace_function(void *ops) { (void)ops; return 0; }
 '''
 
 FUNCTIONS = (
+    ('int', 'verify_nvidia_build_id', 'void'),
     ('int', 'acquire_fine_reference', 'void'),
     ('int', 'release_fine_reference', 'void'),
     ('int', 'cleanup_fine_reference_if_active', 'void'),
@@ -304,11 +329,18 @@ static void reset(void)
     old_calls = new_calls = resolutions = 0;
     graces = wait_mask = invalidations = within_calls = redirects = 0;
     joined_work = drain_complete = expect_old_symbols = false;
-    old_module = (struct module){ MODULE_STATE_GOING, "old" };
-    new_module = (struct module){ MODULE_STATE_LIVE, "replacement" };
+    old_module = (struct module){ MODULE_STATE_GOING, "old", "nvidia" };
+    new_module = (struct module){ MODULE_STATE_LIVE, "replacement", "nvidia" };
     driver = (struct driver){ "nvidia", &new_module };
     pci.dev.driver = &driver;
     h.pci = &pci;
+    memset(note_bytes, 0, sizeof(note_bytes));
+    note_bytes[0] = 4; note_bytes[4] = 3; note_bytes[8] = 3;
+    memcpy(note_bytes + 12, "GNU", 4);
+    note_bytes[17] = 1; note_bytes[18] = 2; note_size = 19;
+    note_error = note_reads = 0;
+    assert(!nh_parse_build_id(expected_nvidia_build_id, &h.expected_build_id));
+    h.build_id_verified = true;
     config_error = config_checks = system_barriers = resume_queued = work_joins = 0;
     linux_active = internal_in_use = patched = tls_failure = power_emits_event = false;
     present = true;
@@ -531,6 +563,60 @@ static void test_actual_pm_admission(void)
     assert(h.phase == ACTIVE && h.replay.enabled && config_checks == 1);
     assert(system_barriers == 1 && h.owner.held && h.nvidia_ref);
 }
+static void test_actual_build_id_admission(void)
+{
+    reset();
+    h.build_id_verified = false;
+    new_module.state = 0; /* COMING is not a completely loaded instance. */
+    assert(pin_nvidia_locked() == -ENODEV && !note_reads && !resolutions);
+    new_module.state = MODULE_STATE_LIVE;
+    new_module.name = "different_module";
+    assert(pin_nvidia_locked() == -ENODEV && !note_reads && !resolutions);
+    new_module.name = "nvidia";
+    note_bytes[16] = 0xaa;
+    assert(pin_nvidia_locked() == -ESTALE);
+    assert(h.nvidia_ref && !h.build_id_verified && note_reads == 1 && !resolutions);
+    assert(!strcmp(h.actual_build_id, "aa0102"));
+    assert(start_guards() == -ESTALE && !resolutions);
+    note_bytes[16] = 0;
+    assert(!pin_nvidia_locked() && h.build_id_verified && note_reads == 2);
+    assert(!start_guards() && resolutions > 0);
+    /* Revalidation of retained ownership must read the note again, before
+     * configuration/private calls, not trust the earlier successful check.
+     */
+    h.owner.held = h.owner.stack_ready = true;
+    h.phase = WAITING;
+    h.accepting = h.event_registered = h.observer_registered = h.legacy_safe = true;
+    h.fine_verified = true;
+    note_bytes[16] = 0xbb;
+    {
+        int previous = note_reads;
+        resume_work(NULL);
+        assert(note_reads == previous + 1 && !h.build_id_verified);
+        assert(h.phase == QUIESCED && h.last_error == -ESTALE && !config_checks && h.fine_verified);
+    }
+    activate_capture();
+    assert(h.phase == QUIESCED && !h.replay.enabled && h.last_error == -ESTALE);
+    note_bytes[16] = 0;
+    h.phase = WAITING;
+    resume_work(NULL);
+    assert(h.phase == ACTIVE && h.replay.enabled && h.build_id_verified);
+    note_error = -ENOENT;
+    assert(verify_nvidia_build_id() == -ENOENT && !h.build_id_verified);
+    note_error = 0; note_size = 11;
+    assert(verify_nvidia_build_id() == -EBADMSG && !h.build_id_verified);
+    /* Retire one instance, then reject a different replacement descriptor
+     * even though its LIVE module and required symbol names are available.
+     */
+    reset();
+    h.nvidia_module = &old_module;
+    h.self_ref = h.guards_registered = true;
+    assert(module_notify(NULL, MODULE_STATE_GOING, &old_module) == NOTIFY_DONE);
+    assert(!h.nvidia_module && !h.build_id_verified && h.phase == DETACHED);
+    note_bytes[16] = 0xcc;
+    assert(pin_nvidia_locked() == -ESTALE && note_reads == 1 && !resolutions);
+    assert(start_guards() == -ESTALE && !resolutions);
+}
 int main(void)
 {
     test_actual_drain();
@@ -539,7 +625,8 @@ int main(void)
     test_actual_retirement();
     test_actual_two_state_delivery();
     test_actual_pm_admission();
-    puts("PASS: compiled production restoration/recovery and failed retirement/replacement/address-reuse and two-state stock/patched delivery and PM admission paths");
+    test_actual_build_id_admission();
+    puts("PASS: compiled production restoration/recovery and failed retirement/replacement/address-reuse and two-state stock/patched delivery and PM/build-ID admission paths");
     return 0;
 }
 '''

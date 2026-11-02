@@ -7,3 +7,4 @@ Module.symvers
 modules.order
 .tmp_versions/
 tests/state_test
+tests/build_id_test
