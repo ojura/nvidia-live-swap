@@ -14,7 +14,9 @@
 # raises query 0x48 about every 7 seconds in the balanced profile, and the
 # firmware sends an NVPCF notification with each one. A notification that
 # wakes the GPU takes about 2 seconds to handle; one that leaves it asleep
-# takes microseconds.
+# takes microseconds. Before and after the trace, it prints nvpcf_hook's
+# state and request counts, or why they are unknown. The difference between
+# the two counts shows what the hook did during the trace.
 #
 # The durations come from a function_graph trace of nv_acpi_nvpcf_event,
 # the driver's handler for the notification. The trace runs in a private
@@ -63,6 +65,7 @@ trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
 
 echo "platform profile: $(cat /sys/firmware/acpi/platform_profile)"
+hook_summary
 mkdir "$I" || fail "could not create the tracing instance $I"
 echo nv_acpi_nvpcf_event > "$I/set_ftrace_filter" || fail "could not set the function filter"
 filter=$(cat "$I/set_ftrace_filter") || fail "could not read the function filter back"
@@ -97,3 +100,4 @@ dmesg --time-format iso | grep -E "Query\(0x[0-9a-f]+\) started" | awk -v s="$si
 echo "--- NVPCF notifications (CPU, duration):"
 [ -z "$records" ] || printf '%s\n' "$records"
 echo "$(printf '%s' "$records" | grep -c nv_acpi_nvpcf_event) notifications"
+hook_summary

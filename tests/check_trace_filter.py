@@ -19,7 +19,7 @@ root = Path(tempfile.mkdtemp(prefix='trace-filter-'))
 (root / 'bin').mkdir()
 (root / 'control').write_text('drivers/acpi/ec.c:281 [acpi]acpi_ec_read_status =_ "EC_SC(R)"\n')
 (root / 'runtime_status').write_text('suspended\n')
-(root / 'lib.sh').write_text('nvidia_gpu() { echo fixture; }\n')
+(root / 'lib.sh').write_text('nvidia_gpu() { echo fixture; }\nhook_summary() { echo "nvpcf_hook is not loaded"; }\n')
 mock = root / 'mock'
 mock.write_text('''#!/usr/bin/python3 -I
 import os, shutil, sys
