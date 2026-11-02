@@ -15,12 +15,16 @@ throwaway cache through the mock curl.
 The cases check the kernels that get the new version, that a kernel keeps
 its working module when the new version fails for it or its headers are
 missing, that an old version is removed only when no kernel has it installed,
-and that a failing dkms status stops the script before it changes
-anything."""
+and that a failing dkms status stops the script before it changes anything.
+For a new kernel, DKMS builds the greatest registered version, as its VER
+function orders them. Every case that registers the new version checks that
+the new version is that greatest one, with VER taken from /usr/sbin/dkms when
+it exists."""
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -32,7 +36,19 @@ RUNNING = '7.0.0-38-generic'
 OTHER = '6.8.0-147-generic'
 NVIDIA = (f'nvidia/615.71.09, {OTHER}, x86_64: installed\n'
           f'nvidia/615.71.09, {RUNNING}, x86_64: installed\n')
-OLD = '0.1-0123456789ab'
+OLD = '0.0.1'
+NEW = re.search(r'^PACKAGE_VERSION="(.*)"$', (SRC / 'hook/dkms.conf').read_text(), re.M).group(1)
+
+
+def dkms_ver(v):
+    """DKMS's VER: every number padded to three digits, compared as a string."""
+    if Path('/usr/sbin/dkms').exists():
+        return subprocess.run(['bash', '-c', 'source <(sed -n "/^VER()/,/^}/p" /usr/sbin/dkms); VER "$1"', '_', v],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    s = re.sub(r'([^0-9])([0-9])', r'\1 \2', v)
+    s = re.sub(r'([0-9])([^0-9])', r'\1 \2', s)
+    s = re.sub(r' ([0-9]) ', r' 00\1 ', f' {s} ')
+    return re.sub(r' ([0-9][0-9]) ', r' 0\1 ', s).replace(' ', '')
 
 MOCK = r'''#!/usr/bin/python3 -I
 import hashlib, json, os, re, shutil, sys
@@ -123,9 +139,10 @@ def check(r, cond, what):
         print(f"FAIL {r['case']}: {what}\n{r['out']}")
 
 
-def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1):
+def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, registered=None):
     """installed maps kernels to an old version that is built and installed
-    for them before the run."""
+    for them before the run. registered maps versions that are only added to
+    the text of their nvpcf_hook.c."""
     root = BASE / name
     (root / 'bin').mkdir(parents=True)
     mock = root / 'mock'
@@ -146,6 +163,13 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1):
                   root / 'lib/modules' / k / 'updates/dkms/nvpcf_hook.ko'):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(f'BUILDID={hashlib.sha1((v + k).encode()).hexdigest()} {v}\n')
+    for v, text in (registered or {}).items():
+        st['added'].append(v)
+        d = root / f'usr/src/nvpcf-hook-{v}'
+        shutil.copytree(SRC / 'hook', d, ignore=shutil.ignore_patterns('tests', '*.o', '*.ko', 'state_test',
+                                                                         '.gitignore', 'README.md', 'nvpcf-hookctl'))
+        if text is not None:
+            (d / 'nvpcf_hook.c').write_text(text)
     (root / 'state.json').write_text(json.dumps(st))
     (root / 'config.json').write_text(json.dumps(dict({'running': RUNNING, 'status': NVIDIA}, **cfg)))
     (root / 'calls.jsonl').write_text('')
@@ -175,12 +199,17 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1):
     return {'case': name, 'exit': p.returncode, 'out': p.stdout, 'calls': named, 'state': st,
             'changing': [c for c in named if c in ('dkms add', 'dkms build', 'dkms install', 'dkms remove')],
             'removed': [a[1] for c, a in calls if c == 'dkms' and a[0] == 'remove'],
-            'new': next((v for v in st['added'] if v != OLD), None),
+            'new': NEW if NEW in st['added'] else None,
+            'latest': max(st['added'], key=dkms_ver) if st['added'] else None,
             'loader': sorted(f.name for f in lib.iterdir()) if lib.exists() else [],
             'unit': (root / 'etc/systemd/system/nvpcf-hook.service').exists(),
             'enabled': ['enable', 'nvpcf-hook.service'] in [a for c, a in calls if c == 'systemctl'],
             'archives': sorted(f.name for f in (root / 'cache').iterdir()),
             'sources': sorted(d.name for d in (root / 'usr/src').iterdir()) if (root / 'usr/src').exists() else []}
+
+
+def latest_is_new(r):
+    check(r, r['latest'] == NEW, f"leaves {NEW} as the greatest registered version for DKMS, got {r['latest']}")
 
 
 r = run('fresh-install', {})
@@ -191,8 +220,8 @@ check(r, r['loader'] == ['check_nvidia.py', 'load-hook.sh', 'nvpcf-hookctl'] and
       f"installs the loader, its checker and the control client, and enables the boot unit, got {r['loader']}")
 check(r, r['archives'] == ['open-gpu-kernel-modules-615.71.09.tar.gz'],
       f"downloads NVIDIA's source archive for the installed version, got {r['archives']}")
-check(r, r['new'] is not None and r['new'].startswith('0.1-') and len(r['new']) == len('0.1-') + 12,
-      f"names the version after hook/dkms.conf and 12 hex digits of the source hash, got {r['new']}")
+check(r, r['new'] == NEW, f"registers PACKAGE_VERSION from hook/dkms.conf, {NEW}, got {r['state']['added']}")
+latest_is_new(r)
 
 r = run('upgrade', {}, installed={RUNNING: OLD, OTHER: OLD})
 check(r, r['exit'] == 0 and r['state']['installed'] == {RUNNING: r['new'], OTHER: r['new']},
@@ -203,12 +232,14 @@ check(r, r['removed'] == [f'nvpcf-hook/{OLD}'] and OLD not in r['state']['added'
 c = r['calls']
 check(r, c.index('dkms remove') > max(i for i, x in enumerate(c) if x == 'dkms install'),
       f"removes the old version only after the installs, got the calls {c}")
+latest_is_new(r)
 
 r = run('build-fails-first', {'build_fails': [OTHER]}, installed={RUNNING: OLD, OTHER: OLD})
 check(r, r['exit'] == 1 and f'{OTHER}: build' in r['out'], f"exits with status 1 and names the failure, got {r['exit']}")
 check(r, r['state']['installed'] == {RUNNING: r['new'], OTHER: OLD},
       f"keeps the old module on the kernel whose build failed, got {r['state']['installed']}")
 check(r, r['removed'] == [] and OLD in r['state']['added'], 'keeps the old version, which a kernel still has installed')
+latest_is_new(r)
 
 r = run('all-builds-fail', {'build_fails': [RUNNING, OTHER]}, installed={RUNNING: OLD, OTHER: OLD})
 check(r, r['exit'] == 1 and r['state']['installed'] == {RUNNING: OLD, OTHER: OLD} and r['removed'] == [],
@@ -223,6 +254,15 @@ check(r, r['exit'] == 1 and f'headers are missing, not built: {OTHER}' in r['out
       f"exits with status 1 and names the skipped kernel, got {r['exit']}")
 check(r, r['state']['installed'] == {RUNNING: r['new'], OTHER: OLD} and r['removed'] == [],
       f"keeps the skipped kernel's module and the old version, got {r['state']['installed']}")
+latest_is_new(r)
+
+r = run('newer-registered', {}, registered={'0.2': None}, installed={RUNNING: OLD})
+check(r, r['exit'] == 1 and 'nvpcf-hook/0.2 is registered, which DKMS ranks above' in r['out'] and r['changing'] == [],
+      f"refuses before changing anything when DKMS would build a greater version for the next kernel, got {r['changing']}")
+
+r = run('same-version-other-source', {}, registered={NEW: '/* other source */\n'})
+check(r, r['exit'] == 1 and 'registered with source that differs' in r['out'] and r['changing'] == [],
+      f"refuses before changing anything when its version is registered with other source, got {r['changing']}")
 
 r = run('again', {}, runs=2)
 check(r, r['exit'] == 0 and r['changing'] == [],

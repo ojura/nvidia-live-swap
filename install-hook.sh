@@ -4,15 +4,20 @@
 # usage: install-hook.sh
 #
 # DKMS builds each version of a module from its own source directory,
-# /usr/src/<package>-<version>. This script gives each content of hook/ its
-# own version: the version in hook/dkms.conf, a hyphen, and the first 12 hex
-# digits of a SHA-256 over the hook's source files. It copies the source to
-# /usr/src/nvpcf-hook-<that version>, and builds and installs that version
-# with DKMS for every kernel that DKMS lists for the NVIDIA driver, plus the
-# running kernel. A kernel keeps its installed module when the new version
-# does not build or install for it, and so does a kernel whose headers are
-# missing. Afterwards, the script removes every other version that is not
-# installed for any kernel.
+# /usr/src/<package>-<version>. For a new kernel, DKMS builds the greatest
+# registered version, as its VER function orders them. The version here is
+# PACKAGE_VERSION in hook/dkms.conf, dotted numbers of up to three digits,
+# where VER's order is the numeric one. A change to the hook's source needs
+# a greater PACKAGE_VERSION. The script refuses when its version is
+# registered with different source, and when a greater version is registered,
+# because DKMS would then build that version for the next kernel.
+#
+# It copies the source to /usr/src/nvpcf-hook-<version>, and builds and
+# installs that version with DKMS for every kernel that DKMS lists for the
+# NVIDIA driver, plus the running kernel. A kernel keeps its installed module
+# when the new version does not build or install for it, and so does a kernel
+# whose headers are missing. Afterwards, the script removes every older
+# version that is not installed for any kernel.
 #
 # It installs load-hook.sh, check_nvidia.py and nvpcf-hookctl as root-owned
 # copies in /usr/local/lib/nvpcf-hook, and enables nvpcf-hook.service, which
@@ -42,11 +47,21 @@ build_id() {
     esac > "$tmp" && readelf -n "$tmp" 2>/dev/null | sed -n 's/.*Build ID: //p' | head -1
 }
 
-base=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p' "$here/hook/dkms.conf")
-[[ $base =~ ^[0-9]+(\.[0-9]+)*$ ]] || fail "cannot read a version from PACKAGE_VERSION in $here/hook/dkms.conf"
+# DKMS's VER from /usr/sbin/dkms: it pads every number to three digits, so
+# that the results compare as strings.
+VER() {
+    echo "$1" | sed -e 's:\([^0-9]\)\([0-9]\):\1 \2:g' \
+        -e 's:\([0-9]\)\([^0-9]\):\1 \2:g' \
+        -e 's:\(.*\): \1 :' \
+        -e 's: \([0-9]\) : 00\1 :g' \
+        -e 's: \([0-9][0-9]\) : 0\1 :g' \
+        -e 's: ::g'
+}
+
+ver=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p' "$here/hook/dkms.conf")
+[[ $ver =~ ^[0-9]{1,3}(\.[0-9]{1,3})*$ ]] ||
+    fail "PACKAGE_VERSION in $here/hook/dkms.conf must be dotted numbers of up to three digits, got '$ver'"
 sources=("$here/hook/Kbuild" "$here/hook/Makefile" "$here/hook/dkms.conf" "$here"/hook/*.c "$here"/hook/*.h)
-hash=$(for f in "${sources[@]}"; do printf '%s\0' "${f##*/}"; cat "$f"; done | sha256sum | cut -c1-12)
-ver=$base-$hash
 src=/usr/src/nvpcf-hook-$ver
 
 status=$(dkms status nvidia) || fail "dkms status nvidia failed"
@@ -64,15 +79,19 @@ echo "== nvpcf-hook/$ver for kernels: ${targets[*]}"
 tmp=$(mktemp) || fail "cannot create a temporary file"
 trap 'rm -f "$tmp"' EXIT
 
+mapfile -t registered < <(sed -nE 's#^nvpcf-hook/([^,:]+)[,:].*#\1#p' <<<"$hook_status" | sort -u)
+for v in "${registered[@]}"; do
+    [[ "$(VER "$v")" > "$(VER "$ver")" ]] &&
+        fail "nvpcf-hook/$v is registered, which DKMS ranks above hook/'s $ver, so DKMS would build $v for the next kernel. Raise PACKAGE_VERSION in hook/dkms.conf, or remove $v with: dkms remove nvpcf-hook/$v --all"
+done
 if grep -q "^nvpcf-hook/$ver[,:]" <<<"$hook_status"; then
     for f in "${sources[@]}"; do
-        [ "${f##*/}" = dkms.conf ] && continue
-        cmp -s "$f" "$src/${f##*/}" || fail "$src differs from hook/; remove it with: dkms remove nvpcf-hook/$ver --all"
+        cmp -s "$f" "$src/${f##*/}" ||
+            fail "nvpcf-hook/$ver is registered with source that differs from hook/${f##*/}. A changed hook needs a greater PACKAGE_VERSION in hook/dkms.conf"
     done
 else
     rm -rf "$src"
     mkdir -p "$src" && cp "${sources[@]}" "$src/" || fail "could not copy the hook's source to $src"
-    sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$ver\"/" "$src/dkms.conf" || fail "could not set the version in $src/dkms.conf"
     dkms add -m nvpcf-hook -v "$ver" || fail "dkms add nvpcf-hook/$ver failed"
 fi
 for k in "${targets[@]}"; do
@@ -90,14 +109,15 @@ for k in "${targets[@]}"; do
     fi
 done
 
-# Remove the versions that are not installed for any kernel. A version that
-# a skipped or failed kernel still has installed stays.
+# Remove the older versions that are not installed for any kernel. A version
+# that a skipped or failed kernel still has installed stays. The check above
+# made every other registered version older than $ver.
 hook_status=$(dkms status nvpcf-hook) || fail "dkms status nvpcf-hook failed after the install"
 mapfile -t old < <(sed -nE 's#^nvpcf-hook/([^,:]+)[,:].*#\1#p' <<<"$hook_status" | sort -u)
 for v in "${old[@]}"; do
     [ "$v" = "$ver" ] && continue
     grep -q "^nvpcf-hook/$v, .*: installed" <<<"$hook_status" && continue
-    [[ $v =~ ^[0-9.]+-[0-9a-f]+$ ]] || { failed+=("nvpcf-hook/$v: not removed, unexpected version"); continue; }
+    [[ $v =~ ^[0-9A-Za-z.+~-]+$ ]] || { failed+=("nvpcf-hook/$v: not removed, unexpected version"); continue; }
     echo "== removing nvpcf-hook/$v, which is not installed for any kernel"
     if dkms remove "nvpcf-hook/$v" --all; then rm -rf "/usr/src/nvpcf-hook-$v"; else failed+=("nvpcf-hook/$v: remove"); fi
 done

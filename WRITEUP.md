@@ -462,15 +462,23 @@ than `/etc/modules-load.d`, and `swap.sh` calls the loader directly rather than
 ### install-hook.sh
 
 `install-hook.sh` runs as root. DKMS builds each version of a module from its
-own source directory, `/usr/src/<package>-<version>`. The script gives each
-content of `hook/` its own version: the version in `hook/dkms.conf`, a hyphen,
-and the first 12 hex digits of a SHA-256 over the hook's source files. It
-copies the source there, and builds and installs that version with DKMS for
-every kernel that DKMS lists for the NVIDIA driver, plus the running kernel.
-For each kernel it checks that the module `modprobe` finds is the one DKMS
-built. A kernel keeps its installed module when the new version does not build
-or install for it, and so does a kernel whose headers are missing. Afterwards
-the script removes every other version that is not installed for any kernel.
+own source directory, `/usr/src/<package>-<version>`, and for a new kernel it
+builds the greatest registered version, in the order of the `VER` function in
+`/usr/sbin/dkms`. That function pads every number to three digits and compares
+the results as strings. The version is `PACKAGE_VERSION` in `hook/dkms.conf`,
+dotted numbers of up to three digits, where that order is the numeric one. A
+change to the hook's source needs a greater `PACKAGE_VERSION`. The script
+refuses when its version is registered with different source, and when a
+greater version is registered, because DKMS would then build that version for
+the next kernel.
+
+It copies the source to `/usr/src/nvpcf-hook-<version>`, and builds and
+installs that version with DKMS for every kernel that DKMS lists for the NVIDIA
+driver, plus the running kernel. For each kernel it checks that the module
+`modprobe` finds is the one DKMS built. A kernel keeps its installed module
+when the new version does not build or install for it, and so does a kernel
+whose headers are missing. Afterwards the script removes every older version
+that is not installed for any kernel.
 
 It installs `load-hook.sh`, `check_nvidia.py` and `nvpcf-hookctl` as root-owned
 copies in `/usr/local/lib/nvpcf-hook`, enables `nvpcf-hook.service`, and
@@ -577,10 +585,13 @@ the number of deliveries.
   does. The cases are a fresh install, an upgrade that removes the old version
   only after the new one is installed everywhere, a build failure on one kernel
   and on both, an install failure, a kernel with missing headers, a second run
-  with the same source, a failing `dkms status` for `nvidia` and for
-  `nvpcf-hook`, missing headers for the running kernel, a failed archive
-  download and an extra argument. A kernel whose new build fails keeps its
-  working module.
+  with the same source, a registered greater version, the same version with
+  other source, a failing `dkms status` for `nvidia` and for `nvpcf-hook`,
+  missing headers for the running kernel, a failed archive download and an
+  extra argument. A kernel whose new build fails keeps its working module.
+  Every case that registers the new version checks, with `VER` from
+  `/usr/sbin/dkms`, that DKMS would build the new version for the next
+  kernel.
 - `make -C hook check` runs nvpcf_hook's own tests, which
   [hook/README.md](hook/README.md) describes.
 - `tests/check_build.py` runs `build.sh` as an ordinary user, against mock
