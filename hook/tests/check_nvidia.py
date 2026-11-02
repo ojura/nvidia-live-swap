@@ -14,6 +14,8 @@ PATHS = {
     'osapi': 'src/nvidia/arch/nvalloc/unix/src/osapi.c',
     'rmapi': 'src/nvidia/src/kernel/rmapi/rmapi.c',
     'dispatch': 'src/nvidia/src/kernel/gpu/gpu_rmapi.c',
+    'procfs': 'kernel-open/nvidia/nv-procfs.c',
+    'proc_utils': 'kernel-open/common/inc/nv-procfs-utils.h',
     'modeset': 'kernel-open/nvidia/nv-modeset-interface.c',
     'linux': 'kernel-open/common/inc/nv-linux.h',
     'uvm': 'kernel-open/nvidia/nv_uvm_interface.c',
@@ -48,7 +50,7 @@ def function(text, name, *, raw=False):
     text = splice_lines(text)
     clean = stripped_c_text(text)
     match = re.search(
-        r'(?m)^(?:static\s+)?(?:void|int|bool|NV_STATUS|NvLength)\s+(?:(?:NV_API_CALL|notrace)\s+)?'
+        r'(?m)^(?:static\s+)?(?:void|int|bool|ssize_t|NV_STATUS|NvLength)\s+(?:(?:NV_API_CALL|notrace)\s+)?'
         + re.escape(name) + r'\s*\([^;]*?\)\s*\{', clean)
     assert match, f'missing function definition: {name}'
     opening = clean.index('{', match.start())
@@ -66,7 +68,33 @@ def function(text, name, *, raw=False):
     return signature, (text if raw else clean)[opening:end], line
 
 
+def macro_tokens(text, name):
+    text = splice_lines(text)
+    matches = re.findall(r'(?m)^\s*#\s*define\s+' + re.escape(name) + r'\b[^\n]*', text)
+    return [c_tokens(match, spliced=True) for match in matches]
+
+
+def check_procfs_sources(texts):
+    reference = Path(__file__).with_name('expected_procfs_wrappers.h').read_text()
+    for key, names in (('proc_utils', ('NV_DEFINE_SINGLE_PROCFS_FILE_HELPER',
+                                     'NV_DEFINE_SINGLE_PROCFS_FILE_READ_ONLY')),
+                       ('procfs', ('NV_DEFINE_SINGLE_NVRM_PROCFS_FILE',))):
+        for name in names:
+            expected = macro_tokens(reference, name)
+            assert len(expected) == 1
+            assert macro_tokens(texts[key], name) == expected, (name, 'proc wrapper source review required')
+    mappings = macro_tokens(texts['proc_utils'], 'NV_PROC_OPS_READ')
+    assert mappings == [('#', 'define', 'NV_PROC_OPS_READ', 'proc_read'),
+                        ('#', 'define', 'NV_PROC_OPS_READ', 'read')]
+    for name in ('power', 'gpu_info'):
+        signature, _, _ = function(texts['procfs'], 'nv_procfs_read_' + name)
+        assert signature == 'staticintnv_procfs_read_' + name + '(structseq_file*s,void*v)'
+        clean = compact(c_text(texts['procfs']))
+        assert 'NV_DEFINE_SINGLE_NVRM_PROCFS_FILE(' + name + ');' in clean
+
+
 def check_kernel_sources(texts):
+    check_procfs_sources(texts)
     expected = {
         'nv_open_device': 'staticintnv_open_device(nv_state_t*nv,nvidia_stack_t*sp)',
         'nv_start_device': 'intnv_start_device(nv_state_t*nv,nvidia_stack_t*sp)',
@@ -234,7 +262,11 @@ def check_module(name):
                'nvidia_dev_put_uuid', 'nvidia_modeset_rm_ops_alloc_stack',
                'nvidia_modeset_rm_ops_free_stack', 'nv_stop_device', 'nv_close_device',
                'nvidia_dev_block_gc6', 'nvidia_dev_unblock_gc6',
-               'rm_ref_dynamic_power', 'rm_unref_dynamic_power')
+               'rm_ref_dynamic_power', 'rm_unref_dynamic_power',
+               'nv_procfs_read_power', 'nv_procfs_read_gpu_info',
+               'nv_procfs_open_power', 'nv_procfs_open_gpu_info',
+               'nv_procfs_release_power', 'nv_procfs_release_gpu_info',
+               'nv_procfs_read_lock_power', 'nv_procfs_read_lock_gpu_info')
     for target in targets:
         assert target in symbols, target
 
@@ -250,7 +282,13 @@ def check_module(name):
                            ('nv_open_device', 'nv_start_device'),
                            ('nv_stop_device', 'nv_shutdown_adapter'),
                            ('nvidia_dev_block_gc6', 'rm_ref_dynamic_power'),
-                           ('nvidia_dev_unblock_gc6', 'rm_unref_dynamic_power')]:
+                           ('nvidia_dev_unblock_gc6', 'rm_unref_dynamic_power'),
+                           ('nv_procfs_open_power', 'single_open'),
+                           ('nv_procfs_open_gpu_info', 'single_open'),
+                           ('nv_procfs_release_power', 'single_release'),
+                           ('nv_procfs_release_gpu_info', 'single_release'),
+                           ('nv_procfs_read_lock_power', 'seq_read'),
+                           ('nv_procfs_read_lock_gpu_info', 'seq_read')]:
         assert direct_call_to_entry(disassemble(caller), caller, callee, symbols), (caller, callee)
     print('PASS: linked NVIDIA module has ownership/allocator/guard symbols, entry fentry and exact entry calls:', name)
 
@@ -303,7 +341,7 @@ def main():
         check_module(name)
     for directory in args.kernel_source:
         texts = {key: (directory / PATHS[key].removeprefix('kernel-open/')).read_text()
-                 for key in ('nv', 'acpi', 'modeset')}
+                 for key in ('nv', 'acpi', 'modeset', 'procfs', 'proc_utils')}
         check_kernel_sources(texts)
         print('PASS: kernel-client and guard source declarations/control flow:', directory)
 

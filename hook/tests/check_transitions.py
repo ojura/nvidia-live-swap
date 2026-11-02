@@ -28,6 +28,7 @@ PREFIX = r'''
 #endif
 #include "lifecycle.h"
 #include "build_id.h"
+#include "text.h"
 typedef unsigned char u8;
 typedef void (*nvpcf_callback)(void *, unsigned int, void *);
 typedef int (*nv_start_callback)(void *, void *);
@@ -37,6 +38,7 @@ struct module { int state; const char *version, *name; };
 struct notifier_block { int unused; };
 struct work_struct { int unused; };
 struct ftrace_ops { int unused; };
+struct seq_file;
 struct ftrace_regs { unsigned long args[3], ip; };
 static void guard_hook(unsigned long, unsigned long, struct ftrace_ops *, struct ftrace_regs *);
 static void event_hook(unsigned long, unsigned long, struct ftrace_ops *, struct ftrace_regs *);
@@ -81,6 +83,7 @@ static char *expected_nvidia_build_id = "000102";
 static unsigned char note_bytes[128];
 static size_t note_size;
 static int note_error, note_reads;
+static const char *gpu_info_text;
 static int token;
 static bool linux_active, internal_in_use, patched, tls_failure, present, power_emits_event;
 static int linux_refs, native_refs, block_error, unblock_error, block_calls, unblock_calls;
@@ -99,6 +102,8 @@ static struct {
     struct { unsigned char b[16]; } gpu_uuid;
     struct nh_owner_ops owner_ops;
     struct nh_fine_ops fine_ops;
+    int (*proc_power_show)(struct seq_file *, void *);
+    int (*proc_info_show)(struct seq_file *, void *);
     bool fine_held;
     int fine_release_error;
     void *dispatch_task;
@@ -108,7 +113,7 @@ static struct {
     char actual_build_id[NH_BUILD_ID_HEX_SIZE];
     bool build_id_verified;
     struct pci_dev *pci;
-    bool accepting, fine_verified, observer_registered, event_registered;
+    bool accepting, fine_verified, observer_registered, event_registered, uuid_valid;
     bool guards_registered, guard_accepting, legacy_safe, target_unavailable;
     bool nvidia_ref, self_ref, power_hold, auto_resume, block_initialization;
     bool retirement_failed, guard_poisoned, legacy_blocked, exiting;
@@ -151,6 +156,7 @@ static void assert_old_symbols(void)
            h.original_shutdown == (nv_shutdown_callback)dummy);
     assert(h.acpi_cleanup == dummy && h.open_ip == 123 && h.start_ip == 123 && h.shutdown_ip == 123);
     assert(h.data == &token && h.handle == &token);
+    assert(h.proc_power_show && h.proc_info_show);
 }
 static void record_grace(void)
 {
@@ -271,6 +277,13 @@ static ssize_t read_blob(const char *name, void *data, size_t size)
     memcpy(data, note_bytes, note_size);
     return (ssize_t)note_size;
 }
+static bool inventory_matches(void) { return true; }
+static const char *pci_name(struct pci_dev *dev) { (void)dev; return "0000:01:00.0"; }
+static int read_gpu_text(const char *name, int (*show)(struct seq_file *, void *), char *buf, size_t size)
+{ assert(name && show && strlen(gpu_info_text) < size); memcpy(buf, gpu_info_text, strlen(gpu_info_text) + 1); return 0; }
+static int uuid_parse(const char *text, void *uuid)
+{ if (strcmp(text, "00112233-4455-6677-8899-aabbccddeeff")) return -EINVAL; memset(uuid, 0x11, 16); return 0; }
+static int stack_alloc(void **stack) { *stack = NULL; return 0; }
 static int check_legacy_methods(void) { return 0; }
 static unsigned long event_symaddr(unsigned long address) { return address; }
 static int resolve_nvidia(const char *name, unsigned long *address)
@@ -298,6 +311,7 @@ FUNCTIONS = (
     ('int', 'cleanup_fine_reference_if_active', 'void'),
     ('int', 'deliver_one', 'bool force'),
     ('int', 'put_gpu', 'void'),
+    ('int', 'get_gpu_locked', 'void'),
     ('void', 'activate_capture', 'void'),
     ('int', 'lifecycle_restore', 'void *unused'),
     ('void', 'guard_hook', 'unsigned long ip, unsigned long parent_ip, struct ftrace_ops *ops, struct ftrace_regs *regs'),
@@ -341,6 +355,7 @@ static void reset(void)
     note_error = note_reads = 0;
     assert(!nh_parse_build_id(expected_nvidia_build_id, &h.expected_build_id));
     h.build_id_verified = true;
+    h.proc_power_show = h.proc_info_show = (int (*)(struct seq_file *, void *))dummy;
     config_error = config_checks = system_barriers = resume_queued = work_joins = 0;
     linux_active = internal_in_use = patched = tls_failure = power_emits_event = false;
     present = true;
@@ -349,6 +364,8 @@ static void reset(void)
     h.fine_ops = (struct nh_fine_ops){ block_fine, unblock_fine };
     h.owner_ops.put = owner_put;
     h.owner_ops.free = stack_free;
+    h.owner_ops.alloc = stack_alloc;
+    gpu_info_text = "Model: GPU without a cached UUID\n";
 }
 static void test_actual_drain(void)
 {
@@ -423,6 +440,7 @@ static void test_actual_retirement(void)
         assert(!h.original && !h.original_open && !h.original_start && !h.original_shutdown);
         assert(!h.acpi_cleanup && !h.open_ip && !h.start_ip && !h.shutdown_ip);
         assert(!h.data && !h.handle && !h.fine_ops.block && !h.fine_ops.unblock);
+        assert(!h.proc_power_show && !h.proc_info_show);
         /* A replacement can even occupy the old module's address. Neither
          * actual admission body may resolve or reuse the retired addresses.
          */
@@ -617,6 +635,29 @@ static void test_actual_build_id_admission(void)
     assert(pin_nvidia_locked() == -ESTALE && note_reads == 1 && !resolutions);
     assert(start_guards() == -ESTALE && !resolutions);
 }
+static void test_actual_waiting_for_uuid(void)
+{
+    reset();
+    h.nvidia_ref = true;
+    h.owner_ops.get = new_get;
+    assert(!hold_active());
+    assert(get_gpu_locked() == -EAGAIN && !h.owner.held && !new_calls);
+    release_active(false);
+    gpu_info_text = "GPU UUID: unknown\n";
+    assert(!hold_active());
+    assert(get_gpu_locked() == -EINVAL && !h.owner.held && !new_calls);
+    release_active(false);
+    gpu_info_text = "GPU UUID: GPU-malformed\n";
+    assert(!hold_active());
+    assert(get_gpu_locked() == -EINVAL && !h.owner.held && !new_calls);
+    release_active(false);
+    gpu_info_text = "GPU UUID: GPU-00112233-4455-6677-8899-aabbccddeeff\n";
+    assert(!hold_active());
+    assert(!get_gpu_locked() && h.owner.held && h.uuid_valid && new_calls == 1);
+    assert(!put_gpu());
+    release_active(false);
+    assert(!linux_refs);
+}
 int main(void)
 {
     test_actual_drain();
@@ -626,6 +667,7 @@ int main(void)
     test_actual_two_state_delivery();
     test_actual_pm_admission();
     test_actual_build_id_admission();
+    test_actual_waiting_for_uuid();
     puts("PASS: compiled production restoration/recovery and failed retirement/replacement/address-reuse and two-state stock/patched delivery and PM/build-ID admission paths");
     return 0;
 }

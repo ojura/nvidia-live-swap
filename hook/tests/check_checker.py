@@ -76,6 +76,32 @@ def test_source():
     print(f'PASS: source checker accepts equivalent whitespace/comments and rejects {len(fixtures)} incompatible control-flow fixtures')
 
 
+def test_proc_wrappers():
+    reference = Path(__file__).with_name('expected_procfs_wrappers.h').read_text()
+    texts = {
+        'proc_utils': reference + '\n#define NV_PROC_OPS_READ proc_read\n#define NV_PROC_OPS_READ read\n',
+        'procfs': reference + """
+static int nv_procfs_read_power(struct seq_file *s, void *v) { return 0; }
+static int nv_procfs_read_gpu_info(struct seq_file *s, void *v) { return 0; }
+NV_DEFINE_SINGLE_NVRM_PROCFS_FILE(power);
+NV_DEFINE_SINGLE_NVRM_PROCFS_FILE(gpu_info);
+""",
+    }
+    CHECK['check_procfs_sources'](texts)
+    for before, after in (('single_open(', 'wrong_open('),
+                          ('single_release(', 'wrong_release('),
+                          ('size = seq_read(', 'size = wrong_read('),
+                          ('nv_down_read_interruptible(&lock)', 'unrelated_lock(&lock)')):
+        changed = dict(texts)
+        changed['proc_utils'] = changed['proc_utils'].replace(before, after)
+        assert changed != texts
+        must_reject(lambda: CHECK['check_procfs_sources'](changed), after)
+    changed = dict(texts)
+    changed['proc_utils'] = changed['proc_utils'].replace('NV_PROC_OPS_READ proc_read', 'NV_PROC_OPS_READ proc_read_iter')
+    must_reject(lambda: CHECK['check_procfs_sources'](changed), 'changed proc read API')
+    print('PASS: complete procfs open/read/release/lock admission rejects changed roles and read API')
+
+
 TARGETS = (
     'nv_open_device', 'nv_start_device', 'nv_shutdown_adapter',
     'nv_acpi_methods_uninit', 'nv_acpi_nvpcf_event', 'nvidia_dev_get_uuid',
@@ -83,6 +109,11 @@ TARGETS = (
     'nvidia_modeset_rm_ops_free_stack', 'nv_stop_device', 'nv_close_device',
     'nv_start_device_wrong', '__fentry__', 'nvidia_dev_block_gc6',
     'nvidia_dev_unblock_gc6', 'rm_ref_dynamic_power', 'rm_unref_dynamic_power',
+    'nv_procfs_read_power', 'nv_procfs_read_gpu_info',
+    'nv_procfs_open_power', 'nv_procfs_open_gpu_info',
+    'nv_procfs_release_power', 'nv_procfs_release_gpu_info',
+    'nv_procfs_read_lock_power', 'nv_procfs_read_lock_gpu_info',
+    'single_open', 'single_release', 'seq_read', 'single_open_wrong',
 )
 INSTRUMENTED = ('nv_open_device', 'nv_start_device', 'nv_shutdown_adapter', 'nv_acpi_nvpcf_event')
 
@@ -95,6 +126,12 @@ def assembly(destination, prefix=''):
         'nv_stop_device': 'nv_shutdown_adapter',
         'nvidia_dev_block_gc6': 'rm_ref_dynamic_power',
         'nvidia_dev_unblock_gc6': 'rm_unref_dynamic_power',
+        'nv_procfs_open_power': 'single_open',
+        'nv_procfs_open_gpu_info': 'single_open',
+        'nv_procfs_release_power': 'single_release',
+        'nv_procfs_release_gpu_info': 'single_release',
+        'nv_procfs_read_lock_power': 'seq_read',
+        'nv_procfs_read_lock_gpu_info': 'seq_read',
     }
     lines = ['.text']
     for name in TARGETS:
@@ -110,9 +147,13 @@ def assembly(destination, prefix=''):
     return '\n'.join(lines) + '\n'
 
 
-def build(root, name, destination, prefix=''):
+def build(root, name, destination, prefix='', wrong_proc_open=False):
     source, obj, linked = (root / (name + suffix) for suffix in ('.s', '.o', '.elf'))
-    source.write_text(assembly(destination, prefix))
+    text = assembly(destination, prefix)
+    if wrong_proc_open:
+        assert 'call single_open\n' in text
+        text = text.replace('call single_open\n', 'call single_open_wrong\n', 1)
+    source.write_text(text)
     subprocess.run(['as', '--64', str(source), '-o', str(obj)], check=True)
     subprocess.run(['ld', '-o', str(linked), '--entry=nvidia_dev_get_uuid', str(obj)], check=True)
     return obj, linked
@@ -134,6 +175,8 @@ def test_elf():
         ):
             for binary in build(root, name, target, prefix):
                 must_reject(lambda: check(binary), name + binary.suffix)
+        for binary in build(root, 'wrong-proc-open', 'nv_start_device', wrong_proc_open=True):
+            must_reject(lambda: check(binary), 'wrong proc single_open entry')
     # These textual relocation fixtures also check the relocation's location,
     # which an unrelated adjacent record must not establish.
     match = CHECK['direct_call_to_entry']
@@ -152,4 +195,5 @@ def test_elf():
 
 
 test_source()
+test_proc_wrappers()
 test_elf()

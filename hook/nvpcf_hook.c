@@ -8,6 +8,7 @@
 #include <linux/ftrace.h>
 #include <linux/kprobes.h>
 #include <linux/miscdevice.h>
+#include <linux/magic.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
@@ -18,6 +19,7 @@
 #include <linux/suspend.h>
 #include <linux/tracepoint.h>
 #include <linux/uaccess.h>
+#include <linux/uio.h>
 #include <linux/version.h>
 #include <linux/wait.h>
 #include <linux/uuid.h>
@@ -107,6 +109,8 @@ static struct {
 	uuid_t gpu_uuid;
 	struct nh_owner_ops owner_ops;
 	struct nh_fine_ops fine_ops;
+	int (*proc_power_show)(struct seq_file *, void *);
+	int (*proc_info_show)(struct seq_file *, void *);
 	bool fine_held;
 	int fine_release_error;
 	struct module *nvidia_module;
@@ -396,6 +400,7 @@ static void notrace guard_hook(unsigned long ip, unsigned long parent_ip,
 static int start_guards(void)
 {
 	unsigned long cleanup_ip, get_ip, put_ip, alloc_ip, free_ip, block_ip, unblock_ip;
+	unsigned long power_show_ip, info_show_ip;
 	int ret;
 
 	if (!nh_instance_attach_allowed(h.retirement_failed, h.guards_registered,
@@ -443,6 +448,14 @@ static int start_guards(void)
 	ret = resolve_nvidia("nvidia:nvidia_dev_unblock_gc6", &unblock_ip);
 	if (ret)
 		return ret;
+	ret = resolve_nvidia("nvidia:nv_procfs_read_power", &power_show_ip);
+	if (ret)
+		return ret;
+	ret = resolve_nvidia("nvidia:nv_procfs_read_gpu_info", &info_show_ip);
+	if (ret)
+		return ret;
+	h.proc_power_show = (int (*)(struct seq_file *, void *))event_symaddr(power_show_ip);
+	h.proc_info_show = (int (*)(struct seq_file *, void *))event_symaddr(info_show_ip);
 	h.fine_ops.block = (int (*)(const u8 *, void *))event_symaddr(block_ip);
 	h.fine_ops.unblock = (int (*)(const u8 *, void *))event_symaddr(unblock_ip);
 	h.owner_ops.get = (int (*)(const u8 *, void *))event_symaddr(get_ip);
@@ -987,6 +1000,53 @@ static int read_text(const char *name, char *buf, size_t size)
 	return 0;
 }
 
+/* Callers hold system-sleep serialization and action. Before device ownership
+ * they also hold device_lock; afterwards the kernel reference retains context.
+ * These exclude NVIDIA's PM writer and proc-entry removal.
+ * NVIDIA registers legacy proc_read wrappers, which kernel_read rejects.
+ */
+static int read_gpu_text(const char *name, int (*show)(struct seq_file *, void *),
+		char *buf, size_t size)
+{
+	struct file *file;
+	struct seq_file *seq;
+	struct kiocb iocb;
+	ssize_t n = 0;
+	size_t total = 0;
+
+	if (size < 2)
+		return -EINVAL;
+	if (!h.nvidia_ref || !h.build_id_verified || !show)
+		return -ESTALE;
+	file = filp_open(name, O_RDONLY, 0);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+	if (file_inode(file)->i_sb->s_magic != PROC_SUPER_MAGIC) {
+		n = -EPROTO;
+		goto out;
+	}
+	seq = file->private_data;
+	if (!seq || seq->file != file || !seq->op || seq->op->show != show) {
+		n = -EPROTO;
+		goto out;
+	}
+	init_sync_kiocb(&iocb, file);
+	while (total < size - 1) {
+		struct kvec vector = { .iov_base = buf + total, .iov_len = size - 1 - total };
+		struct iov_iter iter;
+
+		iov_iter_kvec(&iter, ITER_DEST, &vector, 1, vector.iov_len);
+		n = seq_read_iter(&iocb, &iter);
+		if (n <= 0)
+			break;
+		total += (size_t)n;
+	}
+	buf[total] = '\0';
+out:
+	__fput_sync(file);
+	return n < 0 ? (int)n : 0;
+}
+
 /* The LIVE instance is pinned before this read, so unload/replacement cannot
  * change the module between its note check and private calls/probe registration.
  */
@@ -1055,7 +1115,7 @@ static int effective_fine(void)
 	if (!buf)
 		return -ENOMEM;
 	snprintf(name, sizeof(name), "/proc/driver/nvidia/gpus/%s/power", pci_name(h.pci));
-	ret = read_text(name, buf, 4096);
+	ret = read_gpu_text(name, h.proc_power_show, buf, 4096);
 	field = ret ? NULL : nh_field(buf, "Runtime D3 status:");
 	if (!ret)
 		ret = !field ? -EPROTO : !strcmp(field, "Enabled (fine-grained)") ? 0 :
@@ -1112,10 +1172,12 @@ static int get_gpu_locked(void)
 	if (!buf)
 		return -ENOMEM;
 	snprintf(name, sizeof(name), "/proc/driver/nvidia/gpus/%s/information", pci_name(h.pci));
-	ret = read_text(name, buf, 4096);
+	ret = read_gpu_text(name, h.proc_info_show, buf, 4096);
 	field = ret ? NULL : nh_field(buf, "GPU UUID:");
-	if (!ret && (!field || strncmp(field, "GPU-", 4) ||
-	    uuid_parse(field + 4, &h.gpu_uuid)))
+	if (!ret && !field)
+		ret = -EAGAIN; /* Ordinary initialization populates the UUID cache. */
+	else if (!ret && (strncmp(field, "GPU-", 4) ||
+		 uuid_parse(field + 4, &h.gpu_uuid)))
 		ret = -EINVAL;
 	kfree(buf);
 	if (ret)
@@ -1202,7 +1264,8 @@ static int pin_nvidia_locked(void)
 	/* try_module_get also accepts COMING, whose failed init can free its
 	 * code despite references. Only attach to a completely loaded driver.
 	 */
-	if (!owner || strcmp(module_name(owner), "nvidia") || !nh_may_pin_driver(READ_ONCE(owner->state) == MODULE_STATE_LIVE,
+	if (!owner || strcmp(module_name(owner), "nvidia") ||
+	    !nh_may_pin_driver(READ_ONCE(owner->state) == MODULE_STATE_LIVE,
 		!h.nvidia_module || h.nvidia_module == owner))
 		return -ENODEV;
 	if (!h.nvidia_ref) {
@@ -1372,6 +1435,8 @@ static void invalidate_nvidia_symbols(void)
 	h.acpi_cleanup = NULL;
 	h.owner_ops = (struct nh_owner_ops){ 0 };
 	h.fine_ops = (struct nh_fine_ops){ 0 };
+	h.proc_power_show = NULL;
+	h.proc_info_show = NULL;
 	h.open_ip = 0;
 	h.start_ip = 0;
 	h.shutdown_ip = 0;

@@ -40,9 +40,9 @@ Attachment requires these conditions:
 - NVIDIA retains the private function declarations and call boundaries
   described below. Symbol resolution does not verify a C prototype.
 
-The helper refuses to initialize the GPU itself. If an ordinary client has not
-initialized it, the helper stays `waiting`. A successful ordinary initializer
-queues an attachment attempt. That success is only a hint: if the last ordinary
+The helper refuses to initialize the GPU itself. Attachment needs an initialized
+GPU and a readable cached UUID. If either is missing, the helper stays `waiting`.
+A successful ordinary initializer queues an attachment attempt. That success is only a hint: if the last ordinary
 client closes first, the helper refuses startup at the actual kernel get and
 continues waiting. It can temporarily wake the GPU while acquiring ownership.
 
@@ -69,9 +69,9 @@ four-byte alignment, accepts GNU ld's unpadded final descriptor, and compares
 the descriptor bytes with the parameter. It does not depend on the optional
 `struct module` build-ID field.
 
-Each new ownership or attachment/revalidation attempt repeats the comparison,
-including manual resume after module replacement. Missing notes propagate the
-read errno; malformed/truncated notes return `EBADMSG`, unsupported sizes return
+Every attempt to acquire device ownership, attach or revalidate repeats the
+comparison, including manual resume after module replacement. Missing notes
+propagate the read errno; malformed/truncated notes return `EBADMSG`, unsupported sizes return
 `E2BIG`, missing GNU descriptors return `ENODATA`, and mismatches return `ESTALE`.
 Failures are logged with expected and actual IDs. Status shows cached values and
 `build_id_verified`; reading status does not read the note or retry validation.
@@ -257,6 +257,36 @@ occurs after exit and before NVIDIA text is freed; the notifier then unregisters
 and drains the guards. This protects helper execution through teardown. It is
 not the mechanism that owns ACPI callback data.
 
+## Reading NVIDIA configuration
+
+Sysfs notes and parameters use `kernel_read`. NVIDIA's GPU `power` and
+`information` files register legacy `proc_read` wrappers, so `kernel_read`
+rejects them with `EINVAL` on the supported kernels. Those two GPU reads use
+exported `seq_read_iter` on the positively identified NVIDIA `single_open` file.
+The helper requires procfs, checks `seq->file` and matches `seq->op->show` against
+the checked module's power/info show function. It does not use a generic
+`private_data` fallback or pass kernel memory as a user buffer. All paths close
+the opened file, including context mismatch, short reads and errors.
+
+The checked NVIDIA wrapper opens with `single_open`, reads under
+`nv_system_pm_lock` and releases with `single_release`. Every helper GPU-text
+read holds `lock_system_sleep` and the lifecycle mutex. Before ownership it also
+holds the PCI device lock; afterwards its kernel reference owns context and
+pre-unbind waits for that mutex. These conditions prevent proc-entry teardown.
+Required kernel-notifier mode and absent procfs suspend control leave NVIDIA's
+system-PM notifier as the PM writer, which the system-sleep barrier excludes.
+The iterator path therefore preserves the writer exclusion without invoking the
+legacy read wrapper. Normal VFS release still runs NVIDIA's checked
+`single_release` wrapper.
+
+Admission checks compare the complete open/read/release macro tokens in
+`tests/expected_procfs_wrappers.h`, check show declarations, and require linked
+show/wrapper symbols and entry calls to `single_open`, `seq_read` and
+`single_release`. The three installed kernels export `seq_read_iter` with its
+matching iterator API. Ubuntu kernel commit
+`102c85de1d6726aa44823e8f9740eea74216c7a5`, `fs/read_write.c:508-550` and
+`fs/proc/inode.c:554-568,658-667`, defines the legacy/iterator distinction.
+
 ## Dispatch completion and replay
 
 The original callback is `void(acpi_handle, u32, void *)`. Its data is a non-NULL
@@ -435,7 +465,10 @@ and truncated headers/notes, name/descriptor alignment, duplicate GNU notes and
 replacement mismatch. GNU ld produces real notes at seven descriptor lengths,
 including its unpadded one/three-byte forms. Production-body tests check LIVE
 module identity and note comparison before private resolution and repeat the
-check for retained-owner revalidation.
+check for retained-owner revalidation. I/O-body tests model the actual
+legacy-read refusal and iterator backend, validate file/show association, and
+exercise short/error reads and cleanup. Source/ELF checks include the complete
+NVIDIA wrapper roles used by that backend.
 
 These tests execute shared logic and model kernel ordering. They do not execute
 kernel attachment, ACPI, runtime PM or NVIDIA. The source checker reads archives
