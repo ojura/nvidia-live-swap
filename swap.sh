@@ -272,7 +272,12 @@ else
     case "$hook_state" in
         active|waiting|guard-only|quiesced) ;;
         starting|suspended) hook_problems+=("nvpcf_hook is $hook_state; check again in a few seconds") ;;
-        unavailable) hook_problems+=("nvpcf_hook is unavailable with last_error $(sed -n 's/^last_error: //p' <<<"$hook_status"); its status and the kernel log say why, and swap.sh does not acknowledge a loss") ;;
+        unavailable)
+            if [ "$(sed -n 's/^retirement_failed: //p' <<<"$hook_status")" = 1 ]; then
+                hook_problems+=("nvpcf_hook is unavailable because it could not remove its interception of NVIDIA's functions, with last_error $(sed -n 's/^last_error: //p' <<<"$hook_status"); $DIR/hook/nvpcf-hookctl detach retries the removal")
+            else
+                hook_problems+=("nvpcf_hook is unavailable with last_error $(sed -n 's/^last_error: //p' <<<"$hook_status"); its status and the kernel log say why, and swap.sh does not acknowledge a loss")
+            fi ;;
         *) hook_problems+=("nvpcf_hook is ${hook_state:-in an unknown state}, so it does not guard a swap; run $DIR/hook/nvpcf-hookctl resume, or unload it and load it again with $LOADER") ;;
     esac
 fi

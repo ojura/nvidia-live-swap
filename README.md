@@ -148,7 +148,9 @@ before it renames files, stops services or takes the GPU away from any program.
   messages it held, for example because the GPU disappeared, it stays
   `unavailable` until a person runs `sudo ./hook/nvpcf-hookctl acknowledge-loss`
   after reading its status and the kernel log. `swap.sh` never runs that
-  command.
+  command. If the hook could not remove its interception of NVIDIA's functions,
+  it is `unavailable` with `retirement_failed: 1` in its status, and
+  `sudo ./hook/nvpcf-hookctl detach` retries the removal.
 
 A swap without nvpcf_hook could hang. When the last program closes the GPU,
 NVIDIA shuts down its state for the GPU, and holds a lock while it does. If a

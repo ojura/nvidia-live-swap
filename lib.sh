@@ -27,7 +27,7 @@ hook_summary() {
         echo "cannot read the status of nvpcf_hook: $s"
     else
         printf '%s\n' "$s" | awk -F': ' '
-            $1 ~ /^(state|pending_requests|received_requests|deferred_requests|dispatch_attempts|requests_dispatched|dispatch_failures|last_error)$/ {
+            $1 ~ /^(state|pending_requests|received_requests|deferred_requests|dispatch_attempts|requests_dispatched|dispatch_failures|retirement_failed|last_error)$/ {
                 line = line (line == "" ? "" : ", ") $1 " " $2
             }
             END { print "nvpcf_hook: " line }'

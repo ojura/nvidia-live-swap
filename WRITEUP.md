@@ -561,7 +561,9 @@ the number of deliveries.
     changing anything, when the hook is not loaded, also with a patched driver
     on disk, when it is not installed, unreadable, unavailable, detached or
     starting, when the loader is missing, and when the driver on disk fails the
-    loader's check. With `--check`, an archive that is not cached yet is
+    loader's check. When the hook could not remove its interception of
+    NVIDIA's functions, the refusal names `nvpcf-hookctl detach`, which retries
+    the removal. With `--check`, an archive that is not cached yet is
     reported as a check still to run, and a swap lets the loader download it
     first. A failed `prepare` stops the swap before any change. After a failed
     `detach`, a failed NVIDIA unload, or a SIGTERM after the detach or after

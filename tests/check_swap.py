@@ -148,7 +148,8 @@ elif cmd == 'nvpcf-hookctl':
         print(f"state: {st['hook_state']}\npci: 0000:01:00.0\nguards_registered: {guards}\n"
               f"initialization_blocked: {blocked}\npending_requests: 0\n"
               f"received_requests: 3\ndeferred_requests: 3\nrequests_dispatched: 3\n"
-              f"dispatch_failures: 0\nlast_error: {st['hook_error']}")
+              f"dispatch_failures: 0\nretirement_failed: {1 if cfg.get('hook_retirement_failed') else 0}\n"
+              f"last_error: {st['hook_error']}")
     elif op == 'prepare':
         if cfg.get('hook_prepare_fails') or st['hook_state'] == 'unavailable':
             refuse('[Errno 117] Structure needs cleaning')
@@ -629,6 +630,13 @@ check(r, r['exit'] == 1 and 'cannot read the status of nvpcf_hook: nvpcf-hookctl
 r = run('hook-unavailable', UNPATCHED, holders=[777], patched=False, hook='unavailable')
 check(r, r['exit'] == 1 and 'swap.sh does not acknowledge a loss' in r['out'],
       f"exits with status 1 and says it does not acknowledge a loss, got status {r['exit']}"); expect_untouched(r)
+
+r = run('hook-retirement-failed', dict(UNPATCHED, hook_retirement_failed=True), holders=[777], patched=False,
+        hook='unavailable')
+check(r, r['exit'] == 1 and 'could not remove its interception' in r['out'] and 'nvpcf-hookctl detach retries the removal' in r['out']
+      and 'retirement_failed 1' in r['out'],
+      f"exits with status 1, names the failed removal and the command that retries it, got status {r['exit']}")
+expect_untouched(r)
 
 r = run('hook-detached', UNPATCHED, holders=[777], patched=False, hook='detached')
 check(r, r['exit'] == 1 and 'nvpcf-hookctl resume, or unload it and load it again' in r['out'],
