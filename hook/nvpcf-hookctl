@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Read hook status or request prepare, detach, resume or loss acknowledgement."""
+"""Read nvpcf_hook status or run prepare, detach, resume or acknowledge-loss."""
 import argparse
 import os
 import sys

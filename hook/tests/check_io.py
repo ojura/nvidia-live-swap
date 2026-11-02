@@ -116,7 +116,7 @@ int main(void)
     assert(!strcmp(data, payload) && kernel_reads > 1 && !seq_reads && !shows && closes == 1);
     reset(true);
     assert(read_text("/proc/driver/nvidia/gpus/example/power", data, sizeof(data)) == -EINVAL);
-    assert(kernel_reads == 1 && !seq_reads && closes == 1); /* Old backend fails. */
+    assert(kernel_reads == 1 && !seq_reads && closes == 1); /* kernel_read rejects NVIDIA's legacy proc-read wrapper. */
     reset(true);
     assert(!read_gpu_text("/proc/driver/nvidia/gpus/example/power", show_power, data, sizeof(data)));
     assert(!strcmp(data, payload) && !kernel_reads && seq_reads > 1 && shows == 1 && closes == 1);
@@ -167,7 +167,7 @@ int main(void)
     reset(true);
     assert(read_gpu_text("power", NULL, data, sizeof(data)) == -ESTALE && !opens);
     assert(read_gpu_text("power", show_power, data, 0) == -EINVAL && !opens);
-    puts("PASS: production kernfs/legacy-proc backend selection, checked seq association, short/error reads and close cleanup");
+    puts("PASS: file readers select the correct read method, verify the seq_file, handle short reads and errors, and close opened files");
     return 0;
 }
 '''

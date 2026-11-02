@@ -99,7 +99,7 @@ NV_DEFINE_SINGLE_NVRM_PROCFS_FILE(gpu_info);
     changed = dict(texts)
     changed['proc_utils'] = changed['proc_utils'].replace('NV_PROC_OPS_READ proc_read', 'NV_PROC_OPS_READ proc_read_iter')
     must_reject(lambda: CHECK['check_procfs_sources'](changed), 'changed proc read API')
-    print('PASS: complete procfs open/read/release/lock admission rejects changed roles and read API')
+    print('PASS: procfs source checks reject changes to open, read, release and locking behavior')
 
 
 TARGETS = (

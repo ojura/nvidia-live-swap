@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Read NVIDIA source/ELF evidence without executing or loading driver code."""
+"""Check NVIDIA source and ELF files without executing or loading driver code."""
 import argparse
 from pathlib import Path
 import re
@@ -290,7 +290,7 @@ def check_module(name):
                            ('nv_procfs_read_lock_power', 'seq_read'),
                            ('nv_procfs_read_lock_gpu_info', 'seq_read')]:
         assert direct_call_to_entry(disassemble(caller), caller, callee, symbols), (caller, callee)
-    print('PASS: linked NVIDIA module has ownership/allocator/guard symbols, entry fentry and exact entry calls:', name)
+    print('PASS: linked NVIDIA module has the required device-reference, stack and guard functions, entry instrumentation and calls to exact entries:', name)
 
 
 
@@ -321,7 +321,6 @@ def check_core(name):
     assert re.search(r'\bret\b|__x86_return_thunk', dispatcher)
     assert '__fentry__' not in dispatcher, 'inspect changed core instrumentation'
     print('PASS: x86-64 core has global text targets, expected callback calls and dispatcher returns')
-    print('ELF symbols/call sites do not encode or validate the C prototypes; source checks are separate.')
 
 
 def main():
@@ -343,7 +342,7 @@ def main():
         texts = {key: (directory / PATHS[key].removeprefix('kernel-open/')).read_text()
                  for key in ('nv', 'acpi', 'modeset', 'procfs', 'proc_utils')}
         check_kernel_sources(texts)
-        print('PASS: kernel-client and guard source declarations/control flow:', directory)
+        print('PASS: kernel-client and guard source declarations and control flow match the required checks:', directory)
 
 
 if __name__ == '__main__':

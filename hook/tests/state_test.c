@@ -407,7 +407,9 @@ static void test_power_and_guard_lifetime(void)
 	assert(f.owner && f.capture && f.observer && !f.held_power);
 	assert(f.completed_release == 0 && f.s.attempts == 0 && nh_pending(&f.s) == 1);
 
-	/* Even a zero-pending final release needs active ownership. */
+	/* Final device-reference release needs an active Linux runtime-PM
+	 * reference even when the pending count is zero.
+	 */
 	f = fixture();
 	nh_finish(&f.s, nh_snapshot(&f.s), true);
 	f.power_fail = true;
@@ -433,8 +435,9 @@ static void test_power_and_guard_lifetime(void)
 	f.linux_ldata = false;
 	assert(f.context_frees == 2 && !f.resources_alive);
 	assert(!nh_may_unpin_helper(0, 0, 0, 0));
-	/* GOING follows exit. Unregister and join replacements before releasing
-	 * the helper reference. Linux power was balanced after the device put.
+	/* The GOING notification follows exit. Unregister and wait for
+	 * replacements before releasing the hook module reference. The Linux
+	 * power reference was released after the device reference.
 	 */
 	assert(!nh_may_unpin_helper(0, 1, 0, 0)); /* guard not yet drained */
 	f.held_power = false;
@@ -451,9 +454,9 @@ static void test_power_and_guard_lifetime(void)
 	assert(!r.error && f.context_frees == 2 && f.original_callbacks == 4);
 	assert(!f.psr_object && !f.nvpcf_object && !f.resources_alive);
 
-	/* Involuntary unavailable-device teardown is an error, not publication.
-	 * Ordinary handlers are still drained before resources disappear, and
-	 * stale pending plus the error prevent helper removal until explicit ack.
+	/* Shutdown after involuntary device loss reports an error. Ordinary
+	 * handlers are still drained before resources disappear, and stale
+	 * requests and the error keep the hook loaded until explicit acknowledgement.
 	 */
 	f = fixture();
 	f.capture = false;
@@ -475,13 +478,15 @@ static void test_waiting_and_admission(void)
 	unsigned int users = 0, helper_starts = 0;
 
 	assert(nh_start_allowed(0, 0));
-	assert(!nh_start_allowed(1, 0)); /* helper never initializes */
-	assert(!nh_start_allowed(0, 1)); /* prepared blocks new initialization */
-	assert(nh_open_allowed(0, 0)); /* existing external clients keep baseline ABI */
-	assert(!nh_open_allowed(1, 0)); /* own open checks legacy result under ldata */
+	assert(!nh_start_allowed(1, 0)); /* The hook never initializes the GPU itself. */
+	assert(!nh_start_allowed(0, 1)); /* The block also prevents initialization by other clients. */
+	assert(nh_open_allowed(0, 0)); /* Other clients use NVIDIA's original open behavior. */
+	assert(!nh_open_allowed(1, 0)); /* The hook's own open requires legacy safety. */
 	assert(nh_open_allowed(1, 1));
 
-	/* Initializer succeeded, but closes before deferred attachment takes ldata_lock. */
+	/* The client initializes the GPU, then closes it before the queued
+	 * attachment takes ldata_lock.
+	 */
 	initialized = true;
 	users = 1;
 	initialized = false;

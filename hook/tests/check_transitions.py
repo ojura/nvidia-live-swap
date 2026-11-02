@@ -477,7 +477,8 @@ static void test_actual_retirement(void)
         assert(!h.data && !h.handle && !h.fine_ops.block && !h.fine_ops.unblock);
         assert(!h.proc_power_show && !h.proc_info_show);
         /* A replacement can even occupy the old module's address. Neither
-         * actual admission body may resolve or reuse the retired addresses.
+         * attachment check may resolve or reuse addresses from the module
+         * whose hooks could not be unregistered.
          */
         if (reuse) {
             old_module.state = MODULE_STATE_LIVE;
@@ -545,7 +546,9 @@ static void test_actual_two_state_delivery(void)
         assert(!preflight());
         assert(!pending() && actual_dispatches == 1 && block_calls == 1 && unblock_calls == 1);
         assert(!linux_refs && !native_refs && !h.fine_held && h.owner.held);
-        /* Final detach must also finish from ACTIVE Linux / idle NVIDIA. */
+        /* Final detach must also succeed when Linux reports ACTIVE but
+         * NVIDIA reports IDLE_INDICATED.
+         */
         nh_receive(&h.state, true);
         assert(!internal_in_use && linux_active);
         result = nh_quiesce(NULL, &delivery_ops);
@@ -731,8 +734,8 @@ static void test_actual_scope_resume(void)
         }
         h.starting_calls = 1;
         assert(guarded_start(NULL, NULL) == -EBUSY && !ordinary_starts);
-        /* Eligibility returns, but the target is cold. Only this admitted
-         * case becomes WAITING and permits an ordinary initializer.
+        /* The target is eligible again but has not been initialized. It enters
+         * WAITING and allows another client to initialize it.
          */
         inventory_ok = present = true;
         pci.dev.driver = &driver;
@@ -782,8 +785,8 @@ int main(void)
     test_actual_build_id_admission();
     test_actual_waiting_for_uuid();
     test_actual_scope_resume();
-    puts("PASS: production scope-loss resume refusal, eligible cold WAITING, recovery and concurrent-loss admission");
-    puts("PASS: compiled production restoration/recovery and failed retirement/replacement/address-reuse and two-state stock/patched delivery and PM/build-ID admission paths");
+    puts("PASS: target loss blocks resume; an eligible uninitialized GPU waits; recovery rechecks concurrent loss");
+    puts("PASS: lifecycle functions handle restoration, failed unregistration, driver replacement, power-reference recovery, system PM and build-ID checks");
     return 0;
 }
 '''
@@ -830,4 +833,4 @@ with tempfile.TemporaryDirectory(prefix='nvpcf-production-transitions-') as tmp:
         subprocess.run(command + [str(source), '-o', str(binary)], check=True)
         execution = subprocess.run([str(binary)], check=False)
         assert execution.returncode == (77 if negative else 0), execution.returncode
-    print('PASS: production disabled handlers/drain order; invalidation-before-drain mutation is rejected')
+    print('PASS: redirected calls finish before NVIDIA pointers are cleared; the test rejects early clearing')

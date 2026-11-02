@@ -37,7 +37,7 @@
 #endif
 
 #if defined(CONFIG_X86_KERNEL_IBT) || defined(CONFIG_CFI_CLANG)
-#error "nvpcf_hook private function-pointer calls require kernel IBT and CFI disabled"
+#error "nvpcf_hook private function-pointer calls require kernel IBT and Clang CFI to be disabled"
 #endif
 
 #define NVPCF_CHANGE 0xc0
@@ -148,8 +148,8 @@ static void unlock_action(void)
 }
 
 #ifndef ftrace_get_symaddr
-/* Installed 6.8 headers lack the 7.0 helper. Their is_endbr takes the word,
- * rather than a pointer. Keep the same x86 ENDBR-to-entry adjustment.
+/* The 6.8 headers lack the 7.0 helper, and their is_endbr takes a word
+ * rather than a pointer. Apply the same x86 ENDBR entry-address adjustment.
  */
 static __always_inline unsigned long event_symaddr(unsigned long ip)
 {
@@ -272,9 +272,9 @@ static void notrace run_teardown(struct shutdown_args *args)
 	spin_lock_irqsave(&h.pci->dev.power.lock, flags);
 	if (h.pci->dev.power.runtime_status == RPM_ACTIVE &&
 	    !h.pci->dev.power.runtime_error) {
-		/* PCI removal can disable runtime PM before persistent teardown.
-		 * The ACTIVE state is already stable under this lock; noresume
-		 * retains it without rejecting a disabled, active device.
+		/* PCI removal can disable runtime PM before adapter shutdown.
+		 * RPM_ACTIVE is stable under this lock; pm_runtime_get_noresume
+		 * retains it even when runtime PM is disabled.
 		 */
 		if (!READ_ONCE(h.power_hold)) {
 			pm_runtime_get_noresume(&h.pci->dev);
@@ -292,21 +292,22 @@ static void notrace run_teardown(struct shutdown_args *args)
 		ret = -ENODEV;
 unavailable:
 	if (ret < 0) {
-		/* Normal detach establishes this reference before releasing its
-		 * kernel reference. This branch is involuntary/unavailable-device teardown.
-		 * Drain still precedes resource destruction, but delivery failed.
+		/* Normal detach obtains an active Linux runtime-PM reference before
+		 * releasing its kernel-client device reference. If involuntary shutdown
+		 * cannot confirm active power, cleanup still waits for the handlers
+		 * before destroying resources, but delivery is unverified.
 		 */
 		spin_lock_irqsave(&h.lock, flags);
 		h.guard_failures++;
 		h.guard_poisoned = true;
 		h.last_error = ret;
 		spin_unlock_irqrestore(&h.lock, flags);
-		pr_err("nvpcf_hook: committed teardown lacks active power (%d); delivery is unverified\n", ret);
+		pr_err("nvpcf_hook: shutdown could not confirm active GPU power (%d); notification delivery is unverified\n", ret);
 	}
 	quiescent = !READ_ONCE(h.event_registered) && !atomic_read(&h.redirected) &&
 		    !READ_ONCE(h.dispatch_task);
 	if (WARN_ON_ONCE(!quiescent)) {
-		/* Supported paths stop deferral before committing teardown. */
+		/* Supported paths stop deferral before entering nv_shutdown_adapter. */
 		spin_lock_irqsave(&h.lock, flags);
 		h.guard_failures++;
 		h.guard_poisoned = true;
@@ -589,7 +590,9 @@ static int observer_return(struct kretprobe_instance *instance, struct pt_regs *
 	return 0;
 }
 
-/* delivery held; the existing kernel reference/stack owns the UUID lookup. */
+/* The caller holds delivery. The device reference and pre-unbind
+ * serialization keep the UUID lookup valid; the stack is a separate API resource.
+ */
 static int acquire_fine_reference(void)
 {
 	unsigned long flags;
@@ -627,7 +630,7 @@ static int release_fine_reference(void)
 	}
 	spin_unlock_irqrestore(&h.lock, flags);
 	if (ret) {
-		pr_err("nvpcf_hook: cannot release temporary NVIDIA power reference (%d); ownership retained\n", ret);
+		pr_err("nvpcf_hook: cannot release temporary NVIDIA FINE reference (%d); device reference retained\n", ret);
 	}
 	return ret;
 }
@@ -696,8 +699,9 @@ static int deliver_one(bool force)
 		ret = power_failure(ret ? ret : -ENODEV);
 		goto put_linux;
 	}
-	/* A failed earlier unblock owns a reference even with zero pending. Retry
-	 * its cleanup once here before acquiring another NVIDIA reference.
+	/* A failed earlier unblock leaves an NVIDIA FINE reference outstanding
+	 * even when the pending count is zero. Retry its release once before
+	 * acquiring another.
 	 */
 	ret = release_fine_reference();
 	if (ret || cleanup_only)
@@ -802,7 +806,7 @@ static void activate_capture(void)
 	if (active)
 		pr_info("nvpcf_hook: attached to %s, NVIDIA %s\n", pci_name(h.pci), h.nvidia_version);
 	else
-		pr_err("nvpcf_hook: capture restored without replay readiness: state=%s error=%d\n",
+		pr_err("nvpcf_hook: capture restored, but replay is not ready: state=%s error=%d\n",
 			phase_names[READ_ONCE(h.phase)], READ_ONCE(h.last_error));
 }
 
@@ -939,8 +943,9 @@ static const struct nh_lifecycle_ops lifecycle_ops = {
 	.stop_observer = lifecycle_observer_stop,
 };
 
-/* action held. Fresh ACPICA calls use the original path after stop_capture.
- * The observer remains through the final batch, then stops before owner release.
+/* The caller holds action. After stop_capture, new ACPICA calls use the
+ * original path. The observer remains through the final batch, then stops
+ * before release of the device reference.
  */
 static int quiesce_flush(void)
 {
@@ -953,8 +958,9 @@ static int quiesce_flush(void)
 		   !atomic_read(&h.opening_calls));
 	result = nh_quiesce(NULL, &lifecycle_ops);
 	if (!result.error && READ_ONCE(h.guard_poisoned)) {
-		/* Ownership was already released when hardware failed. The guard
-		 * drained before freeing resources, but cannot certify delivery.
+		/* The device reference had already been released when hardware failed.
+		 * The guard waited for handlers before freeing resources, but
+		 * delivery remains unverified.
 		 */
 		h.phase = UNAVAILABLE;
 		unpin_nvidia();
@@ -1004,10 +1010,10 @@ static int read_text(const char *name, char *buf, size_t size)
 	return 0;
 }
 
-/* Callers hold system-sleep serialization and action. Before device ownership
- * they also hold device_lock; afterwards the kernel reference retains context.
- * These exclude NVIDIA's PM writer and proc-entry removal.
- * NVIDIA registers legacy proc_read wrappers, which kernel_read rejects.
+/* Callers hold the system-sleep lock and action. Before acquiring the device
+ * reference they also hold device_lock; afterwards the reference retains context
+ * and pre-unbind waits for action. These locks exclude NVIDIA's PM writer and
+ * proc-entry removal. kernel_read rejects NVIDIA's legacy proc_read wrappers.
  */
 static int read_gpu_text(const char *name, int (*show)(struct seq_file *, void *),
 		char *buf, size_t size)
@@ -1133,7 +1139,7 @@ static int check_configuration(void)
 	int ret = kernel_notifier_mode();
 
 	if (ret) {
-		pr_err("nvpcf_hook: requires UseKernelSuspendNotifiers=1 and absent procfs suspend control\n");
+		pr_err("nvpcf_hook: requires UseKernelSuspendNotifiers=1 and /proc/driver/nvidia/suspend to be absent\n");
 		return ret;
 	}
 	ret = effective_fine();
@@ -1257,7 +1263,7 @@ static int attach_locked(bool activate)
 		return ret;
 	if (!READ_ONCE(h.legacy_safe)) {
 		h.legacy_blocked = true;
-		pr_crit("nvpcf_hook: legacy ACPI methods changed during attachment; retaining ownership\n");
+		pr_crit("nvpcf_hook: legacy ACPI methods changed during attachment; retaining device reference\n");
 		return -EOPNOTSUPP;
 	}
 	mutex_lock(&h.delivery);
@@ -1383,8 +1389,8 @@ static void release_active(bool driver_gone)
 	}
 }
 
-/* Device lock and action held. Refuse initialization during our kernel get;
- * a successful earlier initializer is only a hint, not lifetime ownership.
+/* The caller holds the device lock and action. Another client can close
+ * before this reference acquisition, so refuse GPU initialization here.
  */
 static int prepare_open_locked(void)
 {
@@ -1473,8 +1479,8 @@ static void resume_work(struct work_struct *work)
 		if (!ret)
 			ret = attach_locked(true);
 		if (ret) {
-			/* Existing ownership also owns buffered callbacks through PM.
-			 * A validation error must not destroy their context.
+			/* The device reference keeps buffered callback data allocated
+			 * through system PM. A validation error must not release it.
 			 */
 			if (!already_owned && !h.legacy_blocked) {
 				int released = put_gpu();
@@ -1502,7 +1508,9 @@ static void resume_work(struct work_struct *work)
 	unlock_system_sleep(sleep_flags);
 }
 
-/* The loader still owns NVIDIA text until this GOING callback returns. */
+/* The module loader keeps NVIDIA's code allocated until this GOING
+ * notification returns.
+ */
 static void invalidate_nvidia_symbols(void)
 {
 	h.build_id_verified = false;
@@ -1524,8 +1532,8 @@ static void invalidate_nvidia_symbols(void)
 }
 
 /* After failed unregistration, the ops can remain registered. Disable their
- * redirects, wait entries that saw the old flags, then join reservations and
- * epilogues before forgetting NVIDIA addresses. Helper code stays pinned.
+ * redirects and wait for entries that saw the old flags, reserved calls and
+ * C epilogues before clearing NVIDIA addresses. Keep the hook module loaded.
  */
 static void drain_disabled_redirects(void)
 {
@@ -1640,7 +1648,9 @@ static int pm_notify(struct notifier_block *nb, unsigned long action, void *unus
 	return NOTIFY_DONE;
 }
 
-/* Publish loss without action so a concurrent admission cannot erase it. */
+/* Record loss before taking action, so an older successful check
+ * cannot clear it.
+ */
 static void mark_scope_unavailable(void)
 {
 	unsigned long flags;
@@ -1681,18 +1691,18 @@ static int bus_notify(struct notifier_block *nb, unsigned long action, void *dev
 		WRITE_ONCE(h.block_initialization, true);
 		h.phase = UNAVAILABLE;
 		set_error(-EOPNOTSUPP);
-		pr_crit("nvpcf_hook: unsupported legacy ACPI state retains ownership; PCI removal may wait\n");
+		pr_crit("nvpcf_hook: unsupported cached legacy ACPI state; retaining device reference, PCI removal may wait\n");
 		unlock_action();
 		return NOTIFY_DONE;
 	}
 	if (h.owner.held) {
 		ret = quiesce_flush();
 		if (ret) {
-			/* Stop any restoration from failed voluntary-style flushing. */
+			/* Prevent a failed explicit flush from restoring capture during removal. */
 			ret = stop_capture();
 			if (ret) {
-				/* Unbind ignores notifier errors. Retain ownership if the
-				 * kernel cannot remove our hook, even though removal waits.
+				/* Unbind ignores notifier errors. Retain the device reference if
+				 * interception cannot be removed, even though device removal waits.
 				 */
 				pr_crit("nvpcf_hook: cannot stop interception (%d); PCI removal may wait for detach\n", ret);
 				set_error(ret);
@@ -1705,7 +1715,7 @@ static int bus_notify(struct notifier_block *nb, unsigned long action, void *dev
 			if (h.fine_held) {
 				h.retirement_failed = true;
 				set_error(h.fine_release_error ? h.fine_release_error : -EBUSY);
-				pr_crit("nvpcf_hook: outstanding NVIDIA power reference retains ownership during removal\n");
+				pr_crit("nvpcf_hook: NVIDIA FINE reference is still outstanding; retaining device reference during removal\n");
 				unlock_action();
 				return NOTIFY_DONE;
 			}
@@ -1716,7 +1726,7 @@ static int bus_notify(struct notifier_block *nb, unsigned long action, void *dev
 				unlock_action();
 				return NOTIFY_DONE;
 			}
-			pr_err("nvpcf_hook: ownership ended with undelivered requests; inspect status\n");
+			pr_err("nvpcf_hook: device reference released with undelivered requests; inspect status\n");
 		}
 	}
 	WRITE_ONCE(h.block_initialization, true);
@@ -1814,8 +1824,8 @@ static int preflight(void)
 	return ret;
 }
 
-/* action/system sleep held. This path retires old registrations, never
- * attaches or calls NVIDIA addresses after its instance has exited.
+/* The caller holds action and the system-sleep lock. This path retries
+ * cleanup; it does not attach or call NVIDIA functions after their module exits.
  */
 static int retry_retirement(void)
 {
@@ -1861,8 +1871,9 @@ static int retry_retirement(void)
 	return 0;
 }
 
-/* action/system sleep held. A request preserves scope refusal until the
- * worker checks the target under device_lock; STARTING is not admitted WAITING.
+/* The caller holds action and the system-sleep lock. Keep initialization
+ * blocked until the worker checks the target under device_lock. STARTING
+ * does not allow initialization as WAITING does.
  */
 static int request_resume(void)
 {
@@ -1990,7 +2001,7 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 		unlock_action();
 	}
 	if (put_self)
-		module_put(THIS_MODULE); /* control file still owns our code */
+		module_put(THIS_MODULE); /* The control file retains a module reference. */
 	return ret ? ret : count;
 }
 
@@ -2043,7 +2054,7 @@ static int initial_stage(void *unused)
 	if (waiting_for_initializer(ret)) {
 		h.phase = WAITING;
 		set_error(ret);
-		pr_info("nvpcf_hook: waiting for a successful ordinary GPU initializer\n");
+		pr_info("nvpcf_hook: waiting for another client to initialize the GPU successfully\n");
 		return 0;
 	}
 	return ret;
@@ -2163,9 +2174,9 @@ static int __init hook_init(void)
 			int published = initial_publish(NULL);
 
 			if (published)
-				pr_crit("nvpcf_hook: diagnostic control publication failed: %d\n", published);
+				pr_crit("nvpcf_hook: could not create the diagnostic control device: %d\n", published);
 		}
-		pr_crit("nvpcf_hook: init cleanup failed (%d after %d); retaining helper and ownership state\n",
+		pr_crit("nvpcf_hook: initial cleanup failed (%d after %d); keeping the hook loaded and retaining resources\n",
 			publication.rollback_error, ret);
 		ret = 0;
 	} else if (ret) {
@@ -2173,7 +2184,7 @@ static int __init hook_init(void)
 		module_put(THIS_MODULE);
 		WRITE_ONCE(h.exiting, true);
 		set_error(ret);
-		pr_err("nvpcf_hook: initial setup/publication failed: %d\n", ret);
+		pr_err("nvpcf_hook: initial setup or control-device creation failed: %d\n", ret);
 	}
 	if (!h.legacy_blocked)
 		release_active(false);

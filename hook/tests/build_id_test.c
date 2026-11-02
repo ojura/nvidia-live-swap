@@ -105,7 +105,7 @@ static void descriptors(void)
 	assert(nh_note_build_id(bytes, size, &actual) == -EBADMSG);
 	size = note(bytes, 65, false);
 	assert(nh_note_build_id(bytes, size, &actual) == -E2BIG);
-	/* The expected descriptor must change for a replacement artifact. */
+	/* A replacement driver build must use its own checked build ID. */
 	size = note(bytes, 20, false);
 	assert(!nh_note_build_id(bytes, size, &expected));
 	bytes[16] ^= 1;

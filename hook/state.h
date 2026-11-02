@@ -37,8 +37,9 @@ static inline void nh_resume_replay(struct nh_replay_control *replay, bool ready
 	replay->enabled = ready;
 }
 
-/* Called after the system-PM barrier. Restoring capture without validated PM
- * readiness preserves count-only capture, the non-active phase and the error.
+/* Called after the system-PM barrier. Restored capture can count requests
+ * while replay is disabled. Report QUIESCED and retain the error until
+ * monitoring is ready.
  */
 static inline bool nh_activate_replay(struct nh_replay_control *replay,
 		bool accepting, bool fine_verified, enum nh_phase *phase, int *error)
@@ -128,7 +129,9 @@ static inline bool nh_pm_end(struct nh_state *s, bool active, bool suspended,
 	return nh_pending(s) != 0;
 }
 
-/* An unavailable device cannot receive replay. Retain the count until ack. */
+/* An unavailable device cannot receive replay. Retain the pending count
+ * until acknowledge-loss.
+ */
 static inline void nh_mark_stale(struct nh_state *s)
 {
 	s->stale = nh_pending(s) != 0;

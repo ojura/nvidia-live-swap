@@ -9,8 +9,9 @@ static inline int nh_may_unpin_helper(int hooks_stopped, int ownership_released,
 	return hooks_stopped && ownership_released && !requests_pending && !fault;
 }
 
-/* The caller owns lifecycle serialization. stop_capture also waits for
- * redirected calls and private replay work. The observer survives dispatch.
+/* The caller serializes lifecycle operations. stop_capture also waits for
+ * redirected calls and the replay worker. The observer remains registered
+ * through the final dispatch.
  */
 static inline int nh_start_allowed(int own_open, int initialization_blocked)
 {
@@ -28,7 +29,7 @@ static inline bool nh_may_pin_driver(bool live, bool same_module)
 }
 
 /* Registered guards can be reused only while their NVIDIA instance is known.
- * A failed retirement blocks attachment even if a replacement reuses an address.
+ * Incomplete cleanup blocks attachment even if a replacement reuses an address.
  */
 static inline bool nh_instance_attach_allowed(bool retirement_failed,
 		bool guards_registered, bool instance_known)
@@ -37,8 +38,9 @@ static inline bool nh_instance_attach_allowed(bool retirement_failed,
 }
 
 /* A successful stack allocation can return NULL. Callers serialize access and
- * keep NVIDIA text pinned until release has put the device and freed the stack.
- * Acquire requires an empty owner; release is safe to call again after cleanup.
+ * retain the NVIDIA module reference until the device reference and stack have
+ * been released. Acquisition requires an empty owner; release can be called
+ * again after cleanup.
  */
 struct nh_owner {
 	bool held;
@@ -168,8 +170,9 @@ struct nh_teardown_ops {
 	void (*destroy_resources)(void *);
 };
 
-/* Only committed adapter teardown uses this ordering. Cleanup drains ordinary
- * callbacks while resources still exist and API/GPU locks are not held.
+/* Use this ordering only after entry to adapter shutdown. Cleanup waits for
+ * ordinary callbacks while resources still exist and before the RM API and
+ * GPU locks are taken.
  */
 static inline void nh_teardown(void *ctx, const struct nh_teardown_ops *ops)
 {
