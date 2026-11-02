@@ -32,7 +32,7 @@ def c_text(text):
 def function(text, name, *, raw=False):
     clean = c_text(text)
     match = re.search(
-        r'(?m)^(?:static\s+)?(?:void|int|NV_STATUS|NvLength)\s+(?:NV_API_CALL\s+)?'
+        r'(?m)^(?:static\s+)?(?:void|int|bool|NV_STATUS|NvLength)\s+(?:NV_API_CALL\s+)?'
         + re.escape(name) + r'\s*\([^;]*?\)\s*\{', clean)
     assert match, f'missing function definition: {name}'
     opening = clean.index('{', match.start())
@@ -95,36 +95,32 @@ def compact(text):
     return re.sub(r'\s+', '', text)
 
 
-def check_dispatch_source(text, notification):
-    signature, body, _ = function(text, 'gpuNotifySubDeviceEvent_IMPL')
-    assert signature == ('voidgpuNotifySubDeviceEvent_IMPL(OBJGPU*pGpu,NvU32notifyIndex,'
-                         'void*pNotifyParams,NvU32notifyParamsSize,NvV32info32,NvV16info16)')
-    loop = re.search(r'\bfor\s*\(', body)
-    assert loop, 'missing normal dispatch loop'
-    # Validate the actual assertions and their placement, not substrings that
-    # could also occur in a condition excluding NVPCF or requiring ISR context.
-    prelude = (
-        '{PEVENTNOTIFICATION pEventNotification;THREAD_STATE_NODE *pCurThread;'
-        'NvU32 localNotifyType;NvU32 localInfo32;NvU32 i;'
-        'if(NV_OK==threadStateGetCurrent(&pCurThread,pGpu)){'
-        'NV_ASSERT_OR_RETURN_VOID(!(pCurThread->flags & THREAD_STATE_FLAGS_IS_ISR_LOCKLESS));}'
-        'NV_ASSERT_OR_RETURN_VOID(notifyIndex < NV2080_NOTIFIERS_MAXCOUNT);'
+def c_tokens(text):
+    token = re.compile(
+        r'(?P<skip>\s+|/\*.*?\*/|//[^\n]*)|'
+        r'(?:u8|u|U|L)?"(?:\\.|[^"\\])*"|(?:u|U|L)?\'(?:\\.|[^\'\\])*\'|'
+        r'[A-Za-z_][A-Za-z_0-9]*|0[xX][0-9a-fA-F]+[uUlL]*|'
+        r'(?:\d+(?:\.\d*)?|\.\d+)(?:[eEpP][+-]?\d+)?[uUlLfF]*|'
+        r'>>=|<<=|\.\.\.|->|\+\+|--|&&|\|\||<=|>=|==|!=|<<|>>|'
+        r'\+=|-=|\*=|/=|%=|&=|\|=|\^=|##|[{}()\[\];,.:?~!%^&*+\-/|<>=#]',
+        flags=re.S,
     )
-    assert compact(body[:loop.start()]) == compact(prelude), 'dispatcher pre-loop conditions changed'
-    opening = body.index('(', loop.start())
-    end = closing_delimiter(body, opening, '(', ')')
-    assert compact(body[opening + 1:end]) == 'i=0;i<pGpu->numSubdeviceBackReferences;i++', 'dispatcher loop condition changed'
-    block = end + 1
-    while body[block].isspace():
-        block += 1
-    assert body[block] == '{'
-    block_end = closing_delimiter(body, block, '{', '}')
-    assert body[block_end + 1:].strip() == '}', 'unexpected post-loop control flow'
-    returns = re.findall(r'\b([A-Z_]*RETURN[A-Z_]*)\s*\(', body)
-    assert returns == ['NV_ASSERT_OR_RETURN_VOID', 'NV_ASSERT_OR_RETURN_VOID']
-    assert not re.search(r'\breturn\b', body), 'explicit dispatcher early return needs inspection'
-    for call in ('_gpuFilterSubDeviceEventInfo', 'notifyFillNotifierMemory', 'osEventNotificationWithInfo'):
-        assert re.search(r'\b' + call + r'\s*\(', body), call
+    result, position = [], 0
+    while position < len(text):
+        match = token.match(text, position)
+        assert match, f'unrecognized C token at byte {position}; source review required'
+        if match.lastgroup != 'skip':
+            result.append(match[0])
+        position = match.end()
+    return tuple(result)
+
+
+def check_dispatch_source(text, notification):
+    signature, body, _ = function(text, 'gpuNotifySubDeviceEvent_IMPL', raw=True)
+    reference = Path(__file__).with_name('expected_dispatcher.c').read_text()
+    expected_signature, expected_body, _ = function(reference, 'gpuNotifySubDeviceEvent_IMPL', raw=True)
+    assert signature == expected_signature, 'dispatcher declaration changed; source review required'
+    assert c_tokens(body) == c_tokens(expected_body), 'unrecognized dispatcher body; source review required'
     index = int(re.search(r'#define\s+NV2080_NOTIFIERS_NVPCF_EVENTS\s+\((\d+)\)', notification)[1])
     maximum = int(re.search(r'#define\s+NV2080_NOTIFIERS_MAXCOUNT\s+\((\d+)\)', notification)[1])
     assert index == 177 and index < maximum

@@ -371,9 +371,12 @@ and manual recovery, including address reuse and preserved independent faults.
 
 These tests execute shared logic and model kernel ordering. They do not execute
 kernel attachment, ACPI, runtime PM or NVIDIA. The source checker reads archives
-without extracting or executing their code. It validates both dispatcher
-assertion conditions, their placement before the normal dispatch loop and that
-loop's bounds. ELF checks require calls to exact symbol entries or corresponding
+without extracting or executing their code. It compares the complete dispatcher
+body's C token sequence with the inspected body in `tests/expected_dispatcher.c`.
+Comments and whitespace are ignored, but unrecognized code changes require
+source review. This checks that one function's implementation remains compatible;
+it does not prove arbitrary C semantics or identify compatible version numbers.
+ELF checks require calls to exact symbol entries or corresponding
 PC32/PLT32 relocations on the call displacement with addend -4. They reject
 similarly named functions and nonzero offsets that could skip instrumentation.
 The tests assemble positive and negative ELF fixtures and mutate source

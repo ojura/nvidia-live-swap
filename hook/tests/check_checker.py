@@ -7,26 +7,7 @@ import tempfile
 
 CHECK = runpy.run_path(str(Path(__file__).with_name('check_nvidia.py')))
 
-SOURCE = '''
-void gpuNotifySubDeviceEvent_IMPL(OBJGPU *pGpu, NvU32 notifyIndex,
-    void *pNotifyParams, NvU32 notifyParamsSize, NvV32 info32, NvV16 info16)
-{
-    PEVENTNOTIFICATION pEventNotification;
-    THREAD_STATE_NODE *pCurThread;
-    NvU32 localNotifyType;
-    NvU32 localInfo32;
-    NvU32 i;
-    if (NV_OK == threadStateGetCurrent(&pCurThread, pGpu)) {
-        NV_ASSERT_OR_RETURN_VOID(!(pCurThread->flags & THREAD_STATE_FLAGS_IS_ISR_LOCKLESS));
-    }
-    NV_ASSERT_OR_RETURN_VOID(notifyIndex < NV2080_NOTIFIERS_MAXCOUNT);
-    for (i = 0; i < pGpu->numSubdeviceBackReferences; i++) {
-        _gpuFilterSubDeviceEventInfo();
-        notifyFillNotifierMemory();
-        osEventNotificationWithInfo();
-    }
-}
-'''
+SOURCE = Path(__file__).with_name('expected_dispatcher.c').read_text()
 NOTIFICATION = '''
 #define NV2080_NOTIFIERS_NVPCF_EVENTS (177)
 #define NV2080_NOTIFIERS_MAXCOUNT (202)
@@ -39,6 +20,14 @@ def must_reject(callback, description):
     except AssertionError:
         return
     raise AssertionError('checker accepted incompatible fixture: ' + description)
+
+
+def mutate_loop(prefix, suffix=''):
+    clean = CHECK['c_text'](SOURCE)
+    loop = clean.index('for (i = 0;')
+    opening = clean.index('{', loop)
+    closing = CHECK['closing_delimiter'](clean, opening, '{', '}')
+    return SOURCE[:opening + 1] + prefix + SOURCE[opening + 1:closing] + suffix + SOURCE[closing:]
 
 
 def test_source():
@@ -64,14 +53,15 @@ def test_source():
         'NVPCF-excluding loop': SOURCE.replace(
             'i < pGpu->numSubdeviceBackReferences;',
             'i < pGpu->numSubdeviceBackReferences && notifyIndex != 177;'),
-        'extra returning macro': SOURCE.replace(
-            '        _gpuFilterSubDeviceEventInfo();',
-            '        NEW_RETURN_IF(notifyIndex == 177);\n        _gpuFilterSubDeviceEventInfo();'),
-        'post-loop control flow': SOURCE.replace(
-            '        osEventNotificationWithInfo();\n    }',
-            '        osEventNotificationWithInfo();\n    }\n    unexpectedOperation();'),
+        'extra returning macro': mutate_loop('\nNEW_RETURN_IF(notifyIndex == 177);\n'),
+        'NVPCF break': mutate_loop('\nif (notifyIndex == 177) break;\n'),
+        'NVPCF continue': mutate_loop('\nif (notifyIndex == 177) continue;\n'),
+        'conditionally guarded notification work': mutate_loop('\nif (notifyIndex != 177) {\n', '\n}\n'),
+        'post-loop control flow': SOURCE[:SOURCE.rfind('}')] + 'unexpectedOperation();\n' + SOURCE[SOURCE.rfind('}'):],
     }
+    assert CHECK['c_tokens']('x + +y') != CHECK['c_tokens']('x++ + y')
     for name, source in fixtures.items():
+        assert source != SOURCE, name
         must_reject(lambda: check(source, NOTIFICATION), name)
     print(f'PASS: source checker accepts equivalent whitespace/comments and rejects {len(fixtures)} incompatible control-flow fixtures')
 
