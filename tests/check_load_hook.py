@@ -6,8 +6,10 @@ case, a throwaway directory in place of /sys/module, /proc/modules,
 modprobe, modinfo, zstd, readelf, curl and uname are mocks placed first on
 PATH. check_nvidia.py and nvpcf-hookctl are mocks placed next to the copied
 script, where the installed script finds its copies. A mock module file
-holds its build ID as text, which the mock readelf reports, so the cases can
-tell which file the script checked. The loaded nvidia's build ID is a real
+holds its build ID and version as text, which the mock readelf and modinfo
+report for that file, so the cases can tell which file the script checked
+and where a version came from. Asked for nvidia's version by name, the mock
+modinfo answers with a different version, which a case would notice. The loaded nvidia's build ID is a real
 GNU note under the throwaway /sys/module, which the script parses itself."""
 import json
 import os
@@ -66,14 +68,20 @@ elif cmd == 'modinfo':
     if cfg.get('modinfo_missing'):
         sys.exit(1)
     if args[:2] == ['-F', 'version']:
-        print(cfg['version'])
+        if args[2] == 'nvidia':
+            print('9.9.9')
+        else:
+            text = Path(args[2]).read_text()
+            if 'VERSION=' in text:
+                print(text.split('VERSION=')[1].split()[0])
     else:
         print(root / 'lib/modules' / cfg['running'] / 'updates/dkms/nvidia.ko.zst')
 elif cmd == 'zstd':
     sys.stdout.write(Path(args[-1]).read_text())
 elif cmd == 'readelf':
     text = Path(args[-1]).read_text()
-    print('    Build ID: ' + text.split('BUILDID=')[1].split()[0])
+    if 'BUILDID=' in text:
+        print('    Build ID: ' + text.split('BUILDID=')[1].split()[0])
 elif cmd == 'curl':
     out = Path(args[args.index('-o') + 1])
     if cfg.get('curl_fails'):
@@ -103,8 +111,12 @@ def check(r, cond, what):
         print(f"FAIL {r['case']}: {what}\n{r['out']}")
 
 
+def module_text(build_id, version, where):
+    return (f'BUILDID={build_id} ' if build_id else '') + f'VERSION={version} {where}\n'
+
+
 def run(name, cfg=None, args=(), nvidia_loaded=True, hook_loaded=False, disk_id=LOADED, dkms_id=None,
-        source_tree=True, cached=True):
+        source_tree=True, cached=True, disk_version=VER, versions=(VER,)):
     cfg = dict({'running': RUNNING, 'version': VER, 'loaded_id': LOADED}, **(cfg or {}))
     root = BASE / name
     (root / 'bin').mkdir(parents=True)
@@ -120,16 +132,17 @@ def run(name, cfg=None, args=(), nvidia_loaded=True, hook_loaded=False, disk_id=
     (root / 'calls.jsonl').write_text('')
     disk = root / 'lib/modules' / RUNNING / 'updates/dkms/nvidia.ko.zst'
     disk.parent.mkdir(parents=True)
-    disk.write_text(f'BUILDID={disk_id} disk\n')
+    disk.write_text(module_text(disk_id, disk_version, 'disk'))
     if dkms_id:
         d = root / 'var/lib/dkms/nvidia' / VER / RUNNING / 'x86_64/module'
         d.mkdir(parents=True)
-        (d / 'nvidia.ko.zst').write_text(f'BUILDID={dkms_id} dkms\n')
-    if source_tree:
-        (root / f'usr/src/nvidia-{VER}').mkdir(parents=True)
+        (d / 'nvidia.ko.zst').write_text(module_text(dkms_id, VER, 'dkms'))
     (root / 'cache').mkdir()
-    if cached:
-        (root / f'cache/open-gpu-kernel-modules-{VER}.tar.gz').write_text('cached archive')
+    for v in versions:
+        if source_tree:
+            (root / f'usr/src/nvidia-{v}').mkdir(parents=True)
+        if cached:
+            (root / f'cache/open-gpu-kernel-modules-{v}.tar.gz').write_text('cached archive')
     scripts = root / 'scripts'
     scripts.mkdir()
     text = (SRC / 'load-hook.sh').read_text()
@@ -176,7 +189,8 @@ check(r, r['exit'] == 0, f"exits with status 0, got {r['exit']}")
 check(r, r['modprobe'] == [['nvidia'], HOOK_LOAD],
       f"loads nvpcf_hook with the loaded build ID in lowercase, got {r['modprobe']}")
 a = r['checker'][0] if r['checker'] else []
-check(r, r['checked'] == f'BUILDID={LOADED} disk', f"checks the module file with the loaded build ID, got {r['checked']}")
+check(r, r['checked'] == module_text(LOADED, VER, 'disk').strip(),
+      f"checks the module file with the loaded build ID, got {r['checked']}")
 check(r, f"{r['root']}/usr/src/nvidia-{VER}" in a and f"{r['root']}/cache/open-gpu-kernel-modules-{VER}.tar.gz" in a,
       f"checks the version's kernel-open source and the cached source archive, got {a}")
 check(r, r['curl'] == [], 'does not download an archive that is cached')
@@ -203,7 +217,7 @@ check(r, r['exit'] == 1 and 'cannot find an installed nvidia module file with th
 check(r, r['checker'] == [] and HOOK_LOAD not in r['modprobe'], 'checks nothing in its place and does not load the hook')
 
 r = run('dkms-copy-matches', disk_id=OTHER, dkms_id=LOADED)
-check(r, r['exit'] == 0 and r['checked'] == f'BUILDID={LOADED} dkms',
+check(r, r['exit'] == 0 and r['checked'] == module_text(LOADED, VER, 'dkms').strip(),
       f"checks DKMS's copy, which has the loaded build ID, got status {r['exit']} and {r['checked']}")
 
 r = run('checker-fails', {'checker_fails': True})
@@ -236,8 +250,25 @@ r = run('already-loaded-unusable', {'hook_before': ['unavailable', 0, 1]}, hook_
 check(r, r['exit'] == 1, f"exits with status 1 for a loaded hook that is unavailable, got {r['exit']}")
 
 r = run('check-disk', args=('--check-disk',), nvidia_loaded=False)
-check(r, r['exit'] == 0 and r['modprobe'] == [] and r['checked'] == f'BUILDID={LOADED} disk',
+check(r, r['exit'] == 0 and r['modprobe'] == [] and r['checked'] == module_text(LOADED, VER, 'disk').strip(),
       f"checks the file modprobe would load without loading anything, got status {r['exit']} and {r['modprobe']}")
+
+for case, build_id in (('no-build-id', None), ('malformed-build-id', 'zz' * 20), ('long-build-id', 'ab' * 65)):
+    r = run(f'check-disk-{case}', args=('--check-disk',), nvidia_loaded=False, disk_id=build_id)
+    check(r, r['exit'] == 1 and 'no GNU build ID of 1 to 64 bytes' in r['out'] and r['checker'] == [],
+          f"refuses a candidate without a usable build ID before checking it, got status {r['exit']}")
+
+r = run('check-disk-version-from-file', args=('--check-disk',), nvidia_loaded=False, disk_version='615.78.08',
+        versions=(VER, '615.78.08'))
+a = r['checker'][0] if r['checker'] else []
+check(r, r['exit'] == 0 and any(x.endswith('/usr/src/nvidia-615.78.08') for x in a)
+      and any(x.endswith('open-gpu-kernel-modules-615.78.08.tar.gz') for x in a),
+      f"checks the source of the version that the checked file reports, got status {r['exit']} and {a}")
+
+r = run('loaded-version-differs', disk_version='615.78.08', versions=(VER, '615.78.08'))
+check(r, r['exit'] == 1 and "reports version '615.78.08', but the loaded nvidia reports 615.71.09" in r['out']
+      and r['checker'] == [] and HOOK_LOAD not in r['modprobe'],
+      f"refuses when the file with the loaded build ID reports another version, got status {r['exit']}")
 
 r = run('check-disk-no-download', args=('--check-disk', '--no-download'), cached=False)
 check(r, r['exit'] == 3 and r['curl'] == [] and 'cannot be checked without a download' in r['out'],

@@ -78,9 +78,10 @@ fetch() {
 }
 
 # Decompress a module file into a temporary file, named in $copy. It runs in
-# the script's own shell, so that the EXIT trap removes the file.
+# the script's own shell, so that the EXIT trap removes the file. The name
+# ends in .ko, because modinfo reads a file only by such a name.
 module_copy() {
-    copy=$(mktemp) || return 1
+    copy=$(mktemp --suffix=.ko) || return 1
     temps+=("$copy")
     case "$1" in
         *.zst) zstd -dcq "$1" > "$copy" ;;
@@ -88,7 +89,15 @@ module_copy() {
         *) cat "$1" > "$copy" ;;
     esac
 }
-file_build_id() { readelf -n "$1" 2>/dev/null | sed -n 's/.*Build ID: //p' | head -1 | tr 'A-F' 'a-f'; }
+# Print the GNU build ID of a module copy in lowercase. Exit status 1 unless
+# it is 1 to 64 bytes of hex, the range that nvpcf_hook accepts.
+copy_build_id() {
+    local id
+    id=$(readelf -n "$1" 2>/dev/null | sed -n 's/.*Build ID: //p' | head -1 | tr 'A-F' 'a-f')
+    [[ $id =~ ^([0-9a-f]{2}){1,64}$ ]] || return 1
+    echo "$id"
+}
+copy_version() { modinfo -F version "$1" 2>/dev/null; }
 # Print the GNU build ID from an ELF note file, parsing each note's header.
 note_build_id() {
     python3 -I -c '
@@ -124,7 +133,7 @@ check_build() {
         fetch "$ver"
     fi
     python3 -I -B "$CHECKER" --module-object "$ko" --kernel-source "/usr/src/nvidia-$ver" --source-tar "$archive" ||
-        fail "check_nvidia.py rejects NVIDIA $ver with build ID $(file_build_id "$ko")"
+        fail "check_nvidia.py rejects NVIDIA $ver with build ID $(copy_build_id "$ko" || echo unknown)"
 }
 
 hook_loaded() { grep -q '^nvpcf_hook ' /proc/modules; }
@@ -146,11 +155,15 @@ case $mode in
         log "NVIDIA's $2 source archive is in $CACHE"
         exit 0 ;;
     check-disk)
+        # The version and the build ID come from the copy that is checked, so
+        # that a package replaced meanwhile cannot pair one file with another
+        # version's source.
         f=$(modinfo -n nvidia 2>/dev/null) || fail "modprobe cannot find nvidia for kernel $(uname -r)"
-        ver=$(modinfo -F version nvidia 2>/dev/null)
         module_copy "$f" || fail "cannot read $f"
+        id=$(copy_build_id "$copy") || fail "$f has no GNU build ID of 1 to 64 bytes, which nvpcf_hook needs"
+        ver=$(copy_version "$copy")
         check_build "$copy" "$ver"
-        log "NVIDIA $ver in $f passes the checks"
+        log "NVIDIA $ver in $f, build ID $id, passes the checks"
         exit 0 ;;
 esac
 
@@ -161,19 +174,22 @@ if hook_loaded; then
 fi
 modprobe nvidia || fail "could not load nvidia"
 id=$(note_build_id /sys/module/nvidia/notes/.note.gnu.build-id) || fail "cannot read the build ID of the loaded nvidia"
-ver=$(cat /sys/module/nvidia/version 2>/dev/null)
-valid_version "$ver" || fail "the loaded nvidia reports '$ver', not a driver version"
+loaded_ver=$(cat /sys/module/nvidia/version 2>/dev/null)
+valid_version "$loaded_ver" || fail "the loaded nvidia reports '$loaded_ver', not a driver version"
 ko=""
-for f in "$(modinfo -n nvidia 2>/dev/null)" /var/lib/dkms/nvidia/"$ver"/"$(uname -r)"/*/module/nvidia.ko*; do
+for f in "$(modinfo -n nvidia 2>/dev/null)" /var/lib/dkms/nvidia/"$loaded_ver"/"$(uname -r)"/*/module/nvidia.ko*; do
     [ -f "$f" ] || continue
     module_copy "$f" || continue
-    if [ "$(file_build_id "$copy")" = "$id" ]; then
+    if [ "$(copy_build_id "$copy")" = "$id" ]; then
         ko=$copy
         log "the loaded nvidia is $f"
         break
     fi
 done
 [ -n "$ko" ] || fail "cannot find an installed nvidia module file with the loaded build ID $id, so the loaded driver cannot be checked"
+ver=$(copy_version "$ko")
+[ "$ver" = "$loaded_ver" ] ||
+    fail "the module file with the loaded build ID reports version '$ver', but the loaded nvidia reports $loaded_ver"
 check_build "$ko" "$ver"
 modprobe nvpcf_hook "expected_nvidia_build_id=$id" || fail "could not load nvpcf_hook"
 hook_usable

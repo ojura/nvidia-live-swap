@@ -445,14 +445,19 @@ is missing, and checked again at every load. By default, the loader loads
 `/sys/module/nvidia/notes`. It checks the module file with that build ID, which
 is the file `modprobe` would load, or DKMS's copy for the loaded version and the
 running kernel. It stops when it cannot find a file with the loaded build ID,
-because a check of a different file does not cover the loaded driver. After the
-checks pass, it loads `nvpcf_hook` with `expected_nvidia_build_id` set to the
-checked build ID, and the hook refuses to attach to any other build. The loader
-exits with status 0 only if the hook then reports `active`, or `waiting` with
-its guards installed and GPU initialization allowed. `--check-disk` checks the
-file that `modprobe` would load without loading anything. `--no-download` makes
-a missing archive end the run with status 3, which means the check could not
-run. `--fetch VERSION` only downloads an archive.
+because a check of a different file does not cover the loaded driver. The
+version comes from the matched file itself, and has to equal the loaded
+module's. After the checks pass, it loads `nvpcf_hook` with
+`expected_nvidia_build_id` set to the checked build ID, and the hook refuses to
+attach to any other build. The loader exits with status 0 only if the hook then
+reports `active`, or `waiting` with its guards installed and GPU initialization
+allowed. `--check-disk` checks the file that `modprobe` would load without
+loading anything. It takes the version and the build ID from the same
+decompressed copy that it checks, so that a package replaced meanwhile cannot
+pair one file with another version's source, and it requires a build ID of 1 to
+64 bytes, the range that the hook accepts. `--no-download` makes a missing
+archive end the run with status 3, which means the check could not run.
+`--fetch` only downloads the archive of the version given after it.
 
 `nvpcf-hook.service` runs the installed loader once at boot, after the network
 is up, because a new driver version can need its archive. A unit runs it rather
@@ -494,13 +499,13 @@ install or check failed, or if an archive could not be downloaded.
 
 `trace.sh [seconds]` runs as root, for 60 seconds by default. Run it in the
 `balanced` profile. It prints the platform profile first. Then it records the EC
-queries, how long the driver takes for each notification, and whether the GPU is
-active or suspended.
+queries, each call of the driver's notification handler with its duration, and
+whether the GPU is active or suspended.
 
 The kernel's EC driver logs a query only as a debug message. Each such message
 is turned on or off through the kernel's dynamic debug control file. `trace.sh`
 turns on the EC driver's debug messages that are off, and only those. It times
-the notifications with ftrace, the kernel's built-in tracer. ftrace's
+the handler's calls with ftrace, the kernel's built-in tracer. ftrace's
 `function_graph` tracer records how long each call to a traced function takes,
 and `trace.sh` traces only `nv_acpi_nvpcf_event`, the driver function that
 receives the notification. The trace runs in a private tracing instance, so the
@@ -572,6 +577,9 @@ the number of deliveries.
   The loaded build ID is a real GNU note that the script parses. The cases check
   that it checks the file with the loaded build ID, or DKMS's copy when only
   that matches, and that it stops without a check when neither matches. They
+  check that the version comes from the checked file, that a file whose version
+  differs from the loaded module's is refused, and that `--check-disk` refuses a
+  candidate whose build ID is missing, malformed or longer than 64 bytes. They
   check that it passes the build ID in lowercase, and downloads a missing
   archive over https into the cache without leaving a partial file. A failed
   download, a rejected check, a missing source tree, a version string that is
