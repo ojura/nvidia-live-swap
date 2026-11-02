@@ -68,13 +68,9 @@ Run the scripts from the repository directory.
   prints the hook's counts before and after the trace, which tell the two
   apart.
 
-To install the fix without logging out:
-
-- With nvpcf_hook, run `sudo ./install-hook.sh`, and then
-  `sudo /usr/local/lib/nvpcf-hook/load-hook.sh`, which reports the hook's state.
-  The hook attaches to the running driver, so the fix works without a swap.
-- With `build.sh`, run `sudo ./build.sh`. The patched driver loads at the next
-  boot.
+Loading nvpcf_hook applies the fix to the running driver without a swap. Run
+`sudo ./install-hook.sh`, then `sudo /usr/local/lib/nvpcf-hook/load-hook.sh`,
+which reports the hook's state.
 
 `swap.sh` needs gdb, the GNU debugger, which it uses to take the GPU away from
 running programs. It also runs `reapply-layout.py`, which needs Ubuntu's
@@ -178,12 +174,14 @@ how. So if the previous swap ended less than 20 seconds earlier, `swap.sh`
 waits for the rest of the 20 seconds. `swap.sh --check` shows how long that
 wait would be.
 
-If a swap fails or is interrupted, `swap.sh` tries to load from disk every
-NVIDIA module that was loaded before the swap and is now missing. It also tries
-to rename the registration files back and to start the services it stopped.
-Then it exits with an error. The modules it loads come from disk, so they can be
-a different build from the modules it unloaded. A program that lost its access
-to the GPU gets it back only when it restarts.
+If a swap fails or is interrupted, `swap.sh` first tries to restore `nvidia` and
+its hook. It restores the other missing NVIDIA modules and the services it
+stopped only after the loader confirms that the hook guards NVIDIA's shutdown
+and allows GPU initialization. Otherwise it leaves those modules unloaded and
+those services stopped, and names them. It tries to rename the registration
+files back in either case, then exits with an error. Modules restored from disk
+can differ from the modules it unloaded. A program that lost its access to the
+GPU gets it back only when it restarts.
 
 A new driver version also installs new NVIDIA libraries, which programs load to
 use the GPU. These libraries work only with kernel modules of the same version.

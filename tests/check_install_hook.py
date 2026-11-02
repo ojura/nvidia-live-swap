@@ -10,28 +10,30 @@ built and installed module files. build --force drops a version's existing
 build for the kernel first. install --force uninstalls the same version first,
 builds a missing build, copies the build over the kernel's installed file,
 and then runs depmod. When depmod fails, it removes the file it copied, so
-the kernel is left with no installed version. A case can also make install
+the kernel is left without an installed version. A case can also make install
 fail before the copy, or leave a file with another build ID while it reports
 success. remove uninstalls a version from every kernel that has
 it installed, so a premature remove shows up as a lost module. A module file
 holds its build ID as text, which the mock objcopy turns into the note that
 GNU ld writes. uname, modinfo, objcopy, systemctl and curl are mocks too. The
-copied load-hook.sh reads the
-build IDs for install-hook.sh, and downloads into the throwaway cache through
-the mock curl.
+copied load-hook.sh reads build IDs for install-hook.sh and downloads into the
+throwaway cache through the mock curl.
 
 The cases check the kernels that get the new version, that a kernel keeps
 its working module when the new version fails to build for it or its headers
 are missing, and that a kernel whose install fails gets its previous version
 back from DKMS's build of it. When that fails too, the previous version's
-registration, source and build stay. An old version is removed only when no
-kernel has it installed and no failed kernel had it. A build ID that cannot
-be read fails the check instead of matching another unreadable one. A failing
-dkms status, a non-canonical PACKAGE_VERSION, and a registered version that
-DKMS ranks equal to or above the new one stop the script before it changes
-anything. Every case that registers the new version checks that the new
-version is the greatest one, with VER taken from /usr/sbin/dkms when it
-exists.
+registration, source and build stay. An older version that is not installed for
+any kernel is removed only after every kernel in the run has the new version
+installed and checked. A failed or skipped kernel keeps the older
+registrations, source and builds, also on a second run that fails again for a
+kernel that the first run left without a module. A build ID that cannot be
+read fails the check instead of matching another unreadable one. A failing
+dkms status, a PACKAGE_VERSION that is not dotted numbers from 0 to 999
+without leading zeros, and a registered version that DKMS ranks equal to or
+above the new one stop the script before it changes anything. Every case that
+registers the new version checks that the new version is the greatest one,
+with VER taken from /usr/sbin/dkms when it exists.
 
 With --no-enable, the script installs the unit without enabling it, and
 leaves a unit that is enabled already as it is; a case covers each.
@@ -45,11 +47,11 @@ source directory with an extra file. mkdir, cp, find and cmp are mocks only in
 the cases that need them. A running kernel without headers passes when it has
 the version installed and checked, and stops the script otherwise.
 
-One case builds hook/ with the real Kbuild between two runs, as hook/README.md
-describes, so the second run sees the generated files, such as
-nvpcf_hook.mod.c. The second run has to find the registered source unchanged,
-and a Kbuild build of the registered source has to succeed. This case needs
-the running kernel's headers and a compiler.
+One case builds hook/ with the real Kbuild between two installer runs, so the
+second run sees generated files such as nvpcf_hook.mod.c. The second run has to
+find the registered source unchanged, and a Kbuild build of the registered
+source has to succeed. This case needs the running kernel's headers and a
+compiler.
 
 The fresh install checks that every file that lib.sh lists in HOOK_TOOLS is
 installed unchanged, with its mode. It also runs hook/tests/check_checker.py,
@@ -197,7 +199,8 @@ elif cmd == 'modinfo':
         sys.exit(1)
     print(p)
 elif cmd == 'objcopy':
-    # A file without the section: objcopy exits with status 0 and writes nothing.
+    # A file without the section: objcopy exits with status 0 and writes an
+    # empty file.
     out = Path(args[-1])
     if cfg.get('build_id_section_missing'):
         out.write_bytes(b'')
@@ -425,7 +428,7 @@ check(r, r['exit'] == 0 and r['state']['installed'] == {RUNNING: r['new'], OTHER
       f"installs the new version for both kernels, got status {r['exit']} and {r['state']['installed']}")
 check(r, r['removed'] == [f'nvpcf-hook/{OLD}'] and OLD not in r['state']['added']
       and f'nvpcf-hook-{OLD}' not in r['sources'],
-      f"removes the old version and its source once no kernel has it installed, got {r['removed']}")
+      f"removes the old version and its source once it is not installed for any kernel, got {r['removed']}")
 c = r['calls']
 check(r, c.index('dkms remove') > max(i for i, x in enumerate(c) if x == 'dkms install'),
       f"removes the old version only after the installs, got the calls {c}")
@@ -471,7 +474,7 @@ check(r, r['exits'] == [1, 1] and RUNNING not in r['state']['installed'] and r['
       f"fails both runs and leaves the failed kernel without a module, got {r['exits']} and {r['state']['installed']}")
 check(r, f'keeping nvpcf-hook/{OLD} until every kernel' in r['out']
       and sorted(r['state']['added']) == sorted([OLD, NEW]),
-      f"keeps {OLD} on the second run too, although no kernel has it installed, got {r['state']['added']}")
+      f"keeps {OLD} on the second run too, although it is not installed for any kernel, got {r['state']['added']}")
 keeps_old(r)
 
 def headers_gone(gone_before, back_before=None):
@@ -534,7 +537,7 @@ check(r, r['removed'] == [f'nvpcf-hook/{OLD}'] and OLD not in r['state']['added'
 r = run('build-id-unreadable', {'build_id_section_missing': True}, installed={RUNNING: OLD, OTHER: OLD})
 check(r, r['exit'] == 1 and f'{RUNNING}: installing nvpcf-hook/{NEW}, or checking that modprobe finds it' in r['out']
       and f'{OTHER}: installing nvpcf-hook/{NEW}, or checking that modprobe finds it' in r['out'],
-      'fails the check when no build ID can be read, instead of matching two empty IDs')
+      'fails the check when the build ID cannot be read, instead of matching two empty IDs')
 keeps_old(r)
 
 r = run('other-headers-missing', {}, headers=(RUNNING,), installed={RUNNING: OLD, OTHER: OLD})
@@ -576,7 +579,7 @@ r = run('unregistered-conflicting-source', {},
         unregistered={NEW: {'nvpcf_hook.c': '/* local work */\n', 'notes.txt': 'keep me\n', 'text.h': None}})
 check(r, r['exit'] == 1 and r['changing'] == [] and 'leaves it as it is' in r['out']
       and 'nvpcf_hook.c differs' in r['out'] and 'text.h is missing' in r['out'] and 'notes.txt is not part of the source' in r['out'],
-      f"refuses, names every difference and changes nothing, got status {r['exit']} and {r['changing']}")
+      f"refuses, names every difference and leaves the source and DKMS state unchanged, got status {r['exit']} and {r['changing']}")
 files = source_files(r)
 check(r, files is not None and files.get('nvpcf_hook.c') == '/* local work */\n' and files.get('notes.txt') == 'keep me\n'
       and 'text.h' not in files, f"leaves the conflicting directory as it was, got {sorted(files or [])}")
@@ -627,7 +630,7 @@ r = run('source-listing-fails', {'find_fails': f'nvpcf-hook-{NEW}'}, mocks=('fin
         unregistered={NEW: {'notes.txt': 'keep me\n'}})
 check(r, r['exit'] == 1 and r['changing'] == [] and 'cannot list' in r['out']
       and (entries(r) or {}).get('notes.txt') == 'file',
-      f"refuses the directory when its listing fails, instead of taking no entries as a match, got status {r['exit']}")
+      f"refuses the directory when its listing fails, instead of treating a failed listing as an empty matching directory, got status {r['exit']}")
 
 r = run('source-read-fails', {'cmp_fails': 'nvpcf_hook.c'}, mocks=('cmp',), unregistered={NEW: {}})
 check(r, r['exit'] == 1 and r['changing'] == [] and 'cannot read nvpcf_hook.c' in r['out'],
@@ -670,7 +673,7 @@ check(r, r['exit'] == 1 and 'before any module was built or installed' in r['out
 
 r = run('again', {}, runs=2)
 check(r, r['exit'] == 0 and r['changing'] == [],
-      f"changes nothing on a second run with the same source, got status {r['exit']} and {r['changing']}")
+      f"leaves the source and DKMS state unchanged on a second run with the same source, got status {r['exit']} and {r['changing']}")
 
 r = run('wrong-file-stays', {'wrong_file': [RUNNING]}, runs=2)
 check(r, r['exits'] == [1, 1] and f'{RUNNING}: installing nvpcf-hook/{NEW}, or checking that modprobe finds it' in r['out'],
@@ -695,7 +698,7 @@ r = run('kbuild-between-runs', {}, runs=2, between=build_in_hook)
 check(r, built['result'].returncode == 0 and built['generated'],
       f"builds hook/ with Kbuild between the runs, got status {built['result'].returncode}:\n{built['result'].stdout}")
 check(r, r['exit'] == 0 and r['changing'] == [],
-      f"changes nothing on the second run after the build, got status {r['exit']} and {r['changing']}")
+      f"leaves the source and DKMS state unchanged on the second run after the build, got status {r['exit']} and {r['changing']}")
 check(r, r['registered_new'] == sorted(SOURCES),
       f"keeps exactly the authored source files registered, got {r['registered_new']}")
 copy = BASE / 'registered-source-build'

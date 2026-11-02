@@ -2,74 +2,18 @@
 # Install nvpcf_hook, its loader and its boot unit. Run as root.
 #
 # usage: install-hook.sh [--no-enable]
+#   --no-enable  install nvpcf-hook.service without enabling it, and leave a
+#                unit that is enabled already as it is
 #
-# DKMS builds each version of a module from its own source directory,
-# /usr/src/<package>-<version>. For a new kernel, DKMS builds the greatest
-# registered version, as its VER function orders them. VER pads every number
-# to three digits and compares the results as strings. The version here is
-# PACKAGE_VERSION in hook/dkms.conf: dotted numbers from 0 to 999 without
-# leading zeros. VER keeps the numeric order of such versions, and gives two
-# of them the same rank only if they are the same version. A change to the
-# hook's source needs a greater PACKAGE_VERSION. The script refuses when its
-# version is registered with different source, and when another registered
-# version ranks equal to it or above it, because DKMS could then build that
-# version for the next kernel.
-#
-# The source is the files of hook/ that DKMS's build reads: Kbuild, Makefile,
-# dkms.conf, nvpcf_hook.c and its headers. Files that a build in hook/
-# generates, such as nvpcf_hook.mod.c, are not part of it. For a version that
-# DKMS does not have registered, the script creates
-# /usr/src/nvpcf-hook-<version> with mkdir, which fails if anything appeared
-# there in the meantime, copies the source into it, and registers it with dkms
-# add. An existing directory there, such as the copy from a run whose dkms add
-# failed, is reused only if its entries are exactly these files, each a
-# regular file with no other link and with hook/'s content. Otherwise, and
-# when the directory or a file in it cannot be read, the script refuses, names
-# the differences, and leaves the directory as it is. When it removes an older
-# version, it deletes only that version's source files and an empty
-# directory, and keeps anything else there.
-#
-# It builds and installs that version with DKMS for every kernel that DKMS
-# lists for the NVIDIA driver or for nvpcf-hook, plus the running kernel. The
-# kernels listed for nvpcf-hook include those whose NVIDIA build DKMS does not
-# list at the moment, for example between a driver update and the dkms install
-# for the other kernels. After each install, and for a kernel that DKMS lists
-# as having this version installed already, it checks that the module
-# modprobe finds for the kernel has the build ID of DKMS's build. That check
-# needs no headers, so a kernel that passes it counts as done even without
-# them. A kernel that fails it gets this version installed again.
-#
-# A failed build leaves the kernel's installed module in place, and so do
-# missing headers. A failed install can leave the kernel without a module,
-# because DKMS replaces the file before it runs depmod, and removes the new
-# file when depmod fails. After a failed install or check, the script installs
-# the kernel's previous version again from DKMS's build of it, checks it in the
-# same way, and reports whether that worked. Older versions that no kernel has
-# installed are removed only by a run in which each of these kernels,
-# including the ones whose headers are missing, ends with this version
-# installed and checked. After a failure or a skipped kernel they stay, also
-# through later runs that find a kernel without any installed version, so that
-# dkms install can still put one of their builds back.
-#
-# It installs the files that lib.sh lists in HOOK_TOOLS as root-owned copies
-# in /usr/local/lib/nvpcf-hook: load-hook.sh, nvpcf-hookctl, check_nvidia.py,
-# and two references that check_nvidia.py reads from its own directory.
-# check_nvidia.py compares the dispatcher function in NVIDIA's source archive
-# with expected_dispatcher.c, and NVIDIA's proc file wrappers in the
-# kernel-open source with expected_procfs_wrappers.h. The script installs
-# nvpcf-hook.service, which runs load-hook.sh at boot, and enables it. With
-# --no-enable, it does not enable the unit, and leaves a unit that is enabled
-# already as it is. It downloads NVIDIA's source archive for each NVIDIA
-# version that DKMS lists into /var/cache/nvpcf-hook, so that loading the hook
-# does not need the network. It does not load the hook now; running
-# /usr/local/lib/nvpcf-hook/load-hook.sh does.
-#
-# It reads the DKMS state and works out the kernels before it changes
-# anything. It stops there if a dkms status fails, or if the running kernel's
-# headers are missing and that kernel does not have this version installed
-# and passing the check. It exits with status 1 at the end if it skipped a
-# kernel, if a build, install or check failed, or if an archive could not be
-# downloaded.
+# The script registers the hook's source with DKMS as the version in
+# hook/dkms.conf, builds and installs it for every kernel that DKMS lists for
+# the NVIDIA driver or for nvpcf-hook and for the running kernel, and checks
+# the module that modprobe finds for each. It installs the files that lib.sh
+# lists in HOOK_TOOLS in /usr/local/lib/nvpcf-hook, enables
+# nvpcf-hook.service, which loads the hook at boot, and downloads NVIDIA's
+# source archive for each NVIDIA version that DKMS lists. It does not load the
+# hook. WRITEUP.md describes the rules for versions, source directories,
+# failed installs and old versions, and the exit statuses.
 set -u
 usage() { echo "usage: install-hook.sh [--no-enable]" >&2; exit 2; }
 enable=1
@@ -82,10 +26,14 @@ here=$(cd "$(dirname "$0")" && pwd)
 DIR=$here
 . "$here/lib.sh"
 UNIT=/etc/systemd/system/nvpcf-hook.service
+# The files of hook/ that DKMS's build reads. Files that a build in hook/
+# generates, such as nvpcf_hook.mod.c, are not part of the source.
 SOURCES=(Kbuild Makefile dkms.conf nvpcf_hook.c build_id.h lifecycle.h state.h text.h)
 fail() { echo "$*"; exit 1; }
 
-# DKMS's VER from /usr/sbin/dkms.
+# DKMS's VER from /usr/sbin/dkms. For a new kernel, DKMS builds the greatest
+# registered version in this order: every number padded to three digits, and
+# the results compared as strings.
 VER() {
     echo "$1" | sed -e 's:\([^0-9]\)\([0-9]\):\1 \2:g' \
         -e 's:\([0-9]\)\([^0-9]\):\1 \2:g' \
@@ -113,12 +61,13 @@ contains() {
     return 1
 }
 # Compare the directory $src with hook/'s source, print each difference on a
-# line, and exit with status 0 only if the comparison completed and found
-# none. Each file of SOURCES has to be a regular file, not a symbolic link,
-# with no other hard link, and with hook/'s content: DKMS copies a link as a
-# link, and another name of the file could change it later. Every other entry
-# counts as a difference. The entries are read with NUL separators, so that a
-# name with a space or a newline is one entry, and printed with printf %q.
+# line, and exit with status 0 only if the comparison completed and every
+# entry matched. Each file of SOURCES has to be a regular file, not a symbolic
+# link, with a link count of one, and with hook/'s content: DKMS copies a link
+# as a link, and another name of the file could change it later. Every other
+# entry counts as a difference. The entries are read with NUL separators, so
+# that a name with a space or a newline is one entry, and printed with printf
+# %q.
 # A file or a listing that cannot be read makes the comparison fail.
 compare_source() {
     local f n entries=() status=0
@@ -153,9 +102,9 @@ compare_source() {
     done
     return $status
 }
-# Remove the files of SOURCES from the source directory $1, and then the
-# directory if nothing else is in it. A file that is not part of the source,
-# or a link, stays, and so does the directory then.
+# Remove the files of SOURCES from the source directory $1, then remove the
+# directory if it is empty. Keep links and files outside SOURCES; their
+# presence also keeps the directory.
 remove_source() {
     local d=$1 f
     [ -d "$d" ] && [ ! -L "$d" ] || return 0
@@ -173,6 +122,9 @@ installed_anywhere() {
     return 1
 }
 
+# For dotted numbers from 0 to 999 without leading zeros, VER's order is the
+# numeric one, and two versions get the same rank only if they are the same.
+# With leading zeros, 0.1 and 0.001 would get the same rank.
 ver=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p' "$here/hook/dkms.conf")
 [[ $ver =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2}))*$ ]] ||
     fail "PACKAGE_VERSION in $here/hook/dkms.conf must be dotted numbers from 0 to 999 without leading zeros, got '$ver'"
@@ -202,6 +154,8 @@ if [ ! -d "/lib/modules/$running/build" ]; then
 fi
 echo "== nvpcf-hook/$ver for kernels: ${kernels[*]}"
 
+# Another registered version that ranks equal to $ver or above it could be the
+# one that DKMS builds for the next kernel.
 mapfile -t registered < <(sed -nE 's#^nvpcf-hook/([^,:]+)[,:].*#\1#p' <<<"$hook_status" | sort -u)
 for v in "${registered[@]}"; do
     [ "$v" = "$ver" ] && continue
@@ -223,7 +177,8 @@ else
         echo "== $src holds hook/'s source already, and the script registers it"
     else
         # mkdir without -p fails if anything appeared at $src since the check
-        # above, and then the script has created nothing to remove.
+        # above. If mkdir fails because an entry appeared, this run must not
+        # remove that entry.
         mkdir -p -- "${src%/*}" && mkdir -- "$src" ||
             fail "could not create $src. The script leaves anything there as it is"
         if ! (cd "$here/hook" && cp -- "${SOURCES[@]}" "$src/"); then
@@ -238,14 +193,15 @@ fi
 for k in "${kernels[@]}"; do
     prev=${before[$k]:-}
     # The check reads the installed file and DKMS's build, so a kernel that
-    # passes it needs no headers.
+    # passes it does not need headers.
     if [ "$prev" = "$ver" ]; then
         if installed_is "$ver" "$k"; then
             echo "== nvpcf-hook/$ver is installed for $k already"
             continue
         fi
-        # DKMS lists $ver as installed, but modprobe finds another file. The
-        # run installs $ver again, and has no other version to go back to.
+        # DKMS lists $ver as installed, but the file that modprobe finds does
+        # not match DKMS's build of it. The run installs $ver again, and has
+        # no earlier version to restore if that fails.
         prev=""
     fi
     if [ ! -d "/lib/modules/$k/build" ]; then
@@ -258,9 +214,13 @@ for k in "${kernels[@]}"; do
         continue
     fi
     dkms install -m nvpcf-hook -v "$ver" -k "$k" --force && installed_is "$ver" "$k" && continue
+    # dkms install copies the new file over the old one before it runs depmod,
+    # and removes the new file when depmod fails, so a failed install can
+    # leave the kernel without a module. The script then installs the previous
+    # version again from DKMS's build of it.
     failed+=("$k: installing nvpcf-hook/$ver, or checking that modprobe finds it")
     if [ -z "$prev" ]; then
-        failed+=("$k: had no installed nvpcf-hook version to go back to")
+        failed+=("$k: did not have an installed nvpcf-hook version to restore")
         continue
     fi
     if installed_is "$prev" "$k"; then
@@ -268,16 +228,15 @@ for k in "${kernels[@]}"; do
     elif dkms install -m nvpcf-hook -v "$prev" -k "$k" --force && installed_is "$prev" "$k"; then
         echo "== installed nvpcf-hook/$prev for $k again, from DKMS's build of it"
     else
-        failed+=("$k: installing nvpcf-hook/$prev again failed, so $k may have no working nvpcf_hook")
+        failed+=("$k: installing nvpcf-hook/$prev again failed, so nvpcf_hook may not be installed or working for $k")
     fi
 done
 
-# Remove the older versions that are not installed for any kernel, but only
-# when every kernel of the run has $ver installed and checked: no build,
-# install or check failed, and no kernel was skipped for missing headers. A
-# failed or skipped kernel can need one of their builds again, also after a
-# later run that finds it without any installed version. The check above made
-# every other registered version rank below $ver.
+# Remove older versions only after every kernel in this run has $ver installed
+# and checked. After a failed build, install or check, or a kernel skipped for
+# missing headers, keep them, so that dkms install can still put an older
+# build back on a kernel that a failed install left without a module. The
+# check above made every other registered version rank below $ver.
 hook_status=$(dkms status nvpcf-hook) || fail "dkms status nvpcf-hook failed after the install"
 mapfile -t old < <(sed -nE 's#^nvpcf-hook/([^,:]+)[,:].*#\1#p' <<<"$hook_status" | grep -vxF "$ver" | sort -u)
 if [ ${#failed[@]} -gt 0 ] || [ ${#skipped[@]} -gt 0 ]; then
@@ -292,6 +251,8 @@ else
     done
 fi
 
+# check_nvidia.py reads expected_dispatcher.c and expected_procfs_wrappers.h
+# from its own directory, so they go next to it.
 for f in "${HOOK_TOOLS[@]}"; do
     mode=0644
     [ -x "$here/$f" ] && mode=0755

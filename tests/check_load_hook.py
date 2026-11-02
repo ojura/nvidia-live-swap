@@ -16,9 +16,9 @@ which the script parses itself.
 
 Real GNU ld objects test --build-id with the real objcopy: ld -r
 --build-id=0x... builds one for every ID length from 1 to 65 bytes, and ld
-writes the note of each without padding after the ID. Further objects have no
-build ID section, two build ID notes in the section, or a truncated note at
-the end. The same note bytes, with and without final padding, test
+writes the note of each without padding after the ID. Further objects lack the
+build ID section, or have two build ID notes in the section, or a truncated
+note at the end. The same note bytes, with and without final padding, test
 --loaded-build-id. The objects stay unchanged.
 
 A differential test compiles nh_note_build_id from hook/build_id.h, the
@@ -104,7 +104,7 @@ elif cmd == 'modinfo':
 elif cmd == 'zstd':
     sys.stdout.write(Path(args[-1]).read_text())
 elif cmd == 'objcopy':
-    # The section's bytes, as GNU ld writes them: no padding after the ID. A
+    # The section's bytes, as GNU ld writes them: without padding after the ID. A
     # file without the section gives an empty output and status 0.
     text, out = Path(args[-2]).read_text(), Path(args[-1])
     if 'BUILDID=' not in text:
@@ -190,7 +190,8 @@ def run(name, cfg=None, args=(), nvidia_loaded=True, hook_loaded=False, disk_id=
         (scripts / name_).symlink_to(mock)
     if nvidia_loaded:
         env0 = dict(os.environ, MOCK_ROOT=str(root))
-        subprocess.run([str(mock)], env=env0, check=False)  # records nothing useful; set up below
+        # Its recorded call is cleared below before the fixture is initialized.
+        subprocess.run([str(mock)], env=env0, check=False)
         (root / 'calls.jsonl').write_text('')
         d = root / 'sys/module/nvidia'
         (d / 'notes').mkdir(parents=True)
@@ -245,12 +246,12 @@ check(r, r['cache'] == [f'open-gpu-kernel-modules-{VER}.tar.gz'],
 r = run('download-fails', {'curl_fails': True}, cached=False)
 check(r, r['exit'] == 1 and HOOK_LOAD not in r['modprobe'] and r['checker'] == [],
       f"exits with status 1 before checking or loading the hook, got status {r['exit']}")
-check(r, r['cache'] == [], f"leaves no partial download in the cache, got {r['cache']}")
+check(r, r['cache'] == [], f"removes the partial download from the cache, got {r['cache']}")
 
 r = run('no-matching-file', disk_id=OTHER)
 check(r, r['exit'] == 1 and 'cannot find an installed nvidia module file with the loaded build ID' in r['out'],
-      f"exits with status 1 when no file has the loaded build ID, got status {r['exit']}")
-check(r, r['checker'] == [] and HOOK_LOAD not in r['modprobe'], 'checks nothing in its place and does not load the hook')
+      f"exits with status 1 when neither candidate file matches the loaded build ID, got status {r['exit']}")
+check(r, r['checker'] == [] and HOOK_LOAD not in r['modprobe'], 'does not check a different build or load the hook')
 
 r = run('dkms-copy-matches', disk_id=OTHER, dkms_id=LOADED)
 check(r, r['exit'] == 0 and r['checked'] == module_text(LOADED, VER, 'dkms').strip(),
@@ -473,15 +474,15 @@ for size in (16, 20, 32, 64):
     hexid = bytes(range(size)).hex()
     r = run(f'build-id-{size}-bytes', args=('--build-id', DISK), disk_id=hexid.upper())
     check(r, r['exit'] == 0 and r['stdout'] == hexid + '\n',
-          f"prints the {size}-byte build ID in lowercase and nothing else, got status {r['exit']} and {r['stdout']!r}")
+          f"prints the {size}-byte build ID as the only stdout line, in lowercase, got status {r['exit']} and {r['stdout']!r}")
     r = run(f'loaded-build-id-{size}-bytes', {'loaded_id': hexid}, args=('--loaded-build-id', 'nvidia'))
     check(r, r['exit'] == 0 and r['stdout'] == hexid + '\n',
-          f"prints the loaded {size}-byte build ID and nothing else, got status {r['exit']} and {r['stdout']!r}")
+          f"prints the loaded {size}-byte build ID as the only stdout line, got status {r['exit']} and {r['stdout']!r}")
 
 for name, disk_id in (('build-id-65-bytes', 'ab' * 65), ('build-id-missing', None)):
     r = run(name, args=('--build-id', DISK), disk_id=disk_id)
     check(r, r['exit'] == 1 and r['stdout'] == '',
-          f"exits with status 1 and prints no build ID, got status {r['exit']} and {r['stdout']!r}")
+          f"exits with status 1 and leaves stdout empty, got status {r['exit']} and {r['stdout']!r}")
 
 r = run('build-id-no-file', args=('--build-id', '{root}/no-such-module.ko'))
 check(r, r['exit'] == 1 and r['stdout'] == '', f"exits with status 1 for a missing file, got status {r['exit']}")
@@ -489,7 +490,7 @@ check(r, r['exit'] == 1 and r['stdout'] == '', f"exits with status 1 for a missi
 for name, loaded_id in (('loaded-build-id-0-bytes', ''), ('loaded-build-id-65-bytes', 'ab' * 65)):
     r = run(name, {'loaded_id': loaded_id}, args=('--loaded-build-id', 'nvidia'))
     check(r, r['exit'] == 1 and r['stdout'] == '',
-          f"exits with status 1 and prints no build ID, got status {r['exit']} and {r['stdout']!r}")
+          f"exits with status 1 and leaves stdout empty, got status {r['exit']} and {r['stdout']!r}")
 
 r = run('loaded-build-id-no-note', args=('--loaded-build-id', 'nvidia'), nvidia_loaded=False)
 check(r, r['exit'] == 1 and r['stdout'] == '' and r['modprobe'] == [],
@@ -508,7 +509,7 @@ check(r, r['exit'] == 0 and r['modprobe'] == [] and r['checked'] == module_text(
 
 for case, build_id in (('no-build-id', None), ('malformed-build-id', 'zz' * 20), ('long-build-id', 'ab' * 65)):
     r = run(f'check-disk-{case}', args=('--check-disk',), nvidia_loaded=False, disk_id=build_id)
-    check(r, r['exit'] == 1 and 'no GNU build ID of 1 to 64 bytes' in r['out'] and r['checker'] == [],
+    check(r, r['exit'] == 1 and 'cannot read the GNU build ID of 1 to 64 bytes' in r['out'] and r['checker'] == [],
           f"refuses a candidate without a usable build ID before checking it, got status {r['exit']}")
 
 r = run('check-disk-version-from-file', args=('--check-disk',), nvidia_loaded=False, disk_version='615.78.08',
@@ -530,7 +531,7 @@ check(r, r['exit'] == 3 and r['curl'] == [] and 'cannot be checked without a dow
 
 r = run('fetch', args=('--fetch', VER), cached=False)
 check(r, r['exit'] == 0 and len(r['curl']) == 1 and r['modprobe'] == [],
-      f"downloads the archive and loads nothing, got status {r['exit']}")
+      f"downloads the archive without loading a module, got status {r['exit']}")
 
 r = run('fetch-bad-version', args=('--fetch', '../../etc'), cached=False)
 check(r, r['exit'] == 1 and r['curl'] == [], f"refuses a version that is not a version, got status {r['exit']}")

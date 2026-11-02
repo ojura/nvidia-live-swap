@@ -8,7 +8,9 @@
 #        load-hook.sh --check-disk [--no-download]
 #                                     check the nvidia module that modprobe
 #                                     would load, without loading anything,
-#                                     waking the GPU or changing a setting
+#                                     waking the GPU or changing a setting;
+#                                     with --no-download, exit with status 3
+#                                     instead of downloading a missing archive
 #        load-hook.sh --fetch VERSION download NVIDIA's source archive for
 #                                     VERSION into the cache
 #        load-hook.sh --build-id FILE print the GNU build ID of a module file
@@ -16,43 +18,12 @@
 #                                     print the GNU build ID of a loaded module
 #
 # nvpcf_hook calls functions inside NVIDIA's driver, so it may attach only to
-# a driver build that check_nvidia.py has checked. The checks read three
-# inputs, and do not run or extract any code from them:
-# - the nvidia module file with the build's GNU build ID: its symbols, its
-#   ftrace instrumentation and its calls;
-# - the kernel-open source of the build's version, in
-#   /usr/src/nvidia-<version>: the C declarations and roles of the functions
-#   that the hook uses;
-# - NVIDIA's source archive for the version's tag on GitHub, for the source
-#   of the precompiled driver core. It holds the dispatcher whose return the
-#   hook observes.
-# The script keeps the archives in /var/cache/nvpcf-hook. When an archive is
-# missing, it downloads it into the cache. With --no-download it exits with
-# status 3 instead. The check then could not run, and the status does not
-# tell whether the driver would pass it.
-#
-# The default mode loads nvidia if it is not loaded, reads the loaded build
-# ID from /sys/module/nvidia/notes, and checks the file with that build ID:
-# the file modprobe would load, or DKMS's copy for the loaded version and
-# the running kernel. It stops when it cannot find a file with that build
-# ID, because a check of a different file does not cover the loaded driver.
-# After the checks pass, it loads nvpcf_hook with expected_nvidia_build_id
-# set to the checked build ID, and the hook refuses to attach to any other
-# build. The script exits with status 0 only if the hook then reports the
-# state active or waiting, with its guards installed, GPU initialization
-# allowed and retirement_failed 0. If the hook is loaded already, the script
-# only checks that, as --check-loaded does.
-#
-# --build-id copies a module file's .note.gnu.build-id section with objcopy,
-# and --loaded-build-id reads the loaded module's note from /sys/module. Both
-# parse the notes with the same rules, and print a build ID only if there is
-# exactly one, of 1 to 64 bytes, the range that nvpcf_hook accepts. They exit
-# with status 1 otherwise. install-hook.sh and swap.sh read build IDs through
-# them.
-#
-# The boot unit nvpcf-hook.service and swap.sh run the copy that
-# install-hook.sh puts in /usr/local/lib/nvpcf-hook, next to copies of
-# check_nvidia.py and nvpcf-hookctl.
+# a driver build that check_nvidia.py has checked: the module file with the
+# build's GNU build ID, the version's source in /usr/src/nvidia-<version>, and
+# NVIDIA's source archive for the version, which the script keeps in
+# /var/cache/nvpcf-hook. The hook then refuses to attach to any other build.
+# WRITEUP.md describes the modes. nvpcf-hook.service and swap.sh run the copy
+# that install-hook.sh puts in /usr/local/lib/nvpcf-hook.
 set -u
 usage() {
     echo "usage: load-hook.sh [--check-loaded | --check-disk [--no-download] | --fetch VERSION |" >&2
@@ -127,7 +98,7 @@ module_copy() {
 # parses a loaded module's note. readelf cannot be used: GNU ld writes an ID
 # whose length is not a multiple of four without padding after it, and readelf
 # 2.42 then leaves the ID out. For a file without the section, objcopy exits
-# with status 0 and writes nothing, which note_build_id refuses.
+# with status 0 and writes an empty file, which note_build_id refuses.
 copy_build_id() {
     : > "$notes" && objcopy -O binary -j .note.gnu.build-id "$1" "$notes" 2>/dev/null && note_build_id "$notes"
 }
@@ -137,7 +108,7 @@ copy_version() { modinfo -F version "$1" 2>/dev/null; }
 # 64 bytes, the range that nvpcf_hook accepts. The rules are those of
 # nh_note_build_id in hook/build_id.h, the hook's own parser. Every note's
 # header, name with its padding, and descriptor have to be complete. A note
-# that another one follows is padded to four bytes, as the ELF format
+# followed by another note is padded to four bytes, as the ELF format
 # requires. The last note may lack some or all of the padding after its
 # descriptor: GNU ld writes it without that padding, and Linux exports such a
 # section with the same size.
@@ -207,7 +178,7 @@ case $mode in
         exit 0 ;;
     build-id)
         module_copy "$arg" || fail "cannot read $arg"
-        copy_build_id "$copy" || fail "$arg has no GNU build ID of 1 to 64 bytes"
+        copy_build_id "$copy" || fail "cannot read a GNU build ID of 1 to 64 bytes from $arg"
         exit 0 ;;
     loaded-build-id)
         note_build_id "/sys/module/$arg/notes/.note.gnu.build-id" ||
@@ -223,7 +194,7 @@ case $mode in
         # version's source.
         f=$(modinfo -n nvidia 2>/dev/null) || fail "modprobe cannot find nvidia for kernel $(uname -r)"
         module_copy "$f" || fail "cannot read $f"
-        id=$(copy_build_id "$copy") || fail "$f has no GNU build ID of 1 to 64 bytes, which nvpcf_hook needs"
+        id=$(copy_build_id "$copy") || fail "cannot read the GNU build ID of 1 to 64 bytes that nvpcf_hook requires from $f"
         ver=$(copy_version "$copy")
         check_build "$copy" "$ver"
         log "NVIDIA $ver in $f, build ID $id, passes the checks"

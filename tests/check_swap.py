@@ -5,21 +5,20 @@ registration files.
 
 Every command that changes the system (mv, systemctl, runuser for
 reapply-layout.py, setsid and python3 for revoke.py, rmmod, modprobe,
-nvpcf-hookctl for anything but status, and load-hook.sh without arguments) is
-a mock. Most are placed first on PATH. nvpcf-hookctl is in the copied
-scripts' hook directory, and load-hook.sh where swap.sh looks for the
-installed copy, next to the other installed tools. The repository's and the
-installed copies of the four tools are the same files, unless a case makes
-one differ. The mock load-hook.sh loads nvpcf_hook; r['modprobe'] lists those
-loads as nvpcf_hook among the modprobe calls, and swap.sh must never run
-modprobe nvpcf_hook itself. For --build-id and --loaded-build-id, the mock
-runs a copy of the real load-hook.sh, which parses the GNU notes that the mock
-writes for the loaded modules and the notes that the mock objcopy writes. A case
-can choose the length of these build IDs. The test runs copies of
-swap.sh and lib.sh, edited so that the files they read, write or rename under
-/sys, /proc, /run and /usr/share are the ones in the throwaway directory.
-swap.sh still looks in the real /dev, but only to test with [ -c ] which
-NVIDIA device nodes exist.
+nvpcf-hookctl for anything but status, and load-hook.sh without arguments) is a
+mock. Most are placed first on PATH. nvpcf-hookctl is in the copied scripts'
+hook directory, and load-hook.sh where swap.sh looks for the installed copy,
+next to the other installed tools. The copies of the files listed in HOOK_TOOLS
+match the repository unless a case changes one. The mock load-hook.sh loads
+nvpcf_hook; r['modprobe'] lists those loads as nvpcf_hook among the modprobe
+calls, and swap.sh must never run modprobe nvpcf_hook itself. For --build-id
+and --loaded-build-id, the mock runs a copy of the real load-hook.sh, which
+parses the GNU notes that the mock writes for the loaded modules and the notes
+that the mock objcopy writes. A case can choose the length of these build IDs.
+The test runs copies of swap.sh and lib.sh, edited so that the files they read,
+write or rename under /sys, /proc, /run and /usr/share are the ones in the
+throwaway directory. swap.sh still looks in the real /dev, but only to test
+with [ -c ] which NVIDIA device nodes exist.
 
 The mock nvpcf-hookctl keeps the hook's state in the throwaway directory. Its
 detach moves the state to guard-only. The mock rmmod of nvidia then plays
@@ -621,8 +620,8 @@ r = run('stamp-after-failure', {'fail_hide': True})
 check(r, r['exit'] == 1 and r['stamp'] is not None,
       f"exits with status 1 and still records when the run ended, got status {r['exit']} and end time {r['stamp']}")
 
-# nvpcf_hook. UNPATCHED is a driver on disk without patch 0001, so the swap
-# needs the hook.
+# nvpcf_hook. UNPATCHED selects a driver on disk without patch 0001. Every swap
+# still requires the hook's shutdown guard.
 UNPATCHED = dict(SVC, disk_patched=False)
 
 r = run('hook-success', dict(UNPATCHED, hook_waits_for_init=True), holders=[777, 4525], patched=False)
@@ -666,8 +665,8 @@ check(r, r['exit'] == 1 and 'cannot read the status of nvpcf_hook: nvpcf-hookctl
       f"exits with status 1 and reports why the status cannot be read, got status {r['exit']}"); expect_untouched(r)
 
 r = run('hook-unavailable', UNPATCHED, holders=[777], patched=False, hook='unavailable')
-check(r, r['exit'] == 1 and 'swap.sh does not acknowledge a loss' in r['out'],
-      f"exits with status 1 and says it does not acknowledge a loss, got status {r['exit']}"); expect_untouched(r)
+check(r, r['exit'] == 1 and '/hook/nvpcf-hookctl acknowledge-loss' in r['out'] and 'swap.sh does not run ' in r['out'],
+      f"exits with status 1 and says it does not run acknowledge-loss, got status {r['exit']}"); expect_untouched(r)
 
 r = run('hook-retirement-failed', dict(UNPATCHED, hook_retirement_failed=True), holders=[777], patched=False,
         hook='unavailable')
@@ -715,7 +714,7 @@ r = run('hook-prepare-fails', dict(UNPATCHED, hook_prepare_fails=True), kms_hold
 check(r, r['exit'] == 1 and 'stops before it changes anything' in r['out'] and 'END (failed)' in r['out'],
       f"exits with status 1 and ends with END (failed), got status {r['exit']}")
 check(r, r['modifying'] == ['hookctl prepare'],
-      f"changes nothing after the failed prepare, not even the display layout, got the commands {r['modifying']}")
+      f"leaves the display layout, registration files, services, handles and loaded modules unchanged after prepare fails, got the commands {r['modifying']}")
 
 r = run('hook-detach-fails', dict(UNPATCHED, hook_detach_fails=True), holders=[777, 4525], patched=False)
 check(r, r['exit'] == 1 and r['rmmod'] == [], f"exits with status 1 without unloading anything, got {r['rmmod']}")
@@ -764,7 +763,7 @@ r = run('hook-no-guard-after-load', dict(UNPATCHED, hook_no_guard_after_load=Tru
 check(r, r['exit'] == 1 and 'stops before the modules that initialize the GPU' in r['out'],
       f"exits with status 1 before the modules that initialize the GPU, got status {r['exit']}")
 check(r, r['modprobe'] == ['nvidia', 'nvpcf_hook'] and r['lactd_active'] is False and r['hidden'] == [],
-      f"moves the files back, but loads no other module and leaves lactd.service stopped, got {r['modprobe']}")
+      f"moves the files back, but does not load another module and leaves lactd.service stopped, got {r['modprobe']}")
 
 r = run('interrupted-after-nvidia-unload', dict(UNPATCHED, pause_after_rmmod='nvidia'), holders=[777],
         patched=False, interrupt=True)

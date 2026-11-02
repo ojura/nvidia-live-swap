@@ -9,8 +9,8 @@ HOOK_LIB=/usr/local/lib/nvpcf-hook
 HOOK_TOOLS=(load-hook.sh hook/nvpcf-hookctl hook/tests/check_nvidia.py hook/tests/expected_dispatcher.c
             hook/tests/expected_procfs_wrappers.h)
 
-# Print the PCI address of the NVIDIA GPU, the first display controller with
-# NVIDIA's vendor ID. This machine has only one.
+# Print the PCI address of the first display controller with NVIDIA's vendor
+# ID.
 nvidia_gpu() {
     local d
     for d in /sys/bus/pci/devices/*; do

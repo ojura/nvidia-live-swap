@@ -6,78 +6,11 @@
 #   --check  only report what holds the NVIDIA GPU and whether a swap can go
 #            ahead now
 #
-# The modules can be unloaded only after every process has closed its
-# NVIDIA devices and removed its memory mappings of them. swap.sh deals
-# with the processes that hold one in three ways:
-# - swap.sh never revokes handles on the GPU's display device,
-#   /dev/dri/cardN (its KMS node). mutter, which runs inside gnome-shell,
-#   drives the monitors on the NVIDIA GPU's ports through it, and
-#   systemd-logind and systemd hold copies of mutter's descriptor. mutter
-#   releases the device the next time it sets the display modes. When
-#   gnome-shell, systemd-logind and systemd are the only holders, swap.sh
-#   first runs reapply-layout.py as gnome-shell's user. That script applies
-#   the current display layout again, which makes mutter set the modes, and
-#   swap.sh waits up to 10 seconds for the release. If the device has
-#   another holder, if a monitor is connected to the NVIDIA GPU, or if
-#   mutter does not release the device, swap.sh exits before it hides
-#   files, stops services or revokes handles.
-# - The other NVIDIA devices are /dev/nvidia*, /dev/nvidia-caps/* and the
-#   GPU's render node. swap.sh accepts a root process as a holder of these
-#   only if the process belongs to one of the services in STOPPABLE. Those
-#   services only watch or tune the GPU and start again cleanly, so swap.sh
-#   stops them for the swap and starts them again afterwards. swap.sh
-#   refuses to swap when any other root process holds one of these devices,
-#   including a process in another service, because stopping that process
-#   could end someone's work.
-# - For processes not owned by root, revoke.py revokes their handles on
-#   these devices. A revoked process keeps running, but cannot use the
-#   NVIDIA GPU until it restarts.
-#
-# Each swap makes mutter ask rtkit-daemon several times to take its KMS
-# thread (the thread that sends display updates to the kernel) out of
-# real-time scheduling and to make it real-time again. mutter takes the
-# thread out while it reads a display device's state, sets its modes or
-# disables it. rtkit-daemon by default allows 25 such requests per user in
-# 20 seconds and refuses the rest. After a refusal the thread stays
-# real-time during those calls. mutter sets RLIMIT_RTTIME to rtkit-daemon's
-# RTTimeUSecMax, 200 ms by default, so the kernel kills gnome-shell if the
-# real-time thread uses the CPU for 200 ms without blocking. swap.sh
-# therefore records when each swap ends, and starts the next swap only
-# after GAP seconds have passed since then.
-#
-# Every swap needs nvpcf_hook (hook/README.md), whichever fix for the
-# wake-ups the driver on disk has. The hook guards NVIDIA's adapter
-# shutdown. Without that guard, a firmware notification that arrives while
-# NVIDIA shuts the adapter down after the last close can make the shutdown
-# and the notification's handler wait for each other. Patch 0001 does not
-# prevent that, because the patched driver takes the same lock before it
-# defers a notification. swap.sh therefore refuses unless nvpcf_hook is
-# loaded, installed for the running kernel, and in a state that allows a
-# swap. It also refuses when the driver it would load fails the checks of
-# the hook's loader, load-hook.sh, which it runs before any change. A swap
-# runs the hook's prepare before any change, and its detach once the other
-# holders are gone. It unloads NVIDIA while the hook's guard remains, then
-# unloads the hook. It loads nvidia, then the hook through load-hook.sh, and
-# the other NVIDIA modules only once the hook's guard is in place.
-#
-# Once the display device is free, a swap hides the files that register
-# NVIDIA's EGL and Vulkan libraries with their loaders (HIDE), so that these
-# loaders do not find the libraries during the swap. GLX, a program's own
-# dlopen and direct opens of /dev/nvidia*, as by nvidia-smi, do not use
-# these files. A process that holds /dev/nvidia* open when the modules are
-# unloaded makes rmmod fail, and the swap stops. After hiding the files, a
-# swap stops the services, revokes the handles, unloads nvidia_drm,
-# nvidia_modeset, nvidia_uvm and nvidia, loads them from disk, and restores
-# the files and the services. On a failure or a signal, it tries to restore
-# the modules, the files and the services, and exits with a non-zero status.
-# It loads from disk every NVIDIA module that was loaded at the start and is
-# now missing, so a module it loads again can be a different build from the
-# one it unloaded. Revoked handles stay revoked. It logs END only when every
-# module it loaded, nvpcf_hook included, has the same build ID as its file
-# on disk, and nvpcf_hook reports the state active. If the nvidia module on
-# disk has patch 0001, the loaded driver must also contain
-# RmDeferNvpcfNotifyIfIdle and RmReplayNvpcfNotify, two of the functions
-# that the patch adds.
+# A swap needs nvpcf_hook, whose guard keeps NVIDIA's shutdown of the GPU from
+# deadlocking with the handler of a firmware notification. WRITEUP.md
+# describes how swap.sh deals with the processes that hold the GPU, the order
+# of a swap, the wait between swaps, what it restores after a failure, and
+# when it logs END.
 set -u
 usage() { echo "usage: swap.sh [--check]" >&2; exit 2; }
 check_only=0
@@ -276,7 +209,7 @@ else
         case "$hook_state" in
             active|waiting|guard-only|quiesced) ;;
             starting|suspended) hook_problems+=("nvpcf_hook is $hook_state; check again in a few seconds") ;;
-            unavailable) hook_problems+=("nvpcf_hook is unavailable with last_error $hook_error; its status and the kernel log say why, and swap.sh does not acknowledge a loss") ;;
+            unavailable) hook_problems+=("nvpcf_hook is unavailable with last_error $hook_error; its status and the kernel log say why, and swap.sh does not run $DIR/hook/nvpcf-hookctl acknowledge-loss") ;;
             *) hook_problems+=("nvpcf_hook is ${hook_state:-in an unknown state}, so it does not guard a swap; run $DIR/hook/nvpcf-hookctl resume, or unload it and load it again with $LOADER") ;;
         esac
     fi
@@ -310,13 +243,12 @@ fi
 # Loading nvidia_drm initializes the GPU: it sets up an NVKMS device, and
 # frees it again if its setup fails. A started service such as lactd does
 # too. So the swap and the trap load nvidia first, then load or resume the
-# hook, and check from its status that its guard is installed and
-# initialization is allowed. Only then do they load the other modules and
-# start the services. If the hook does not reach that state, the trap leaves
-# those modules unloaded and the services stopped, and reports them. After
-# its detach, the hook refuses initialization until it resumes.
-# hook_detached records the detach before it runs, so that the trap resumes
-# the hook.
+# hook, and check from its status that its guards are registered and
+# initialization is allowed. They load the other modules and start the
+# services only after that check passes. If it fails, the trap leaves those
+# modules unloaded and the services stopped, and reports them. After its
+# detach, the hook refuses initialization until it resumes. hook_detached
+# records the detach before it runs, so that the trap resumes the hook.
 MODULES=(nvidia nvidia_modeset nvidia_drm nvidia_uvm)  # load order
 hidden=() stopped=() initial=()
 hook_detached=0
