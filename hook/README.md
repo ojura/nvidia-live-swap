@@ -268,8 +268,9 @@ also checks the loss marker. Capture can continue counting notifications while
 replay is disabled.
 
 Incomplete cleanup sets `retirement_failed` and blocks `resume` and new
-attachment. This includes failed unregistration of interception functions and
-initialization rollback that cannot safely release resources. Failed old-hook
+attachment. This includes cases where interception functions cannot be
+unregistered, a failed setup cannot be undone, or PCI removal cannot release the
+NVIDIA FINE reference or kernel-client device reference. Failed old-hook
 unregistration also blocks automatic attachment after system PM and a replacement
 NVIDIA module that uses the old module's address. Before clearing old NVIDIA
 function pointers, the hook disables redirection and waits for redirected calls

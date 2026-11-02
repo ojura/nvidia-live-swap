@@ -2270,7 +2270,7 @@ static int __init hook_init(void)
 			if (published)
 				pr_crit("nvpcf_hook: could not create the diagnostic control device: %d\n", published);
 		}
-		pr_crit("nvpcf_hook: initial cleanup failed (%d after %d); keeping the hook loaded and retaining resources\n",
+		pr_crit("nvpcf_hook: could not undo failed setup: cleanup error=%d, setup error=%d; keeping the hook loaded and retaining resources\n",
 			publication.rollback_error, ret);
 		ret = 0;
 	} else if (ret) {
