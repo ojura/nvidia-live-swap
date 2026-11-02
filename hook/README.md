@@ -144,6 +144,14 @@ stale requests retain the helper's diagnostic state until explicit
 unsupported cached legacy-method state instead retains ownership and reports
 that removal may wait.
 
+Failed hook retirement blocks `resume` and every new attachment, including a
+replacement NVIDIA module that reuses the old module address. The helper
+disables and drains redirects before clearing every old NVIDIA function pointer.
+`retirement_failed` remains set until `detach` completes a cleanup-only retry
+that actually unregisters the old hooks. That retry does not clear a separate
+delivery/teardown fault or acknowledge lost requests. Retaining helper code does
+not retain the retired NVIDIA module's text.
+
 The same procedure runs when another NVIDIA GPU appears. These notifications do
 not make arbitrary hardware loss recoverable.
 
@@ -254,6 +262,7 @@ pointer for `:mod:`. The 6.8 entry-address adjustment matches its ENDBR helper;
 - `device_reference`, `stack_ready`, `nvidia_reference`, `power_reference`:
   separate ownership records. A successfully allocated NVIDIA stack can be NULL.
 - `guards_registered`, `initialization_blocked`, `replay_paused`: lifecycle state.
+- `retirement_failed`: incomplete cleanup that blocks reuse of NVIDIA addresses.
 - `received_requests`: captured CHANGE calls. Ordinary calls after interception
   stops are not counted.
 - `pending_requests`: captured requests not covered by observed dispatch or an
@@ -354,6 +363,11 @@ revalidation recovery and loss acknowledgement. Duplicate states and
 inapplicable choices are included; these are operation sequences, not counts of
 distinct states. A separate matrix checks 64 readiness/error combinations. The
 portable suite also passes AddressSanitizer and UndefinedBehaviorSanitizer.
+
+The suite also compiles the production activation, restoration, module-GOING,
+pinning, guard admission, symbol invalidation and retirement-retry bodies with
+mocked kernel operations. It checks failed unregistration followed by replacement
+and manual recovery, including address reuse and preserved independent faults.
 
 These tests execute shared logic and model kernel ordering. They do not execute
 kernel attachment, ACPI, runtime PM or NVIDIA. The source checker reads archives

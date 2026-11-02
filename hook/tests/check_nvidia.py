@@ -29,7 +29,7 @@ def c_text(text):
                   text, flags=re.S)
 
 
-def function(text, name):
+def function(text, name, *, raw=False):
     clean = c_text(text)
     match = re.search(
         r'(?m)^(?:static\s+)?(?:void|int|NV_STATUS|NvLength)\s+(?:NV_API_CALL\s+)?'
@@ -41,7 +41,7 @@ def function(text, name):
         depth += (clean[end] == '{') - (clean[end] == '}')
         end += 1
     signature = re.sub(r'\s+', '', clean[match.start():opening])
-    return signature, clean[opening:end], text.count('\n', 0, match.start()) + 1
+    return signature, (text if raw else clean)[opening:end], text.count('\n', 0, match.start()) + 1
 
 
 def check_kernel_sources(texts):

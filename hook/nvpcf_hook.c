@@ -83,6 +83,7 @@ static struct {
 	u64 prelock_cleanup_calls;
 	u64 guard_failures;
 	bool guard_poisoned;
+	bool retirement_failed;
 	struct ftrace_ops guard_ops;
 	struct notifier_block module_nb;
 	bool event_registered;
@@ -121,6 +122,7 @@ static void notrace capture_event(acpi_handle handle, u32 event, void *data);
 static int hold_active(void);
 static void release_active(bool driver_gone);
 static void unpin_nvidia(void);
+static int initial_rollback(void *unused);
 
 static void unlock_action(void)
 {
@@ -383,6 +385,9 @@ static int start_guards(void)
 	unsigned long cleanup_ip, get_ip, put_ip, alloc_ip, free_ip;
 	int ret;
 
+	if (!nh_instance_attach_allowed(h.retirement_failed, h.guards_registered,
+		h.nvidia_module != NULL))
+		return -EUCLEAN;
 	if (h.guards_registered)
 		return 0;
 	ret = check_legacy_methods();
@@ -446,7 +451,7 @@ static int stop_guards(void)
 	if (h.guards_registered) {
 		ret = unregister_ftrace_function(&h.guard_ops);
 		if (ret) {
-			WRITE_ONCE(h.guard_accepting, true);
+			WRITE_ONCE(h.guard_accepting, !h.retirement_failed);
 			return ret;
 		}
 		h.guards_registered = false;
@@ -467,6 +472,8 @@ static void notrace event_hook(unsigned long ip, unsigned long parent_ip,
 	unsigned long flags;
 
 	/* Calls from deliver_one retain an ordinary return into this module. */
+	if (!READ_ONCE(h.accepting) || !READ_ONCE(h.nvidia_module))
+		return;
 	if (!within_module(ip, h.nvidia_module) || within_module(parent_ip, THIS_MODULE) ||
 	    (u32)ftrace_regs_get_argument(regs, 1) != NVPCF_CHANGE)
 		return;
@@ -1002,6 +1009,10 @@ static int pin_nvidia_locked(void)
 {
 	struct module *owner;
 
+	if (!nh_instance_attach_allowed(h.retirement_failed, h.guards_registered,
+		h.nvidia_module != NULL))
+		return -EUCLEAN;
+
 	if (!h.pci->dev.driver || strcmp(h.pci->dev.driver->name, "nvidia"))
 		return -ENODEV;
 	owner = h.pci->dev.driver->owner;
@@ -1157,10 +1168,49 @@ static void resume_work(struct work_struct *work)
 	unlock_system_sleep(sleep_flags);
 }
 
+/* The loader still owns NVIDIA text until this GOING callback returns. */
+static void invalidate_nvidia_symbols(void)
+{
+	h.nvidia_module = NULL;
+	h.original = NULL;
+	h.original_open = NULL;
+	h.original_start = NULL;
+	h.original_shutdown = NULL;
+	h.acpi_cleanup = NULL;
+	h.owner_ops = (struct nh_owner_ops){ 0 };
+	h.open_ip = 0;
+	h.start_ip = 0;
+	h.shutdown_ip = 0;
+	h.data = NULL;
+	h.handle = NULL;
+}
+
+/* After failed unregistration, the ops can remain registered. Disable their
+ * redirects, wait entries that saw the old flags, then join reservations and
+ * epilogues before forgetting NVIDIA addresses. Helper code stays pinned.
+ */
+static void drain_disabled_redirects(void)
+{
+	unsigned long flags;
+
+	WRITE_ONCE(h.guard_accepting, false);
+	spin_lock_irqsave(&h.lock, flags);
+	h.accepting = false;
+	h.replay.enabled = false;
+	spin_unlock_irqrestore(&h.lock, flags);
+	synchronize_rcu_tasks();
+	wait_event(h.guard_wait, !atomic_read(&h.starting_calls) &&
+		!atomic_read(&h.opening_calls) && !atomic_read(&h.shutdown_calls));
+	wait_event(h.redirect_wait, !atomic_read(&h.redirected));
+	cancel_work_sync(&h.replay_work);
+	synchronize_rcu_tasks();
+}
+
 static int module_notify(struct notifier_block *nb, unsigned long action, void *data)
 {
 	bool put_self = false;
-	int ret;
+	int ret, guards_ret;
+	unsigned long flags;
 
 	if (action != MODULE_STATE_GOING || data != READ_ONCE(h.nvidia_module))
 		return NOTIFY_DONE;
@@ -1170,19 +1220,26 @@ static int module_notify(struct notifier_block *nb, unsigned long action, void *
 	mutex_lock(&h.action);
 	WRITE_ONCE(h.auto_resume, false);
 	WRITE_ONCE(h.block_initialization, true);
+	h.retirement_failed = true;
+	WRITE_ONCE(h.guard_accepting, false);
+	spin_lock_irqsave(&h.lock, flags);
+	h.accepting = false;
+	h.replay.enabled = false;
+	spin_unlock_irqrestore(&h.lock, flags);
 	ret = stop_capture();
+	guards_ret = stop_guards();
 	if (!ret)
-		ret = stop_guards();
+		ret = guards_ret;
+	if (ret)
+		drain_disabled_redirects();
 	stop_observer();
 	release_active(true);
 	WARN_ON(h.owner.held || h.nvidia_ref);
-	h.nvidia_module = NULL;
-	h.original = NULL;
-	h.data = NULL;
-	h.handle = NULL;
+	invalidate_nvidia_symbols();
+	h.retirement_failed = ret != 0;
 	if (!nh_may_unpin_helper(!ret && !h.guards_registered && !h.event_registered,
 				!h.owner.held && !h.owner.stack_ready && !h.nvidia_ref && !h.power_hold,
-				pending(), h.guard_poisoned)) {
+				pending(), h.guard_poisoned || h.retirement_failed)) {
 		h.phase = UNAVAILABLE;
 		if (ret)
 			set_error(ret);
@@ -1323,6 +1380,7 @@ static int status_show(struct seq_file *seq, void *unused)
 		seq_printf(seq, "gpu_uuid: GPU-%pUb\n", &h.gpu_uuid);
 	seq_printf(seq, "stack_ready: %u\nreplay_paused: %u\n", h.owner.stack_ready,
 		READ_ONCE(h.replay.paused));
+	seq_printf(seq, "retirement_failed: %u\n", h.retirement_failed);
 	seq_printf(seq, "guards_registered: %u\ninitialization_blocked: %u\nnvidia_reference: %u\npower_reference: %u\n",
 		h.guards_registered, READ_ONCE(h.block_initialization), h.nvidia_ref,
 		READ_ONCE(h.power_hold));
@@ -1361,7 +1419,7 @@ static int preflight(void)
 	bool had_hold;
 	int ret;
 
-	if (h.legacy_blocked || h.guard_poisoned || h.state.stale)
+	if (h.legacy_blocked || h.guard_poisoned || h.state.stale || h.retirement_failed)
 		return -EUCLEAN;
 	if (h.phase == GUARD_ONLY || h.phase == WAITING)
 		return 0;
@@ -1378,6 +1436,50 @@ static int preflight(void)
 	WRITE_ONCE(h.dispatch_task, NULL);
 	mutex_unlock(&h.delivery);
 	return ret;
+}
+
+/* action/system sleep held. This path retires old registrations, never
+ * attaches or calls NVIDIA addresses after its instance has exited.
+ */
+static int retry_retirement(void)
+{
+	int ret, guards_ret;
+
+	WRITE_ONCE(h.auto_resume, false);
+	if (h.nvidia_module) {
+		if (!h.nvidia_ref) {
+			if (READ_ONCE(h.nvidia_module->state) != MODULE_STATE_LIVE ||
+			    !try_module_get(h.nvidia_module))
+				return -ENODEV;
+			h.nvidia_ref = true;
+		}
+		if (h.owner.held) {
+			ret = hold_active();
+			if (ret)
+				return ret;
+		}
+		ret = initial_rollback(NULL);
+	} else {
+		ret = stop_capture();
+		guards_ret = stop_guards();
+		if (!ret)
+			ret = guards_ret;
+		if (ret)
+			drain_disabled_redirects();
+		stop_observer();
+		if (!ret && (h.owner.held || h.owner.stack_ready || h.nvidia_ref))
+			ret = -EUCLEAN;
+	}
+	if (ret) {
+		set_error(ret);
+		return ret;
+	}
+	h.retirement_failed = false;
+	h.phase = h.guard_poisoned || h.state.stale ? UNAVAILABLE : DETACHED;
+	if (h.phase == UNAVAILABLE)
+		return -EUCLEAN;
+	set_error(0);
+	return 0;
 }
 
 static ssize_t control_write(struct file *file, const char __user *buf,
@@ -1414,7 +1516,7 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 	if (!strcmp(command, "prepare")) {
 		ret = preflight();
 	} else if (!strcmp(command, "resume")) {
-		if (h.state.stale || h.guard_poisoned || h.legacy_blocked) {
+		if (h.state.stale || h.guard_poisoned || h.legacy_blocked || h.retirement_failed) {
 			ret = -EUCLEAN;
 		} else if (!nh_monitoring_active(h.phase, &h.replay,
 			READ_ONCE(h.accepting), h.fine_verified)) {
@@ -1432,7 +1534,7 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 	} else if (!strcmp(command, "acknowledge-loss")) {
 		spin_lock_irqsave(&h.lock, flags);
 		if (h.owner.held || h.nvidia_module || h.guards_registered ||
-		    h.phase != UNAVAILABLE || (!h.state.stale && !h.guard_poisoned)) {
+		    h.phase != UNAVAILABLE || h.retirement_failed || (!h.state.stale && !h.guard_poisoned)) {
 			ret = -EINVAL;
 		} else {
 			if (h.state.stale)
@@ -1442,6 +1544,9 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 		}
 		spin_unlock_irqrestore(&h.lock, flags);
 		cancel_resume = !ret;
+	} else if (h.retirement_failed) {
+		ret = retry_retirement();
+		cancel_resume = !h.retirement_failed;
 	} else if (h.state.stale || h.guard_poisoned) {
 		ret = -EUCLEAN;
 	} else if (h.phase != GUARD_ONLY) {
@@ -1640,6 +1745,8 @@ static int __init hook_init(void)
 	publication = nh_publish(NULL, &publication_ops);
 	ret = publication.error;
 	if (ret && publication.rollback_error) {
+		h.retirement_failed = true;
+		WRITE_ONCE(h.block_initialization, true);
 		/* Failed cleanup cannot permit freeing registered replacement code.
 		 * Publish diagnostics if publication was not already attempted.
 		 */

@@ -27,6 +27,15 @@ static inline bool nh_may_pin_driver(bool live, bool same_module)
 	return live && same_module;
 }
 
+/* Registered guards can be reused only while their NVIDIA instance is known.
+ * A failed retirement blocks attachment even if a replacement reuses an address.
+ */
+static inline bool nh_instance_attach_allowed(bool retirement_failed,
+		bool guards_registered, bool instance_known)
+{
+	return !retirement_failed && (!guards_registered || instance_known);
+}
+
 /* A successful stack allocation can return NULL. Callers serialize access and
  * keep NVIDIA text pinned until release has put the device and freed the stack.
  * Acquire requires an empty owner; release is safe to call again after cleanup.
