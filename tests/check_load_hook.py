@@ -3,15 +3,23 @@
 case, a throwaway directory in place of /sys/module, /proc/modules,
 /var/cache/nvpcf-hook, /var/lib/dkms, /lib/modules and /usr/src.
 
-modprobe, modinfo, zstd, readelf, curl and uname are mocks placed first on
+modprobe, modinfo, zstd, objcopy, curl and uname are mocks placed first on
 PATH. check_nvidia.py and nvpcf-hookctl are mocks placed next to the copied
 script, where the installed script finds its copies. A mock module file
-holds its build ID and version as text, which the mock readelf and modinfo
-report for that file, so the cases can tell which file the script checked
+holds its build ID and version as text. The mock objcopy turns the ID into
+the note that GNU ld writes, and the mock modinfo reports the version, so
+the cases can tell which file the script checked
 and where a version came from. Asked for nvidia's version by name, the mock
 modinfo answers with a different version, which a case would notice. The
 loaded nvidia's build ID is a real GNU note under the throwaway /sys/module,
 which the script parses itself.
+
+Real GNU ld objects test --build-id with the real objcopy: ld -r
+--build-id=0x... builds one for every ID length from 1 to 65 bytes, and ld
+writes the note of each without padding after the ID. Further objects have no
+build ID section, two build ID notes in the section, or a truncated note at
+the end. The same note bytes, with and without final padding, test
+--loaded-build-id. The objects stay unchanged.
 
 The cases for --build-id and --loaded-build-id read the script's stdout
 apart from its messages on stderr, and check that it prints IDs of 16, 20, 32
@@ -87,10 +95,19 @@ elif cmd == 'modinfo':
         print(root / 'lib/modules' / cfg['running'] / 'updates/dkms/nvidia.ko.zst')
 elif cmd == 'zstd':
     sys.stdout.write(Path(args[-1]).read_text())
-elif cmd == 'readelf':
-    text = Path(args[-1]).read_text()
-    if 'BUILDID=' in text:
-        print('    Build ID: ' + text.split('BUILDID=')[1].split()[0])
+elif cmd == 'objcopy':
+    # The section's bytes, as GNU ld writes them: no padding after the ID. A
+    # file without the section gives an empty output and status 0.
+    text, out = Path(args[-2]).read_text(), Path(args[-1])
+    if 'BUILDID=' not in text:
+        out.write_bytes(b'')
+    else:
+        try:
+            desc = bytes.fromhex(text.split('BUILDID=')[1].split()[0])
+        except ValueError:
+            out.write_bytes(b'\x04\x00\x00\x00')
+        else:
+            out.write_bytes(struct.pack('<III', 4, len(desc), 3) + b'GNU\0' + desc)
 elif cmd == 'curl':
     out = Path(args[args.index('-o') + 1])
     if cfg.get('curl_fails'):
@@ -133,7 +150,7 @@ def run(name, cfg=None, args=(), nvidia_loaded=True, hook_loaded=False, disk_id=
     mock = root / 'mock'
     mock.write_text(MOCK)
     mock.chmod(0o755)
-    for cmd in ('modprobe', 'modinfo', 'zstd', 'readelf', 'curl', 'uname'):
+    for cmd in ('modprobe', 'modinfo', 'zstd', 'objcopy', 'curl', 'uname'):
         (root / 'bin' / cmd).symlink_to(mock)
     (root / 'proc').mkdir()
     (root / 'proc/modules').write_text('')
@@ -258,6 +275,76 @@ for state, ok in ((['waiting', 1, 0], True), (['waiting', 0, 0], False), (['wait
 r = run('already-loaded', hook_loaded=True)
 check(r, r['exit'] == 0 and r['modprobe'] == [] and r['checker'] == [],
       f"only reads the state of a loaded hook, got status {r['exit']} and {r['modprobe']}")
+
+import hashlib
+
+
+def note(desc, pad):
+    data = struct.pack('<III', 4, len(desc), 3) + b'GNU\0' + desc
+    return data + b'\0' * (-len(desc) % 4) if pad else data
+
+
+FIX = BASE / 'ld-fixtures'
+FIX.mkdir()
+(FIX / 'e.s').write_text('.text\n.globl f\nf: ret\n')
+subprocess.run(['as', '--64', str(FIX / 'e.s'), '-o', str(FIX / 'e.o')], check=True)
+objects = {}
+for n in range(1, 66):
+    objects[n] = FIX / f'id{n}.o'
+    subprocess.run(['ld', '-r', f'--build-id=0x{bytes(range(1, n + 1)).hex()}', str(FIX / 'e.o'),
+                    '-o', str(objects[n])], check=True)
+subprocess.run(['ld', '-r', str(FIX / 'e.o'), '-o', str(FIX / 'none.o')], check=True)
+crafted = {'duplicate': note(bytes(range(1, 21)), True) + note(bytes(range(21, 41)), False),
+           'truncated': note(bytes(range(1, 21)), True) + b'\x04\x00'}
+for name, data in crafted.items():
+    (FIX / f'{name}.bin').write_bytes(data)
+    subprocess.run(['objcopy', '--add-section', f'.note.gnu.build-id={FIX / (name + ".bin")}',
+                    '--set-section-flags', '.note.gnu.build-id=alloc,readonly,data,contents',
+                    str(FIX / 'e.o'), str(FIX / f'{name}.o')], check=True)
+artifacts = [*objects.values(), FIX / 'none.o', FIX / 'duplicate.o', FIX / 'truncated.o']
+digests = {a: hashlib.sha256(a.read_bytes()).hexdigest() for a in artifacts}
+# A copy of the loader whose /sys/module is a throwaway directory, run with the
+# real objcopy and python3.
+NOTES = BASE / 'note-sandbox'
+(NOTES / 'sys/module/nvidia/notes').mkdir(parents=True)
+(NOTES / 'load-hook.sh').write_text((SRC / 'load-hook.sh').read_text().replace('/sys/module/', f'{NOTES}/sys/module/'))
+
+
+def extract(*args):
+    p = subprocess.run(['/bin/bash', str(NOTES / 'load-hook.sh'), *args], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True, timeout=60, env=dict(os.environ, PATH='/usr/bin:/bin'))
+    return {'exit': p.returncode, 'stdout': p.stdout, 'out': p.stdout + p.stderr}
+
+
+def loaded(data):
+    (NOTES / 'sys/module/nvidia/notes/.note.gnu.build-id').write_bytes(data)
+    return extract('--loaded-build-id', 'nvidia')
+
+
+for n, obj in objects.items():
+    want = bytes(range(1, n + 1)).hex() + '\n' if n <= 64 else ''
+    status = 0 if n <= 64 else 1
+    r = dict(extract('--build-id', str(obj)), case=f'ld-object-{n}-bytes')
+    check(r, r['exit'] == status and r['stdout'] == want,
+          f"prints the {n}-byte ID of the object that ld built, or refuses it above 64 bytes, got {r['exit']} and {r['stdout']!r}")
+    raw = FIX / f'id{n}.note'
+    subprocess.run(['objcopy', '-O', 'binary', '-j', '.note.gnu.build-id', str(obj), str(raw)], check=True)
+    data = raw.read_bytes()
+    check(r, len(data) == 16 + n, f"ld writes the {n}-byte ID's note with {16 + n} bytes, got {len(data)}")
+    for padded in (False, True):
+        r = dict(loaded(note(data[16:], True) if padded else data),
+                 case=f"loaded-ld-note-{n}-bytes{'-padded' if padded else ''}")
+        check(r, r['exit'] == status and r['stdout'] == want,
+              f"reads the loaded note {'with' if padded else 'without'} final padding, got {r['exit']} and {r['stdout']!r}")
+for name in ('none', 'duplicate', 'truncated'):
+    r = dict(extract('--build-id', str(FIX / f'{name}.o')), case=f'ld-object-{name}')
+    check(r, r['exit'] == 1 and r['stdout'] == '', f"refuses the object, got {r['exit']} and {r['stdout']!r}")
+for name, data in (*crafted.items(), ('empty', b'')):
+    r = dict(loaded(data), case=f'loaded-note-{name}')
+    check(r, r['exit'] == 1 and r['stdout'] == '', f"refuses the loaded note, got {r['exit']} and {r['stdout']!r}")
+r = {'case': 'ld-objects-unchanged', 'out': ''}
+check(r, all(hashlib.sha256(a.read_bytes()).hexdigest() == d for a, d in digests.items()),
+      'leaves every object it read unchanged')
 
 r = run('check-loaded', args=('--check-loaded',), hook_loaded=True)
 check(r, r['exit'] == 0 and r['modprobe'] == [] and r['checker'] == [] and r['curl'] == [],

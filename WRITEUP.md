@@ -482,13 +482,28 @@ pair one file with another version's source, and it requires a build ID of 1 to
 archive end the run with status 3, which means the check could not run.
 `--fetch` only downloads the archive of the version given after it.
 
-`--build-id FILE` prints the GNU build ID of a module file, which it
-decompresses first, and `--loaded-build-id MODULE` prints the build ID of a
-loaded module, which it parses from the note in `/sys/module/<module>/notes`.
-Both print an ID only if it is 1 to 64 bytes, in lowercase hex, and exit with
-status 1 otherwise. Their messages go to stderr, so stdout holds only the ID.
-`install-hook.sh` and `swap.sh` read build IDs through these two modes, so
-that the three scripts accept the same IDs.
+`--build-id FILE` prints the GNU build ID of a module file. It decompresses
+the file, and copies the bytes of its `.note.gnu.build-id` section into a
+temporary file with `objcopy -O binary -j .note.gnu.build-id`.
+`--loaded-build-id MODULE` prints the build ID of a loaded module, from the
+note in `/sys/module/<module>/notes`. Both parse the notes with the same
+rules:
+
+- every note has to be complete;
+- a note that another one follows is padded to four bytes;
+- the last note may end right after its ID.
+
+They print the ID in lowercase hex only if the notes hold exactly one GNU
+build ID note, of 1 to 64 bytes, and exit with status 1 otherwise.
+
+GNU ld 2.42 writes the note of an ID whose length is not a multiple of four
+with 16 bytes before the ID and no padding after it, and Linux exports the
+section with that size. `readelf -n` then leaves the ID out, which is why the
+loader does not use it. For a file without the section, `objcopy` exits with
+status 0 and writes nothing, which the parser refuses. The messages of both
+modes go to stderr, so stdout holds only the ID. `install-hook.sh` and
+`swap.sh` read build IDs through these two modes, so that the three scripts
+accept the same IDs.
 
 `nvpcf-hook.service` runs the installed loader once at boot, after the network
 is up, because a new driver version can need its archive. A unit runs it rather
@@ -642,7 +657,8 @@ the number of deliveries.
     holds for a hook that reports `active` with `retirement_failed` set after a
     failed `detach`. A hook that does not become active, or a service that
     does not start, ends the swap with `END (failed)`.
-  - Full swaps compare build IDs of 16, 32 and 64 bytes. A loaded module
+  - Full swaps compare build IDs of 1, 16, 17, 32 and 64 bytes, whose notes
+    end without padding as GNU ld writes them. A loaded module
     without a build ID note ends the swap with `END (failed)` and names the
     module.
 - `tests/check_load_hook.py` runs `load-hook.sh` as an ordinary user, against a
@@ -663,7 +679,13 @@ the number of deliveries.
   guards registered, initialization allowed and `retirement_failed` 0, at the
   end of a load and with `--check-loaded`. It also checks `--check-disk`,
   `--no-download`, `--fetch` and an already loaded hook. For `--build-id` and
-  `--loaded-build-id`, it reads stdout apart from the messages, and checks IDs
+  `--loaded-build-id`, it reads stdout apart from the messages. With the real
+  `objcopy`, it reads objects that `ld -r --build-id=0x...` builds for every
+  ID length from 1 to 65 bytes, whose notes ld writes without padding after
+  the ID. It also reads objects without the section, with two build ID notes
+  in it, and with a truncated note at the end, and it checks that the objects
+  stay unchanged. The same note bytes, with and without final padding, test
+  `--loaded-build-id`. The cases with the mock `objcopy` check IDs
   of 16, 20, 32 and 64 bytes, IDs of 0 and 65 bytes, a file without an ID, a
   missing file, a module without a note, and a module name with a path.
 - `tests/check_install_hook.py` runs `install-hook.sh` as an ordinary user,
@@ -690,7 +712,8 @@ the number of deliveries.
     when the failed kernel loses its headers before the second run, and goes
     only after a third run with the headers back has installed and checked the
     new version there;
-  - a build ID that cannot be read, which fails the check;
+  - a module file without a build ID section, for which `objcopy` exits with
+    status 0 and writes nothing, which fails the check;
   - an install that DKMS reports as successful but that leaves another file,
     which fails two runs in a row while the fault stays, and is installed
     again and passes when it goes away;

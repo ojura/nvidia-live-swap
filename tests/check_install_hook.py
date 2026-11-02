@@ -14,8 +14,9 @@ the kernel is left with no installed version. A case can also make install
 fail before the copy, or leave a file with another build ID while it reports
 success. remove uninstalls a version from every kernel that has
 it installed, so a premature remove shows up as a lost module. A module file
-holds its build ID as text, which the mock readelf reports. uname, modinfo,
-readelf, systemctl and curl are mocks too. The copied load-hook.sh reads the
+holds its build ID as text, which the mock objcopy turns into the note that
+GNU ld writes. uname, modinfo, objcopy, systemctl and curl are mocks too. The
+copied load-hook.sh reads the
 build IDs for install-hook.sh, and downloads into the throwaway cache through
 the mock curl.
 
@@ -88,7 +89,7 @@ def dkms_ver(v):
 assert ALIAS != NEW and dkms_ver(ALIAS) == dkms_ver(NEW), (NEW, ALIAS)
 
 MOCK = r'''#!/usr/bin/python3 -I
-import hashlib, json, os, re, shutil, sys
+import hashlib, json, os, re, shutil, struct, sys
 from pathlib import Path
 root = Path(os.environ['MOCK_ROOT'])
 cfg = json.loads((root / 'config.json').read_text())
@@ -179,10 +180,14 @@ elif cmd == 'modinfo':
     if not p.exists():
         sys.exit(1)
     print(p)
-elif cmd == 'readelf':
-    if cfg.get('readelf_fails'):
-        sys.exit(1)
-    print('    Build ID: ' + Path(args[-1]).read_text().split('BUILDID=')[1].split()[0])
+elif cmd == 'objcopy':
+    # A file without the section: objcopy exits with status 0 and writes nothing.
+    out = Path(args[-1])
+    if cfg.get('build_id_section_missing'):
+        out.write_bytes(b'')
+    else:
+        desc = bytes.fromhex(Path(args[-2]).read_text().split('BUILDID=')[1].split()[0])
+        out.write_bytes(struct.pack('<III', 4, len(desc), 3) + b'GNU\0' + desc)
 elif cmd == 'curl':
     out = Path(args[args.index('-o') + 1])
     if cfg.get('fetch_fails'):
@@ -221,7 +226,7 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
     mock = root / 'mock'
     mock.write_text(MOCK)
     mock.chmod(0o755)
-    for cmd in ('dkms', 'uname', 'modinfo', 'readelf', 'systemctl', 'curl'):
+    for cmd in ('dkms', 'uname', 'modinfo', 'objcopy', 'systemctl', 'curl'):
         (root / 'bin' / cmd).symlink_to(mock)
     for k in headers:
         (root / 'lib/modules' / k / 'build').mkdir(parents=True)
@@ -480,7 +485,7 @@ check(r, r['exits'] == [1, 1, 0] and r['state']['installed'] == {RUNNING: NEW, O
 check(r, r['removed'] == [f'nvpcf-hook/{OLD}'] and OLD not in r['state']['added'] and f'nvpcf-hook-{OLD}' not in r['sources'],
       f"removes {OLD} only in the run that installs the new version everywhere, got {r['removed']}")
 
-r = run('build-id-unreadable', {'readelf_fails': True}, installed={RUNNING: OLD, OTHER: OLD})
+r = run('build-id-unreadable', {'build_id_section_missing': True}, installed={RUNNING: OLD, OTHER: OLD})
 check(r, r['exit'] == 1 and f'{RUNNING}: installing nvpcf-hook/{NEW}, or checking that modprobe finds it' in r['out']
       and f'{OTHER}: installing nvpcf-hook/{NEW}, or checking that modprobe finds it' in r['out'],
       'fails the check when no build ID can be read, instead of matching two empty IDs')

@@ -43,9 +43,12 @@
 # allowed and retirement_failed 0. If the hook is loaded already, the script
 # only checks that, as --check-loaded does.
 #
-# --build-id and --loaded-build-id print a build ID only if it is 1 to 64
-# bytes, the range that nvpcf_hook accepts, and exit with status 1 otherwise.
-# install-hook.sh and swap.sh read build IDs through them.
+# --build-id copies a module file's .note.gnu.build-id section with objcopy,
+# and --loaded-build-id reads the loaded module's note from /sys/module. Both
+# parse the notes with the same rules, and print a build ID only if there is
+# exactly one, of 1 to 64 bytes, the range that nvpcf_hook accepts. They exit
+# with status 1 otherwise. install-hook.sh and swap.sh read build IDs through
+# them.
 #
 # The boot unit nvpcf-hook.service and swap.sh run the copy that
 # install-hook.sh puts in /usr/local/lib/nvpcf-hook, next to copies of
@@ -84,6 +87,11 @@ log() { echo "load-hook.sh: $*" >&2; }
 fail() { log "$*"; exit 1; }
 temps=()
 trap 'rm -f "${temps[@]}"' EXIT
+# One file for the build ID notes that copy_build_id extracts. It is made
+# here, in the script's own shell, so that the EXIT trap removes it also
+# when copy_build_id runs in a command substitution.
+notes=$(mktemp) || { echo "load-hook.sh: cannot create a temporary file" >&2; exit 1; }
+temps+=("$notes")
 valid_version() { [[ $1 =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; }
 archive_of() { echo "$CACHE/open-gpu-kernel-modules-$1.tar.gz"; }
 
@@ -114,34 +122,46 @@ module_copy() {
         *) cat "$1" > "$copy" ;;
     esac
 }
-# Print the GNU build ID of a module copy in lowercase. Exit status 1 unless
-# it is 1 to 64 bytes of hex, the range that nvpcf_hook accepts.
+# Print the GNU build ID of a module copy. objcopy copies the bytes of its
+# .note.gnu.build-id section into $notes, and note_build_id parses them, as it
+# parses a loaded module's note. readelf cannot be used: GNU ld writes an ID
+# whose length is not a multiple of four without padding after it, and readelf
+# 2.42 then leaves the ID out. For a file without the section, objcopy exits
+# with status 0 and writes nothing, which note_build_id refuses.
 copy_build_id() {
-    local id
-    id=$(readelf -n "$1" 2>/dev/null | sed -n 's/.*Build ID: //p' | head -1 | tr 'A-F' 'a-f')
-    [[ $id =~ ^([0-9a-f]{2}){1,64}$ ]] || return 1
-    echo "$id"
+    : > "$notes" && objcopy -O binary -j .note.gnu.build-id "$1" "$notes" 2>/dev/null && note_build_id "$notes"
 }
 copy_version() { modinfo -F version "$1" 2>/dev/null; }
-# Print the GNU build ID from an ELF note file, parsing each note's header.
+# Print the GNU build ID in a file of ELF notes in lowercase hex, and exit
+# with status 1 unless the file holds exactly one GNU build ID note, of 1 to
+# 64 bytes, the range that nvpcf_hook accepts. Every note has to be complete.
+# A note that another one follows is padded to four bytes, as the ELF format
+# requires. The last note may end right after its descriptor, as GNU ld
+# writes it, and Linux exports such a section with the same size.
 note_build_id() {
     python3 -I -c '
 import struct, sys
 data = open(sys.argv[1], "rb").read()
-offset = 0
-while offset + 12 <= len(data):
+ids, offset = [], 0
+while offset < len(data):
+    if offset + 12 > len(data):
+        sys.exit(1)
     namesz, descsz, kind = struct.unpack_from("<III", data, offset)
-    offset += 12
-    name = data[offset:offset + namesz]
-    offset += (namesz + 3) & ~3
-    desc = data[offset:offset + descsz]
-    offset += (descsz + 3) & ~3
-    if offset > len(data) or len(desc) != descsz:
+    name_at = offset + 12
+    desc_at = name_at + ((namesz + 3) & ~3)
+    desc_end = desc_at + descsz
+    if desc_end > len(data):
+        sys.exit(1)
+    if kind == 3 and data[name_at:name_at + namesz] == b"GNU\0":
+        ids.append(data[desc_at:desc_end])
+    if desc_end == len(data):
         break
-    if kind == 3 and name == b"GNU\0" and 1 <= descsz <= 64:
-        print(desc.hex())
-        sys.exit(0)
-sys.exit(1)' "$1"
+    offset = (desc_end + 3) & ~3
+    if offset > len(data):
+        sys.exit(1)
+if len(ids) != 1 or not 1 <= len(ids[0]) <= 64:
+    sys.exit(1)
+print(ids[0].hex())' "$1"
 }
 
 # Run check_nvidia.py on a module copy ($1) of driver version $2.

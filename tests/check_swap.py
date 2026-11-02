@@ -14,7 +14,7 @@ one differ. The mock load-hook.sh loads nvpcf_hook; r['modprobe'] lists those
 loads as nvpcf_hook among the modprobe calls, and swap.sh must never run
 modprobe nvpcf_hook itself. For --build-id and --loaded-build-id, the mock
 runs a copy of the real load-hook.sh, which parses the GNU notes that the mock
-writes for the loaded modules and the IDs that the mock readelf prints. A case
+writes for the loaded modules and the notes that the mock objcopy writes. A case
 can choose the length of these build IDs. The test runs copies of
 swap.sh and lib.sh, edited so that the files they read, write or rename under
 /sys, /proc, /run and /usr/share are the ones in the throwaway directory.
@@ -123,7 +123,7 @@ elif cmd == 'systemctl':
         pause()
 elif cmd == 'load-hook.sh':
     if args and args[0] in ('--build-id', '--loaded-build-id'):
-        # The real python3 parses the notes; readelf stays the mock.
+        # The real python3 parses the notes; objcopy stays the mock.
         os.execve('/bin/bash', ['/bin/bash', str(root / 'real-load-hook.sh'), *args],
                   dict(os.environ, PATH=f"{root}/loader-bin:/usr/bin:/bin"))
     if args == ['--check-loaded']:
@@ -262,8 +262,9 @@ elif cmd == 'nm':
     if cfg.get('disk_patched', True):
         print('0000000000000000 T RmDeferNvpcfNotifyIfIdle')
     print('0000000000000000 T nv_acpi_nvpcf_event')
-elif cmd == 'readelf':
-    print('    Build ID: ' + DISK_ID)
+elif cmd == 'objcopy':
+    desc = bytes.fromhex(DISK_ID)
+    Path(args[-1]).write_bytes(struct.pack('<III', 4, len(desc), 3) + b'GNU\0' + desc)
 elif cmd == 'runuser':
     st = load()
     if cfg.get('reapply_releases', True) and cfg.get('reapply_rc', 0) == 0:
@@ -353,7 +354,7 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
     mock.write_text(MOCK)
     mock.chmod(0o755)
     for cmd in ('mv', 'systemctl', 'fuser', 'setsid', 'python3', 'rmmod', 'modprobe', 'lsmod',
-                'modinfo', 'readelf', 'runuser', 'getent', 'sleep', 'nm'):
+                'modinfo', 'runuser', 'getent', 'sleep', 'nm'):
         (root / 'bin' / cmd).symlink_to(mock)
     (root / 'config.json').write_text(json.dumps(cfg))
     (root / 'state.json').write_text(json.dumps({
@@ -385,7 +386,7 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
         (lib / 'check_nvidia.py').write_text('# an older checker\n')
     (root / 'real-load-hook.sh').write_text(rewrite((SRC / 'load-hook.sh').read_text(), root))
     (root / 'loader-bin').mkdir()
-    (root / 'loader-bin' / 'readelf').symlink_to(mock)
+    (root / 'loader-bin' / 'objcopy').symlink_to(mock)
     env = dict(os.environ, PATH=f'{root}/bin:/usr/bin:/bin', MOCK_ROOT=str(root))
     p = subprocess.Popen(['/bin/bash', str(script_dir / 'swap.sh'), *args], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -691,7 +692,7 @@ check(r, r['exit'] == 1 and 'lib-nvpcf-hook/check_nvidia.py differs from' in r['
       f"refuses while an installed tool differs from the repository's, and names install-hook.sh, got status {r['exit']}")
 expect_untouched(r)
 
-for size in (16, 32, 64):
+for size in (1, 16, 17, 32, 64):
     r = run(f'build-id-{size}-bytes', dict(SVC, build_id='a5' * size), holders=[777])
     check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'),
           f"compares {size}-byte build IDs and ends with END, got status {r['exit']}")
