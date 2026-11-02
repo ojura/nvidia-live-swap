@@ -192,11 +192,12 @@ hang in NVIDIA's shutdown](#the-hang-in-nvidias-shutdown).
 and in the state `active`, `waiting`, `guard-only` or `quiesced`. It reads the
 hook's state with `nvpcf-hookctl status`, which does not change the hook.
 [hook/README.md](hook/README.md) describes the states. A hook whose status
-shows `retirement_failed: 1` could not remove its interception of NVIDIA's
-functions. `swap.sh` then refuses in every state, and tells the user to run
-`nvpcf-hookctl detach` to retry the removal. For the check after the swap,
-`swap.sh` also decompresses the nvidia module that `modprobe` would load and
-looks for `RmDeferNvpcfNotifyIfIdle` with `nm`.
+shows `retirement_failed: 1` could not finish a cleanup: removing its
+interception of NVIDIA's functions, releasing its references to the GPU, or
+undoing a failed setup. `swap.sh` then refuses in every state, and tells the
+user to run `nvpcf-hookctl detach` to retry the cleanup. For the check after
+the swap, `swap.sh` also decompresses the nvidia module that `modprobe` would
+load and looks for `RmDeferNvpcfNotifyIfIdle` with `nm`.
 
 `swap.sh` runs the installed `load-hook.sh`, which runs the installed checker,
 and the loaded hook comes from the installed DKMS module. So `swap.sh` refuses
@@ -219,9 +220,8 @@ A swap runs these steps in order:
 
 1. If the previous swap ended less than 20 seconds earlier, `swap.sh` waits for
    the rest of the 20 seconds.
-2. It runs the hook's `prepare`, which delivers any held message and checks
-   that the hook can detach later. If `prepare` fails, `swap.sh` stops before
-   it changes anything.
+2. It runs the hook's `prepare`, which wakes the GPU and delivers any held
+   message. If `prepare` fails, `swap.sh` stops before it changes anything.
 3. If mutter holds the display device, `swap.sh` makes mutter release it, as
    described above.
 4. It renames the registration files
@@ -294,14 +294,15 @@ arrives after a change has taken effect, but before its command has returned,
 The hook's guard has to be in place before anything makes NVIDIA initialize the
 GPU: loading `nvidia_modeset` or `nvidia_drm`, or starting a service such as
 `lactd`. After its `detach`, the hook also refuses that initialization until
-its `resume`. So on a failure, `swap.sh` first loads `nvidia` again if it is
-missing. Then it runs the loader if the hook is not loaded, or the hook's
-`resume` if the swap had detached it. If `load-hook.sh --check-loaded` then
-finds the hook `active` or `waiting`, with its guards registered,
-initialization allowed and `retirement_failed` 0, it loads the other missing
-modules and starts the stopped services. Otherwise it leaves those modules
-unloaded and those services stopped, and names them. In both cases it renames
-the registration files back. It never runs `acknowledge-loss`.
+its `resume` has checked that the GPU and NVIDIA's driver are eligible. So on
+a failure, `swap.sh` first loads `nvidia` again if it is missing. Then it runs
+the loader if the hook is not loaded, or the hook's `resume` if the swap had
+detached it. If `load-hook.sh --check-loaded` then finds the hook `active` or
+`waiting`, with its guards registered, initialization allowed and
+`retirement_failed` 0, it loads the other missing modules and starts the
+stopped services. Otherwise it leaves those modules unloaded and those
+services stopped, and names them. In both cases it renames the registration
+files back. It never runs `acknowledge-loss`.
 
 `swap.sh` logs `END` only when every module it loaded, including `nvpcf_hook`,
 has the same build ID as its file on disk, and the fix is in place. Otherwise
@@ -423,10 +424,11 @@ in detail. In short:
   `gpuNotifySubDeviceEvent_IMPL`, a function in NVIDIA's precompiled core,
   return. A notification stays pending until the hook sees that return. If the
   probe misses a return, a retry can therefore deliver the notification twice.
-- It holds a reference to the GPU through NVIDIA's in-kernel
-  `nvidia_dev_get_uuid` and `nvidia_dev_put_uuid`. The data that NVIDIA's
-  notification handler uses stays allocated while the hook holds a
-  notification. The reference does not keep the GPU powered.
+- While it is attached, it holds a reference to the GPU through NVIDIA's
+  in-kernel `nvidia_dev_get_uuid` and `nvidia_dev_put_uuid`. The reference
+  keeps the data that NVIDIA's notification handler uses allocated, so that a
+  held notification can still be delivered, but it does not keep the GPU
+  powered.
 - It intercepts `nv_shutdown_adapter`, as described in [The hang in NVIDIA's
   shutdown](#the-hang-in-nvidias-shutdown).
 - It attaches only to the configuration it was checked for. That is exactly one
@@ -671,10 +673,9 @@ the number of deliveries.
     when its status cannot be read, and when it is unavailable, detached or
     starting. It also refuses when the loader is missing, when the driver on
     disk fails the loader's check, and while an installed tool differs from
-    the repository's or is not executable. When the hook could not remove its
-    interception of NVIDIA's functions, the refusal names
-    `nvpcf-hookctl detach`, which retries the removal, also while the hook
-    reports `active`.
+    the repository's or is not executable. When the hook reports
+    `retirement_failed: 1`, the refusal names `nvpcf-hookctl detach`, which
+    retries the cleanup, also while the hook reports `active`.
   - With `--check`, an archive that is not cached yet is reported as a check
     still to run, and a swap lets the loader download it first.
   - A failed `prepare` stops the swap before any change. After a failed

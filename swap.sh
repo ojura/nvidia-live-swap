@@ -204,7 +204,7 @@ else
     hook_state=$(sed -n 's/^state: //p' <<<"$hook_status")
     hook_error=$(sed -n 's/^last_error: //p' <<<"$hook_status")
     if [ "$(sed -n 's/^retirement_failed: //p' <<<"$hook_status")" = 1 ]; then
-        hook_problems+=("nvpcf_hook could not remove its interception of NVIDIA's functions (state $hook_state, last_error $hook_error); $DIR/hook/nvpcf-hookctl detach retries the removal")
+        hook_problems+=("nvpcf_hook could not finish a cleanup (state $hook_state, last_error $hook_error); the kernel log says why, and $DIR/hook/nvpcf-hookctl detach retries the cleanup")
     else
         case "$hook_state" in
             active|waiting|guard-only|quiesced) ;;
@@ -247,8 +247,9 @@ fi
 # initialization is allowed. They load the other modules and start the
 # services only after that check passes. If it fails, the trap leaves those
 # modules unloaded and the services stopped, and reports them. After its
-# detach, the hook refuses initialization until it resumes. hook_detached
-# records the detach before it runs, so that the trap resumes the hook.
+# detach, the hook refuses initialization until its resume has checked that
+# the GPU and NVIDIA's driver are eligible. hook_detached records the detach
+# before it runs, so that the trap resumes the hook.
 MODULES=(nvidia nvidia_modeset nvidia_drm nvidia_uvm)  # load order
 hidden=() stopped=() initial=()
 hook_detached=0

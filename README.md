@@ -146,9 +146,9 @@ before it renames files, stops services or takes the GPU away from any program.
   messages it held, for example because the GPU disappeared, it stays
   `unavailable` until a person runs `sudo ./hook/nvpcf-hookctl acknowledge-loss`
   after reading its status and the kernel log. `swap.sh` never runs that
-  command. If the hook could not remove its interception of NVIDIA's functions,
-  its status shows `retirement_failed: 1`, and
-  `sudo ./hook/nvpcf-hookctl detach` retries the removal.
+  command. If the hook could not finish a cleanup, such as removing its
+  interception of NVIDIA's functions, its status shows `retirement_failed: 1`,
+  and `sudo ./hook/nvpcf-hookctl detach` retries the cleanup.
 - A file that `install-hook.sh` installs in `/usr/local/lib/nvpcf-hook` is
   missing there, or differs from the repository's file, for example after a
   `git pull`. Run `sudo ./install-hook.sh` first.

@@ -32,7 +32,8 @@ becomes active when lactd.service starts and initializes the GPU.
 Loading nvidia_modeset, nvidia_drm or nvidia_uvm, or starting a service, can
 make NVIDIA initialize the GPU. The mock records each such step taken while
 the hook does not guard NVIDIA's shutdown, and every case fails if it finds
-one. A hook with retirement_failed set does not guard, whatever its state."""
+one. The mock counts a hook with retirement_failed set as one that does not
+guard, whatever its state."""
 import json
 import os
 from pathlib import Path
@@ -670,13 +671,13 @@ check(r, r['exit'] == 1 and '/hook/nvpcf-hookctl acknowledge-loss' in r['out'] a
 
 r = run('hook-retirement-failed', dict(UNPATCHED, hook_retirement_failed=True), holders=[777], patched=False,
         hook='unavailable')
-check(r, r['exit'] == 1 and 'could not remove its interception' in r['out'] and 'nvpcf-hookctl detach retries the removal' in r['out']
+check(r, r['exit'] == 1 and 'could not finish a cleanup' in r['out'] and 'nvpcf-hookctl detach retries the cleanup' in r['out']
       and 'retirement_failed 1' in r['out'],
-      f"exits with status 1, names the failed removal and the command that retries it, got status {r['exit']}")
+      f"exits with status 1, names the failed cleanup and the command that retries it, got status {r['exit']}")
 expect_untouched(r)
 
 r = run('hook-active-retirement-failed', dict(UNPATCHED, hook_retirement_failed=True), holders=[777], patched=False)
-check(r, r['exit'] == 1 and 'could not remove its interception' in r['out'] and '(state active,' in r['out'],
+check(r, r['exit'] == 1 and 'could not finish a cleanup' in r['out'] and '(state active,' in r['out'],
       f"refuses an active hook whose retirement failed, got status {r['exit']}")
 expect_untouched(r)
 

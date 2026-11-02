@@ -164,7 +164,7 @@ check_build() {
 hook_loaded() { grep -q '^nvpcf_hook ' /proc/modules; }
 field() { sed -n "s/^$2: //p" <<<"$1"; }
 # Exit status 0 if the hook's state is active or waiting, with its guards
-# installed, GPU initialization allowed and retirement_failed 0. Then the
+# registered, GPU initialization allowed and retirement_failed 0. Then the
 # guard covers NVIDIA's shutdown, and loading NVIDIA's other modules or
 # starting a service that initializes the GPU is safe.
 hook_usable() {
