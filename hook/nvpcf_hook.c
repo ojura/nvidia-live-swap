@@ -101,6 +101,7 @@ static struct {
 	u64 observer_missed_total;
 	bool exiting;
 	bool target_unavailable;
+	u64 scope_epoch;
 	struct pci_dev *pci;
 	struct nh_owner owner;
 	bool uuid_valid;
@@ -340,7 +341,8 @@ static int notrace guarded_start(void *nv, void *sp)
 	bool safe;
 	int ret;
 
-	if (!nh_start_allowed(own, READ_ONCE(h.block_initialization))) {
+	if (!nh_start_allowed(own, READ_ONCE(h.block_initialization) ||
+		READ_ONCE(h.target_unavailable))) {
 		if (own)
 			WRITE_ONCE(h.would_initialize, true);
 		ret = -EBUSY;
@@ -791,7 +793,8 @@ static void activate_capture(void)
 	h.accepting = nh_capture_ready(h.owner.held, h.observer_registered,
 		h.event_registered && h.guards_registered, READ_ONCE(h.legacy_safe));
 	active = nh_activate_replay(&h.replay, h.accepting,
-		h.fine_verified && !h.fine_release_error && h.build_id_verified,
+		h.fine_verified && !h.fine_release_error && h.build_id_verified &&
+		!h.target_unavailable,
 		&h.phase, &h.last_error);
 	if (h.replay.enabled && nh_pending(&h.state))
 		queue_work(h.replay_wq, &h.replay_work);
@@ -959,7 +962,8 @@ static int quiesce_flush(void)
 	}
 	if (result.error) {
 		set_error(result.error);
-		WRITE_ONCE(h.block_initialization, false);
+		WRITE_ONCE(h.block_initialization, READ_ONCE(h.target_unavailable) ||
+			h.retirement_failed || h.legacy_blocked || h.guard_poisoned || h.state.stale);
 	} else {
 		/* Guard-only must permit NVIDIA exit; the guard retains helper code. */
 		unpin_nvidia();
@@ -1157,6 +1161,52 @@ static bool inventory_matches(void)
 	return count == 1 && target;
 }
 
+/* Device lock and action held. Keep startup blocked until setup validates the
+ * current target and inventory. A bus notification invalidates an earlier check
+ * before it acquires action.
+ */
+static int check_target_scope_locked(u64 *epoch)
+{
+	struct module *owner;
+	unsigned long flags;
+
+	spin_lock_irqsave(&h.lock, flags);
+	*epoch = h.scope_epoch;
+	spin_unlock_irqrestore(&h.lock, flags);
+	if (!inventory_matches() || !pci_device_is_present(h.pci) ||
+	    !h.pci->dev.driver || strcmp(h.pci->dev.driver->name, "nvidia"))
+		goto refused;
+	owner = h.pci->dev.driver->owner;
+	if (!owner || READ_ONCE(owner->state) != MODULE_STATE_LIVE ||
+	    strcmp(module_name(owner), "nvidia"))
+		goto refused;
+	return 0;
+refused:
+	spin_lock_irqsave(&h.lock, flags);
+	h.target_unavailable = true;
+	h.block_initialization = true;
+	spin_unlock_irqrestore(&h.lock, flags);
+	return -ENODEV;
+}
+
+static int admit_target_scope(u64 epoch)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&h.lock, flags);
+	if (epoch != h.scope_epoch) {
+		ret = -ENODEV;
+		h.target_unavailable = true;
+		h.block_initialization = true;
+	} else {
+		h.target_unavailable = false;
+		h.block_initialization = false;
+	}
+	spin_unlock_irqrestore(&h.lock, flags);
+	return ret;
+}
+
 /* Device lock and action held. */
 static int get_gpu_locked(void)
 {
@@ -1338,8 +1388,14 @@ static void release_active(bool driver_gone)
  */
 static int prepare_open_locked(void)
 {
-	int ret = pin_nvidia_locked();
+	u64 epoch;
+	bool may_wait = false;
+	int ret;
 
+	WRITE_ONCE(h.block_initialization, true);
+	ret = check_target_scope_locked(&epoch);
+	if (!ret)
+		ret = pin_nvidia_locked();
 	if (!ret)
 		ret = kernel_notifier_mode();
 	if (!ret)
@@ -1347,7 +1403,11 @@ static int prepare_open_locked(void)
 	if (!ret)
 		ret = check_legacy_methods();
 	if (!ret)
+		ret = admit_target_scope(epoch);
+	if (!ret) {
 		ret = effective_fine();
+		may_wait = ret == -EAGAIN;
+	}
 	if (!ret)
 		ret = hold_active();
 	if (!ret) {
@@ -1357,8 +1417,17 @@ static int prepare_open_locked(void)
 		WRITE_ONCE(h.open_task, NULL);
 		if (ret == -EBUSY && READ_ONCE(h.would_initialize))
 			ret = -EAGAIN;
+		may_wait = ret == -EAGAIN;
 	}
+	if (ret && (!may_wait || READ_ONCE(h.target_unavailable)))
+		WRITE_ONCE(h.block_initialization, true);
 	return ret;
+}
+
+static bool waiting_for_initializer(int error)
+{
+	return error == -EAGAIN && !READ_ONCE(h.target_unavailable) &&
+		!READ_ONCE(h.block_initialization);
 }
 
 static void resume_work(struct work_struct *work)
@@ -1366,6 +1435,7 @@ static void resume_work(struct work_struct *work)
 	unsigned int sleep_flags;
 	unsigned long flags;
 	bool already_owned;
+	u64 epoch;
 	int ret;
 
 	/* Waits for the whole PM sequence/robust rollback, not only our post. */
@@ -1384,14 +1454,21 @@ static void resume_work(struct work_struct *work)
 		h.phase = UNAVAILABLE;
 	}
 	if (!READ_ONCE(h.exiting) && !attachment_blocked() &&
-	    ((h.auto_resume && READ_ONCE(h.phase) == SUSPENDED) || READ_ONCE(h.phase) == WAITING)) {
+	    ((h.auto_resume && READ_ONCE(h.phase) == SUSPENDED) ||
+	     READ_ONCE(h.phase) == WAITING || READ_ONCE(h.phase) == STARTING)) {
 		already_owned = h.owner.held;
 		WRITE_ONCE(h.auto_resume, false);
-		WRITE_ONCE(h.block_initialization, false);
+		WRITE_ONCE(h.block_initialization, true);
 		spin_lock_irqsave(&h.lock, flags);
 		h.replay.enabled = false;
 		spin_unlock_irqrestore(&h.lock, flags);
-		ret = already_owned ? 0 : prepare_open_locked();
+		if (already_owned) {
+			ret = check_target_scope_locked(&epoch);
+			if (!ret)
+				ret = admit_target_scope(epoch);
+		} else {
+			ret = prepare_open_locked();
+		}
 		device_unlock(&h.pci->dev);
 		if (!ret)
 			ret = attach_locked(true);
@@ -1405,8 +1482,10 @@ static void resume_work(struct work_struct *work)
 				if (released)
 					ret = released;
 			}
-			h.phase = h.owner.held ? QUIESCED :
-				  ret == -EAGAIN ? WAITING : UNAVAILABLE;
+			if (already_owned || !waiting_for_initializer(ret))
+				WRITE_ONCE(h.block_initialization, true);
+			h.phase = READ_ONCE(h.target_unavailable) ? UNAVAILABLE :
+				h.owner.held ? QUIESCED : waiting_for_initializer(ret) ? WAITING : UNAVAILABLE;
 			set_error(ret);
 			if (ret != -EAGAIN || already_owned)
 				pr_err("nvpcf_hook: attachment failed: state=%s error=%d\n",
@@ -1561,6 +1640,21 @@ static int pm_notify(struct notifier_block *nb, unsigned long action, void *unus
 	return NOTIFY_DONE;
 }
 
+/* Publish loss without action so a concurrent admission cannot erase it. */
+static void mark_scope_unavailable(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&h.lock, flags);
+	h.scope_epoch++;
+	h.target_unavailable = true;
+	h.block_initialization = true;
+	h.auto_resume = false;
+	h.replay.enabled = false;
+	h.state.resume_armed = false;
+	spin_unlock_irqrestore(&h.lock, flags);
+}
+
 static int bus_notify(struct notifier_block *nb, unsigned long action, void *dev)
 {
 	struct device *changed = dev;
@@ -1575,8 +1669,7 @@ static int bus_notify(struct notifier_block *nb, unsigned long action, void *dev
 
 	if (!target_remove && !another_gpu)
 		return NOTIFY_DONE;
-	WRITE_ONCE(h.target_unavailable, true);
-	WRITE_ONCE(h.auto_resume, false);
+	mark_scope_unavailable();
 	/* UNBIND holds device_lock, before NVIDIA removes nvl from its list.
 	 * A concurrent controller put must finish before this callback returns.
 	 * Kernel put is also used by modeset_remove in this lock context; unlike
@@ -1768,6 +1861,32 @@ static int retry_retirement(void)
 	return 0;
 }
 
+/* action/system sleep held. A request preserves scope refusal until the
+ * worker checks the target under device_lock; STARTING is not admitted WAITING.
+ */
+static int request_resume(void)
+{
+	unsigned long flags;
+
+	if (attachment_blocked())
+		return -EUCLEAN;
+	if (!READ_ONCE(h.target_unavailable) &&
+	    nh_monitoring_active(READ_ONCE(h.phase), &h.replay,
+		READ_ONCE(h.accepting), h.fine_verified && !READ_ONCE(h.fine_release_error) &&
+		h.build_id_verified))
+		return 0;
+	if (!h.self_ref) {
+		__module_get(THIS_MODULE);
+		h.self_ref = true;
+	}
+	WRITE_ONCE(h.auto_resume, false);
+	spin_lock_irqsave(&h.lock, flags);
+	h.phase = STARTING;
+	spin_unlock_irqrestore(&h.lock, flags);
+	schedule_work(&h.resume_work);
+	return 1;
+}
+
 static ssize_t control_write(struct file *file, const char __user *buf,
 			     size_t count, loff_t *pos)
 {
@@ -1802,22 +1921,10 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 	if (!strcmp(command, "prepare")) {
 		ret = preflight();
 	} else if (!strcmp(command, "resume")) {
-		if (h.state.stale || h.guard_poisoned || h.legacy_blocked || h.retirement_failed) {
-			ret = -EUCLEAN;
-		} else if (!nh_monitoring_active(READ_ONCE(h.phase), &h.replay,
-			READ_ONCE(h.accepting), h.fine_verified && !READ_ONCE(h.fine_release_error) && h.build_id_verified)) {
-			if (!h.self_ref) {
-				__module_get(THIS_MODULE);
-				h.self_ref = true;
-			}
-			WRITE_ONCE(h.target_unavailable, false);
-			WRITE_ONCE(h.block_initialization, false);
-			WRITE_ONCE(h.auto_resume, false);
-			spin_lock_irqsave(&h.lock, flags);
-			h.phase = WAITING;
-			spin_unlock_irqrestore(&h.lock, flags);
+		ret = request_resume();
+		if (ret > 0) {
 			restore = true;
-			schedule_work(&h.resume_work);
+			ret = 0;
 		}
 	} else if (!strcmp(command, "acknowledge-loss")) {
 		spin_lock_irqsave(&h.lock, flags);
@@ -1933,7 +2040,7 @@ static int initial_stage(void *unused)
 	device_unlock(&h.pci->dev);
 	if (!ret)
 		ret = attach_locked(false);
-	if (ret == -EAGAIN) {
+	if (waiting_for_initializer(ret)) {
 		h.phase = WAITING;
 		set_error(ret);
 		pr_info("nvpcf_hook: waiting for a successful ordinary GPU initializer\n");

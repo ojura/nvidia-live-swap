@@ -30,6 +30,7 @@ PREFIX = r'''
 #include "build_id.h"
 #include "text.h"
 typedef unsigned char u8;
+typedef uint64_t u64;
 typedef void (*nvpcf_callback)(void *, unsigned int, void *);
 typedef int (*nv_start_callback)(void *, void *);
 typedef void (*nv_shutdown_callback)(void *, void *, void *);
@@ -45,7 +46,13 @@ static void event_hook(unsigned long, unsigned long, struct ftrace_ops *, struct
 typedef unsigned int u32;
 struct driver { const char *name; struct module *owner; };
 struct device { struct driver *driver; struct { int lock, runtime_error; } power; };
-struct pci_dev { struct device dev; };
+struct pci_dev { struct device dev; unsigned int vendor, class; };
+#define to_pci_dev(dev) ((struct pci_dev *)(dev))
+#define PCI_VENDOR_ID_NVIDIA 0x10de
+#define PCI_BASE_CLASS_DISPLAY 3
+#define BUS_NOTIFY_UNBIND_DRIVER 20
+#define BUS_NOTIFY_DEL_DEVICE 21
+#define BUS_NOTIFY_ADD_DEVICE 22
 #define MODULE_STATE_LIVE 1
 #define MODULE_STATE_GOING 2
 #define NOTIFY_DONE 0
@@ -87,7 +94,8 @@ static const char *gpu_info_text;
 static int token;
 static bool linux_active, internal_in_use, patched, tls_failure, present, power_emits_event;
 static int linux_refs, native_refs, block_error, unblock_error, block_calls, unblock_calls;
-static int actual_dispatches, owner_puts;
+static int actual_dispatches, owner_puts, effective_error, ordinary_starts;
+static bool inventory_ok;
 static unsigned int graces, wait_mask, invalidations, within_calls, redirects;
 static bool joined_work, drain_complete, expect_old_symbols;
 static struct {
@@ -96,6 +104,9 @@ static struct {
     struct { struct { void *addr; } kp; } observer;
     struct work_struct replay_work, resume_work;
     struct nh_state state;
+    u64 scope_epoch;
+    void *open_task;
+    bool would_initialize;
     struct nh_replay_control replay;
     enum nh_phase phase;
     struct nh_owner owner;
@@ -139,8 +150,10 @@ static unsigned long ftrace_regs_get_argument(struct ftrace_regs *regs, unsigned
 { assert(regs && arg < 3); return regs->args[arg]; }
 static void atomic_inc(int *value) { (*value)++; }
 static int atomic_read(const int *value) { return *value; }
+static bool atomic_dec_and_test(int *value) { return --*value == 0; }
+#define wake_up_all(queue) ((void)0)
 static int guarded_open(void *a, void *b) { (void)a; (void)b; assert(false); return 0; }
-static int guarded_start(void *a, void *b) { (void)a; (void)b; assert(false); return 0; }
+static int guarded_start(void *a, void *b);
 static void guarded_shutdown(void *a, void *b, void *c)
 { (void)a; (void)b; (void)c; assert(false); }
 static void capture_event(void *a, unsigned int b, void *c)
@@ -213,6 +226,7 @@ static int hold_active(void)
 { if (!h.power_hold) { linux_active = true; linux_refs++; h.power_hold = true; } return 0; }
 static int initial_rollback(void *ctx) { (void)ctx; return rollback_error; }
 static bool try_module_get(struct module *m) { return m->state == MODULE_STATE_LIVE; }
+static void __module_get(struct module *m) { assert(m == &helper); }
 static void module_put(struct module *m) { assert(m == &helper); self_puts++; }
 static void strscpy(char *dest, const char *src, size_t size)
 { assert(strlen(src) < size); memcpy(dest, src, strlen(src) + 1); }
@@ -265,7 +279,8 @@ static void cancel_work_sync(struct work_struct *work)
 static void schedule_work(struct work_struct *work) { (void)work; resume_queued++; }
 static int check_configuration(void) { config_checks++; return config_error; }
 static int register_kretprobe(void *probe) { (void)probe; return 0; }
-static int prepare_open_locked(void) { return 0; }
+static int prepare_open_locked(void);
+static int quiesce_flush(void);
 static void unpin_nvidia(void) { h.nvidia_ref = false; }
 static ssize_t read_blob(const char *name, void *data, size_t size)
 {
@@ -277,7 +292,7 @@ static ssize_t read_blob(const char *name, void *data, size_t size)
     memcpy(data, note_bytes, note_size);
     return (ssize_t)note_size;
 }
-static bool inventory_matches(void) { return true; }
+static bool inventory_matches(void) { return inventory_ok; }
 static const char *pci_name(struct pci_dev *dev) { (void)dev; return "0000:01:00.0"; }
 static int read_gpu_text(const char *name, int (*show)(struct seq_file *, void *), char *buf, size_t size)
 { assert(name && show && strlen(gpu_info_text) < size); memcpy(buf, gpu_info_text, strlen(gpu_info_text) + 1); return 0; }
@@ -285,12 +300,22 @@ static int uuid_parse(const char *text, void *uuid)
 { if (strcmp(text, "00112233-4455-6677-8899-aabbccddeeff")) return -EINVAL; memset(uuid, 0x11, 16); return 0; }
 static int stack_alloc(void **stack) { *stack = NULL; return 0; }
 static int check_legacy_methods(void) { return 0; }
+static int kernel_notifier_mode(void) { return 0; }
+static int effective_fine(void) { return effective_error; }
+static int ordinary_start(void *nv, void *sp)
+{ (void)nv; (void)sp; ordinary_starts++; effective_error = 0; gpu_info_text = "GPU UUID: GPU-00112233-4455-6677-8899-aabbccddeeff\n"; return 0; }
 static unsigned long event_symaddr(unsigned long address) { return address; }
 static int resolve_nvidia(const char *name, unsigned long *address)
 {
     assert(h.build_id_verified && h.nvidia_ref && note_reads > 0);
     resolutions++;
     *address = (unsigned long)dummy;
+    if (!strcmp(name, "nvidia:nvidia_modeset_rm_ops_alloc_stack"))
+        *address = (unsigned long)stack_alloc;
+    if (!strcmp(name, "nvidia:nvidia_modeset_rm_ops_free_stack"))
+        *address = (unsigned long)stack_free;
+    if (!strcmp(name, "nvidia:nvidia_dev_put_uuid"))
+        *address = (unsigned long)owner_put;
     if (!strcmp(name, "nvidia:nvidia_dev_get_uuid"))
         *address = (unsigned long)new_get;
     if (!strcmp(name, "nvidia:nvidia_dev_block_gc6"))
@@ -311,9 +336,12 @@ FUNCTIONS = (
     ('int', 'cleanup_fine_reference_if_active', 'void'),
     ('int', 'deliver_one', 'bool force'),
     ('int', 'put_gpu', 'void'),
+    ('int', 'check_target_scope_locked', 'u64 *epoch'),
+    ('int', 'admit_target_scope', 'u64 epoch'),
     ('int', 'get_gpu_locked', 'void'),
     ('void', 'activate_capture', 'void'),
     ('int', 'lifecycle_restore', 'void *unused'),
+    ('int', 'guarded_start', 'void *nv, void *sp'),
     ('void', 'guard_hook', 'unsigned long ip, unsigned long parent_ip, struct ftrace_ops *ops, struct ftrace_regs *regs'),
     ('void', 'event_hook', 'unsigned long ip, unsigned long parent_ip, struct ftrace_ops *ops, struct ftrace_regs *regs'),
     ('void', 'drain_disabled_redirects', 'void'),
@@ -322,8 +350,13 @@ FUNCTIONS = (
     ('int', 'start_guards', 'void'),
     ('bool', 'attachment_blocked', 'void'),
     ('int', 'attach_locked', 'bool activate'),
+    ('int', 'prepare_open_locked', 'void'),
+    ('bool', 'waiting_for_initializer', 'int error'),
     ('void', 'resume_work', 'struct work_struct *work'),
     ('int', 'pm_notify', 'struct notifier_block *nb, unsigned long action, void *unused'),
+    ('void', 'mark_scope_unavailable', 'void'),
+    ('int', 'bus_notify', 'struct notifier_block *nb, unsigned long action, void *dev'),
+    ('int', 'request_resume', 'void'),
     ('int', 'module_notify', 'struct notifier_block *nb, unsigned long action, void *data'),
     ('int', 'retry_retirement', 'void'),
     ('int', 'preflight', 'void'),
@@ -347,6 +380,8 @@ static void reset(void)
     new_module = (struct module){ MODULE_STATE_LIVE, "replacement", "nvidia" };
     driver = (struct driver){ "nvidia", &new_module };
     pci.dev.driver = &driver;
+    pci.vendor = PCI_VENDOR_ID_NVIDIA; pci.class = PCI_BASE_CLASS_DISPLAY << 16;
+    inventory_ok = true; effective_error = ordinary_starts = 0;
     h.pci = &pci;
     memset(note_bytes, 0, sizeof(note_bytes));
     note_bytes[0] = 4; note_bytes[4] = 3; note_bytes[8] = 3;
@@ -474,6 +509,12 @@ static const struct nh_lifecycle_ops delivery_ops = {
     .release_active = lifecycle_unhold, .release_owner = lifecycle_release,
     .stop_observer = lifecycle_observer_stop,
 };
+static int quiesce_flush(void)
+{
+    struct nh_quiesce_result result = nh_quiesce(NULL, &delivery_ops);
+    if (!result.error) unpin_nvidia();
+    return result.error;
+}
 static void prepare_delivery(bool use_patch)
 {
     reset();
@@ -658,6 +699,78 @@ static void test_actual_waiting_for_uuid(void)
     release_active(false);
     assert(!linux_refs);
 }
+static void test_actual_scope_resume(void)
+{
+    unsigned int removed;
+    for (removed = 0; removed < 2; ++removed) {
+        struct pci_dev second = { .vendor = PCI_VENDOR_ID_NVIDIA,
+                                  .class = PCI_BASE_CLASS_DISPLAY << 16 };
+        prepare_delivery(true);
+        h.nvidia_module = &new_module;
+        h.owner_ops.get = new_get;
+        h.original_start = ordinary_start;
+        h.self_ref = true;
+        if (removed) {
+            assert(bus_notify(NULL, BUS_NOTIFY_UNBIND_DRIVER, &pci.dev) == NOTIFY_DONE);
+            pci.dev.driver = NULL;
+            present = false;
+        } else {
+            inventory_ok = false;
+            assert(bus_notify(NULL, BUS_NOTIFY_ADD_DEVICE, &second.dev) == NOTIFY_DONE);
+        }
+        assert(h.phase == UNAVAILABLE && h.target_unavailable && h.block_initialization);
+        assert(!h.owner.held && !pending() && h.guards_registered);
+        assert(request_resume() == 1 && h.phase == STARTING);
+        assert(h.target_unavailable && h.block_initialization);
+        {
+            int previous = resolutions;
+            resume_work(NULL);
+            assert(h.phase == UNAVAILABLE && h.last_error == -ENODEV);
+            assert(h.target_unavailable && h.block_initialization && !h.owner.held);
+            assert(h.guards_registered && resolutions == previous);
+        }
+        h.starting_calls = 1;
+        assert(guarded_start(NULL, NULL) == -EBUSY && !ordinary_starts);
+        /* Eligibility returns, but the target is cold. Only this admitted
+         * case becomes WAITING and permits an ordinary initializer.
+         */
+        inventory_ok = present = true;
+        pci.dev.driver = &driver;
+        note_error = -EAGAIN; /* A pre-admission error is not cold WAITING. */
+        assert(request_resume() == 1);
+        resume_work(NULL);
+        assert(h.phase == UNAVAILABLE && h.block_initialization && h.target_unavailable);
+        assert(!waiting_for_initializer(-EAGAIN));
+        note_error = 0;
+        effective_error = -EAGAIN;
+        assert(request_resume() == 1 && h.target_unavailable && h.block_initialization);
+        resume_work(NULL);
+        assert(h.phase == WAITING && h.last_error == -EAGAIN);
+        assert(!h.target_unavailable && !h.block_initialization && !h.owner.held);
+        h.starting_calls = 1;
+        assert(!guarded_start(NULL, NULL) && ordinary_starts == 1);
+        resume_work(NULL);
+        assert(h.phase == ACTIVE && h.replay.enabled && h.owner.held);
+        assert(!h.target_unavailable && !h.block_initialization && !linux_refs);
+    }
+    /* A loss arriving after a successful scope check cannot be erased by
+     * publishing the stale admission result, or by capture activation.
+     */
+    prepare_delivery(true);
+    {
+        u64 epoch;
+        assert(!check_target_scope_locked(&epoch));
+        mark_scope_unavailable();
+        assert(admit_target_scope(epoch) == -ENODEV);
+        assert(h.target_unavailable && h.block_initialization && !h.replay.enabled);
+        activate_capture();
+        assert(h.phase == QUIESCED && !h.replay.enabled);
+        h.block_initialization = false; /* The loss marker independently refuses startup. */
+        h.original_start = ordinary_start;
+        h.starting_calls = 1;
+        assert(guarded_start(NULL, NULL) == -EBUSY && !ordinary_starts);
+    }
+}
 int main(void)
 {
     test_actual_drain();
@@ -668,6 +781,8 @@ int main(void)
     test_actual_pm_admission();
     test_actual_build_id_admission();
     test_actual_waiting_for_uuid();
+    test_actual_scope_resume();
+    puts("PASS: production scope-loss resume refusal, eligible cold WAITING, recovery and concurrent-loss admission");
     puts("PASS: compiled production restoration/recovery and failed retirement/replacement/address-reuse and two-state stock/patched delivery and PM/build-ID admission paths");
     return 0;
 }

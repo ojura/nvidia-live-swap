@@ -175,6 +175,16 @@ stale requests retain the helper's diagnostic state until explicit
 unsupported cached legacy-method state instead retains ownership and reports
 that removal may wait.
 
+After scope loss, `resume` requests a new check but does not mark the target
+available or permit initialization. The worker checks the selected device and
+single-GPU inventory under device/lifecycle locks, then checks its LIVE NVIDIA
+instance and setup prerequisites. Only successful admission clears the startup
+block. A removed target or unsupported inventory stays `unavailable` and blocked;
+`waiting` is reserved for an eligible target that needs ordinary initialization.
+`starting` reports an admission attempt in progress. PCI loss is published with
+a counter under the private lock, so a concurrent loss cannot be erased by an
+older successful check. Capture activation also respects the loss marker.
+
 Failed hook retirement blocks `resume` and every new attachment, including
 automatic post-PM reattachment and a replacement NVIDIA module that reuses the old module address. The helper
 disables and drains redirects before clearing every old NVIDIA function pointer.
@@ -453,6 +463,9 @@ pinning, guard admission, symbol invalidation, real disabled handlers/drain,
 PM prepare/post, resume work, attachment and retirement-retry bodies with mocked
 kernel operations. It checks failed unregistration followed by replacement
 and manual recovery, including address reuse and preserved independent faults.
+The actual bus notifier, resume request, preparation and initializer bodies also
+test startup refusal after second-GPU/target loss, eligible cold waiting, later
+recovery and rejection of a stale admission result after concurrent loss.
 The drain model records disabled redirects, both grace periods, reservation
 waits, work joining and final invalidation, checking old callable pointers and
 arguments throughout. A deliberately premature-invalidation mutation must fail.
