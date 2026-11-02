@@ -12,6 +12,7 @@ modules:
 check: tests/state_test
 	./tests/state_test
 	python3 -I -B tests/check_control.py
+	python3 -I -B tests/check_checker.py
 
 tests/state_test: tests/state_test.c state.h lifecycle.h text.h
 	$(CC) $(HOSTCFLAGS) $< -o $@

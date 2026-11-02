@@ -81,6 +81,56 @@ def check_kernel_sources(texts):
     assert 'psr_nv_acpi_object = NULL' in body and 'nvpcf_nv_acpi_object = NULL' in body
 
 
+def closing_delimiter(text, opening, left, right):
+    assert text[opening] == left
+    depth = 1
+    for end in range(opening + 1, len(text)):
+        depth += (text[end] == left) - (text[end] == right)
+        if depth == 0:
+            return end
+    raise AssertionError('unbalanced source delimiter')
+
+
+def compact(text):
+    return re.sub(r'\s+', '', text)
+
+
+def check_dispatch_source(text, notification):
+    signature, body, _ = function(text, 'gpuNotifySubDeviceEvent_IMPL')
+    assert signature == ('voidgpuNotifySubDeviceEvent_IMPL(OBJGPU*pGpu,NvU32notifyIndex,'
+                         'void*pNotifyParams,NvU32notifyParamsSize,NvV32info32,NvV16info16)')
+    loop = re.search(r'\bfor\s*\(', body)
+    assert loop, 'missing normal dispatch loop'
+    # Validate the actual assertions and their placement, not substrings that
+    # could also occur in a condition excluding NVPCF or requiring ISR context.
+    prelude = (
+        '{PEVENTNOTIFICATION pEventNotification;THREAD_STATE_NODE *pCurThread;'
+        'NvU32 localNotifyType;NvU32 localInfo32;NvU32 i;'
+        'if(NV_OK==threadStateGetCurrent(&pCurThread,pGpu)){'
+        'NV_ASSERT_OR_RETURN_VOID(!(pCurThread->flags & THREAD_STATE_FLAGS_IS_ISR_LOCKLESS));}'
+        'NV_ASSERT_OR_RETURN_VOID(notifyIndex < NV2080_NOTIFIERS_MAXCOUNT);'
+    )
+    assert compact(body[:loop.start()]) == compact(prelude), 'dispatcher pre-loop conditions changed'
+    opening = body.index('(', loop.start())
+    end = closing_delimiter(body, opening, '(', ')')
+    assert compact(body[opening + 1:end]) == 'i=0;i<pGpu->numSubdeviceBackReferences;i++', 'dispatcher loop condition changed'
+    block = end + 1
+    while body[block].isspace():
+        block += 1
+    assert body[block] == '{'
+    block_end = closing_delimiter(body, block, '{', '}')
+    assert body[block_end + 1:].strip() == '}', 'unexpected post-loop control flow'
+    returns = re.findall(r'\b([A-Z_]*RETURN[A-Z_]*)\s*\(', body)
+    assert returns == ['NV_ASSERT_OR_RETURN_VOID', 'NV_ASSERT_OR_RETURN_VOID']
+    assert not re.search(r'\breturn\b', body), 'explicit dispatcher early return needs inspection'
+    for call in ('_gpuFilterSubDeviceEventInfo', 'notifyFillNotifierMemory', 'osEventNotificationWithInfo'):
+        assert re.search(r'\b' + call + r'\s*\(', body), call
+    index = int(re.search(r'#define\s+NV2080_NOTIFIERS_NVPCF_EVENTS\s+\((\d+)\)', notification)[1])
+    maximum = int(re.search(r'#define\s+NV2080_NOTIFIERS_MAXCOUNT\s+\((\d+)\)', notification)[1])
+    assert index == 177 and index < maximum
+    return index, maximum
+
+
 def check_sources(texts):
     check_kernel_sources(texts)
     signature, body, line = function(texts['acpi'], 'nv_acpi_nvpcf_event')
@@ -89,19 +139,9 @@ def check_sources(texts):
     assert re.search(r'#define\s+ACPI_NVPCF_EVENT_CHANGE\s+0xC0', texts['acpi'])
     signature, _, _ = function(texts['nv'], 'nv_pmops_runtime_resume')
     assert signature == 'intnv_pmops_runtime_resume(structdevice*dev)'
-    signature, body, _ = function(texts['dispatch'], 'gpuNotifySubDeviceEvent_IMPL')
-    assert signature == ('voidgpuNotifySubDeviceEvent_IMPL(OBJGPU*pGpu,NvU32notifyIndex,'
-                         'void*pNotifyParams,NvU32notifyParamsSize,NvV32info32,NvV16info16)')
-    assert body.count('NV_ASSERT_OR_RETURN_VOID') == 2
-    assert 'THREAD_STATE_FLAGS_IS_ISR_LOCKLESS' in body
-    assert 'notifyIndex < NV2080_NOTIFIERS_MAXCOUNT' in body
-    assert not re.search(r'\breturn\b', body), 'new explicit dispatcher early return needs inspection'
-    for call in ('_gpuFilterSubDeviceEventInfo', 'notifyFillNotifierMemory', 'osEventNotificationWithInfo'):
-        assert call in body
-    index = int(re.search(r'#define\s+NV2080_NOTIFIERS_NVPCF_EVENTS\s+\((\d+)\)', texts['notification'])[1])
-    maximum = int(re.search(r'#define\s+NV2080_NOTIFIERS_MAXCOUNT\s+\((\d+)\)', texts['notification'])[1])
-    assert index == 177 and index < maximum
+    index, maximum = check_dispatch_source(texts['dispatch'], texts['notification'])
     _, body, _ = function(texts['osapi'], 'rm_acpi_nvpcf_notify')
+    assert 'threadStateInit(&threadState,THREAD_STATE_FLAGS_NONE);' in compact(body)
     for expected in ('THREAD_STATE_FLAGS_NONE', 'rmapiLockAcquire', 'gpumgrGetGpu(0)',
                      'os_ref_dynamic_power', 'gpuNotifySubDeviceEvent', 'os_unref_dynamic_power'):
         assert expected in body
@@ -124,30 +164,63 @@ def check_sources(texts):
     return f'kernel-client ownership, teardown, UUID, callback/dispatcher declarations and control flow; event index {index} < {maximum}'
 
 
-# ELF checks intentionally verify call boundaries separately from C declarations.
+# ELF checks verify exact call entries separately from source declarations.
+def direct_call_to_entry(code, caller, target, symbols, entry_only=False):
+    lines = code.splitlines()
+    entry = symbols[caller]
+    # ENDBR is an optional entry prefix, not permission to skip instrumentation.
+    endbr = re.search(r'(?m)^\s*' + format(entry, 'x') +
+                      r':\s+f3\s+0f\s+1e\s+fa\s+endbr64\s*$', code)
+    instrumented_entry = entry + (4 if endbr else 0)
+    instruction = re.compile(
+        r'^\s*([0-9a-fA-F]+):\s+e8(?:\s+[0-9a-fA-F]{2}){4}\s+'
+        r'callq?\s+([0-9a-fA-F]+)\s+<([^>]+)>\s*$')
+    relocation = re.compile(
+        r'^\s*([0-9a-fA-F]+):\s+(R_\S+)\s+(\S+)\s*$')
+    for position, line in enumerate(lines):
+        call = instruction.match(line)
+        if not call:
+            continue
+        address, destination = int(call[1], 16), int(call[2], 16)
+        if entry_only and address != instrumented_entry:
+            continue
+        reloc = relocation.match(lines[position + 1]) if position + 1 < len(lines) else None
+        if reloc:
+            # For E8 disp32, P is call+1 and RIP is call+5. S-4-P+RIP=S.
+            # Another addend or a relocation on another byte does not prove S.
+            if (reloc[2] in ('R_X86_64_PLT32', 'R_X86_64_PC32') and
+                    int(reloc[1], 16) == address + 1 and reloc[3] == target + '-0x4'):
+                return True
+            continue
+        if target in symbols and call[3] == target and destination == symbols[target]:
+            return True
+    return False
+
+
 def check_module(name):
-    symbols = subprocess.check_output(['nm', '--defined-only', str(name)], text=True)
+    table = subprocess.check_output(['nm', '--defined-only', str(name)], text=True)
+    symbols = {match[2]: int(match[1], 16) for match in re.finditer(
+        r'(?m)^([0-9a-fA-F]+) [tT] (\S+)$', table)}
     targets = ('nv_open_device', 'nv_start_device', 'nv_shutdown_adapter',
                'nv_acpi_methods_uninit', 'nv_acpi_nvpcf_event', 'nvidia_dev_get_uuid',
                'nvidia_dev_put_uuid', 'nvidia_modeset_rm_ops_alloc_stack',
-               'nvidia_modeset_rm_ops_free_stack')
+               'nvidia_modeset_rm_ops_free_stack', 'nv_stop_device', 'nv_close_device')
     for target in targets:
-        assert re.search(r'(?m)^[0-9a-fA-F]+ [tT] ' + target + r'$', symbols), target
+        assert target in symbols, target
+
     def disassemble(target):
         return subprocess.check_output(
             ['objdump', '-dr', '--disassemble=' + target, str(name)], text=True)
+
     for target in ('nv_open_device', 'nv_start_device', 'nv_shutdown_adapter', 'nv_acpi_nvpcf_event'):
-        assert '__fentry__' in disassemble(target), target
+        assert direct_call_to_entry(disassemble(target), target, '__fentry__', symbols,
+                                    entry_only=True), ('missing entry instrumentation', target)
     for caller, callee in [('nvidia_dev_get_uuid', 'nv_open_device'),
                            ('nvidia_dev_put_uuid', 'nv_close_device'),
                            ('nv_open_device', 'nv_start_device'),
                            ('nv_stop_device', 'nv_shutdown_adapter')]:
-        code = disassemble(caller)
-        direct = re.search(r'\bcall\b[^\n]*<' + callee + r'[^>]*>', code)
-        relocated = re.search(r'\bcall\b[^\n]*\n\s*[0-9a-f]+: R_X86_64_PLT32\s+'
-                              + callee + r'-0x4', code)
-        assert direct or relocated, (caller, callee)
-    print('PASS: linked NVIDIA module has ownership/allocator/guard symbols, fentry and required call boundaries:', name)
+        assert direct_call_to_entry(disassemble(caller), caller, callee, symbols), (caller, callee)
+    print('PASS: linked NVIDIA module has ownership/allocator/guard symbols, entry fentry and exact entry calls:', name)
 
 
 

@@ -357,8 +357,14 @@ portable suite also passes AddressSanitizer and UndefinedBehaviorSanitizer.
 
 These tests execute shared logic and model kernel ordering. They do not execute
 kernel attachment, ACPI, runtime PM or NVIDIA. The source checker reads archives
-without extracting or executing their code. ELF checks verify symbols,
-instrumentation and specified calls, separately from source C declarations.
+without extracting or executing their code. It validates both dispatcher
+assertion conditions, their placement before the normal dispatch loop and that
+loop's bounds. ELF checks require calls to exact symbol entries or corresponding
+PC32/PLT32 relocations on the call displacement with addend -4. They reject
+similarly named functions and nonzero offsets that could skip instrumentation.
+The tests assemble positive and negative ELF fixtures and mutate source
+conditions, including an assertion that excludes index 177. These checks remain
+separate from source C declarations; symbol tables do not validate C types.
 
 The module compiles against the three installed header targets above. Compiler
 name-string and missing pahole/vmlinux notices do not prevent module linking;
