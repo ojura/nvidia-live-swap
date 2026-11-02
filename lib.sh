@@ -1,4 +1,11 @@
-# Sourced by swap.sh and trace.sh, which set DIR to the repository directory.
+# Sourced by swap.sh, trace.sh and install-hook.sh, which set DIR to the
+# repository directory.
+
+# install-hook.sh installs these files of the repository in HOOK_LIB, and
+# swap.sh refuses to swap while an installed copy differs from the
+# repository's. load-hook.sh finds the other three next to itself.
+HOOK_LIB=/usr/local/lib/nvpcf-hook
+HOOK_TOOLS=(load-hook.sh hook/nvpcf-hookctl hook/tests/check_nvidia.py hook/tests/expected_dispatcher.c)
 
 # Print the PCI address of the NVIDIA GPU, the first display controller with
 # NVIDIA's vendor ID. This machine has only one.

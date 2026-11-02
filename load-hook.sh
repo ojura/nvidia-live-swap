@@ -2,12 +2,18 @@
 # Check an NVIDIA driver build, and load nvpcf_hook for it. Run as root.
 #
 # usage: load-hook.sh                 check the loaded nvidia and load the hook
+#        load-hook.sh --check-loaded  exit with status 0 if the loaded hook
+#                                     guards NVIDIA's shutdown and lets NVIDIA
+#                                     initialize the GPU
 #        load-hook.sh --check-disk [--no-download]
 #                                     check the nvidia module that modprobe
 #                                     would load, without loading anything,
 #                                     waking the GPU or changing a setting
 #        load-hook.sh --fetch VERSION download NVIDIA's source archive for
 #                                     VERSION into the cache
+#        load-hook.sh --build-id FILE print the GNU build ID of a module file
+#        load-hook.sh --loaded-build-id MODULE
+#                                     print the GNU build ID of a loaded module
 #
 # nvpcf_hook calls functions inside NVIDIA's driver, so it may attach only to
 # a driver build that check_nvidia.py has checked. The checks read three
@@ -33,21 +39,38 @@
 # After the checks pass, it loads nvpcf_hook with expected_nvidia_build_id
 # set to the checked build ID, and the hook refuses to attach to any other
 # build. The script exits with status 0 only if the hook then reports the
-# state active, or the state waiting with its guards installed and GPU
-# initialization allowed. If the hook is loaded already, the script only
-# checks its state.
+# state active or waiting, with its guards installed, GPU initialization
+# allowed and retirement_failed 0. If the hook is loaded already, the script
+# only checks that, as --check-loaded does.
+#
+# --build-id and --loaded-build-id print a build ID only if it is 1 to 64
+# bytes, the range that nvpcf_hook accepts, and exit with status 1 otherwise.
+# install-hook.sh and swap.sh read build IDs through them.
 #
 # The boot unit nvpcf-hook.service and swap.sh run the copy that
 # install-hook.sh puts in /usr/local/lib/nvpcf-hook, next to copies of
 # check_nvidia.py and nvpcf-hookctl.
 set -u
-usage() { echo "usage: load-hook.sh [--check-disk [--no-download] | --fetch VERSION]" >&2; exit 2; }
-mode=load download=1
+usage() {
+    echo "usage: load-hook.sh [--check-loaded | --check-disk [--no-download] | --fetch VERSION |" >&2
+    echo "                     --build-id FILE | --loaded-build-id MODULE]" >&2
+    exit 2
+}
+mode=load download=1 arg=
 case "$*" in
     '') ;;
+    --check-loaded) mode=check-loaded ;;
     --check-disk) mode=check-disk ;;
     '--check-disk --no-download') mode=check-disk download=0 ;;
-    *) [ $# = 2 ] && [ "$1" = --fetch ] || usage; mode=fetch ;;
+    *)
+        [ $# = 2 ] || usage
+        case $1 in
+            --fetch) mode=fetch ;;
+            --build-id) mode=build-id ;;
+            --loaded-build-id) [[ $2 =~ ^[A-Za-z0-9_]+$ ]] || usage; mode=loaded-build-id ;;
+            *) usage ;;
+        esac
+        arg=$2 ;;
 esac
 here=$(cd "$(dirname "$0")" && pwd)
 CHECKER=$here/check_nvidia.py HOOKCTL=$here/nvpcf-hookctl
@@ -55,7 +78,9 @@ CHECKER=$here/check_nvidia.py HOOKCTL=$here/nvpcf-hookctl
 [ -e "$HOOKCTL" ] || HOOKCTL=$here/hook/nvpcf-hookctl
 CACHE=/var/cache/nvpcf-hook
 
-log() { echo "load-hook.sh: $*"; }
+# Messages go to stderr, so that the build ID is all that --build-id and
+# --loaded-build-id print on stdout.
+log() { echo "load-hook.sh: $*" >&2; }
 fail() { log "$*"; exit 1; }
 temps=()
 trap 'rm -f "${temps[@]}"' EXIT
@@ -137,23 +162,39 @@ check_build() {
 }
 
 hook_loaded() { grep -q '^nvpcf_hook ' /proc/modules; }
-# Exit status 0 if the hook's state is active, or waiting with its guards
-# installed and GPU initialization allowed.
+field() { sed -n "s/^$2: //p" <<<"$1"; }
+# Exit status 0 if the hook's state is active or waiting, with its guards
+# installed, GPU initialization allowed and retirement_failed 0. Then the
+# guard covers NVIDIA's shutdown, and loading NVIDIA's other modules or
+# starting a service that initializes the GPU is safe.
 hook_usable() {
-    local s state
+    local s
     s=$("$HOOKCTL" status 2>&1) || { log "cannot read the status of nvpcf_hook: $s"; return 1; }
-    state=$(sed -n 's/^state: //p' <<<"$s")
-    log "nvpcf_hook is $state, last_error $(sed -n 's/^last_error: //p' <<<"$s")"
-    [ "$state" = active ] && return 0
-    [ "$state" = waiting ] && [ "$(sed -n 's/^guards_registered: //p' <<<"$s")" = 1 ] &&
-        [ "$(sed -n 's/^initialization_blocked: //p' <<<"$s")" = 0 ]
+    log "nvpcf_hook is $(field "$s" state), guards_registered $(field "$s" guards_registered)," \
+        "initialization_blocked $(field "$s" initialization_blocked)," \
+        "retirement_failed $(field "$s" retirement_failed), last_error $(field "$s" last_error)"
+    case $(field "$s" state) in active|waiting) ;; *) return 1 ;; esac
+    [ "$(field "$s" guards_registered)" = 1 ] && [ "$(field "$s" initialization_blocked)" = 0 ] &&
+        [ "$(field "$s" retirement_failed)" = 0 ]
 }
 
 case $mode in
     fetch)
-        fetch "$2"
-        log "NVIDIA's $2 source archive is in $CACHE"
+        fetch "$arg"
+        log "NVIDIA's $arg source archive is in $CACHE"
         exit 0 ;;
+    build-id)
+        module_copy "$arg" || fail "cannot read $arg"
+        copy_build_id "$copy" || fail "$arg has no GNU build ID of 1 to 64 bytes"
+        exit 0 ;;
+    loaded-build-id)
+        note_build_id "/sys/module/$arg/notes/.note.gnu.build-id" ||
+            fail "cannot read a GNU build ID of 1 to 64 bytes for the loaded module $arg"
+        exit 0 ;;
+    check-loaded)
+        hook_loaded || fail "nvpcf_hook is not loaded"
+        hook_usable
+        exit ;;
     check-disk)
         # The version and the build ID come from the copy that is checked, so
         # that a package replaced meanwhile cannot pair one file with another

@@ -5,12 +5,17 @@ registration files.
 
 Every command that changes the system (mv, systemctl, runuser for
 reapply-layout.py, setsid and python3 for revoke.py, rmmod, modprobe,
-nvpcf-hookctl for anything but status, and load-hook.sh for anything but
---check-disk) is a mock. Most are placed first on PATH. nvpcf-hookctl is in the
-copied scripts' hook directory, and load-hook.sh where swap.sh looks for the
-installed copy. The mock load-hook.sh loads nvpcf_hook; r['modprobe'] lists
-those loads as nvpcf_hook among the modprobe calls, and swap.sh must never
-run modprobe nvpcf_hook itself. The test runs copies of
+nvpcf-hookctl for anything but status, and load-hook.sh without arguments) is
+a mock. Most are placed first on PATH. nvpcf-hookctl is in the copied
+scripts' hook directory, and load-hook.sh where swap.sh looks for the
+installed copy, next to the other installed tools. The repository's and the
+installed copies of the four tools are the same files, unless a case makes
+one differ. The mock load-hook.sh loads nvpcf_hook; r['modprobe'] lists those
+loads as nvpcf_hook among the modprobe calls, and swap.sh must never run
+modprobe nvpcf_hook itself. For --build-id and --loaded-build-id, the mock
+runs a copy of the real load-hook.sh, which parses the GNU notes that the mock
+writes for the loaded modules and the IDs that the mock readelf prints. A case
+can choose the length of these build IDs. The test runs copies of
 swap.sh and lib.sh, edited so that the files they read, write or rename under
 /sys, /proc, /run and /usr/share are the ones in the throwaway directory.
 swap.sh still looks in the real /dev, but only to test with [ -c ] which
@@ -28,7 +33,7 @@ becomes active when lactd.service starts and initializes the GPU.
 Loading nvidia_modeset, nvidia_drm or nvidia_uvm, or starting a service, can
 make NVIDIA initialize the GPU. The mock records each such step taken while
 the hook does not guard NVIDIA's shutdown, and every case fails if it finds
-one."""
+one. A hook with retirement_failed set does not guard, whatever its state."""
 import json
 import os
 from pathlib import Path
@@ -59,7 +64,7 @@ OLD_ID, DISK_ID, STALE_ID = 'aa' * 20, 'bb' * 20, 'cc' * 20
 MODIFYING = {'mv', 'systemctl', 'setsid', 'python3', 'rmmod', 'modprobe', 'runuser', 'nvpcf-hookctl', 'load-hook.sh'}
 
 MOCK = r'''#!/usr/bin/python3 -I
-import json, os, sys, time
+import json, os, struct, sys, time
 from pathlib import Path
 root = Path(os.environ['MOCK_ROOT'])
 cfg = json.loads((root / 'config.json').read_text())
@@ -78,11 +83,15 @@ def pause():
     time.sleep(30)
 def guarded(st):
     return ('nvpcf_hook' in loaded() and st['hook_state'] in ('active', 'waiting')
-            and st.get('hook_guards', 1) == 1)
+            and st.get('hook_guards', 1) == 1 and not st.get('hook_retirement_failed'))
+DISK_ID = cfg.get('build_id', 'bb' * 20)
 def set_build_id(m, hexid):
     d = root / 'sys/module' / m / 'notes'
     d.mkdir(parents=True, exist_ok=True)
-    (d / '.note.gnu.build-id').write_bytes(bytes.fromhex('040000001400000003000000474e5500' + hexid))
+    if m == cfg.get('note_missing'):
+        return
+    desc = bytes.fromhex(hexid)
+    (d / '.note.gnu.build-id').write_bytes(struct.pack('<III', 4, len(desc), 3) + b'GNU\0' + desc)
 if cmd == 'mv':
     a, b = Path(args[0]), Path(args[1])
     assert a.is_relative_to(root / 'files') and b.is_relative_to(root / 'files'), args
@@ -110,6 +119,12 @@ elif cmd == 'systemctl':
     if action == 'stop' and cfg.get('pause_after_stop'):
         pause()
 elif cmd == 'load-hook.sh':
+    if args and args[0] in ('--build-id', '--loaded-build-id'):
+        # The real python3 parses the notes; readelf stays the mock.
+        os.execve('/bin/bash', ['/bin/bash', str(root / 'real-load-hook.sh'), *args],
+                  dict(os.environ, PATH=f"{root}/loader-bin:/usr/bin:/bin"))
+    if args == ['--check-loaded']:
+        sys.exit(0 if guarded(load()) else 1)
     if args and args[0] == '--check-disk':
         if cfg.get('disk_check') == 'reject':
             print('load-hook.sh: check_nvidia.py rejects NVIDIA 615.71.09')
@@ -123,15 +138,14 @@ elif cmd == 'load-hook.sh':
     st = load()
     if 'nvpcf_hook' not in loaded():
         set_loaded(loaded() + ['nvpcf_hook'])
-        set_build_id('nvpcf_hook', 'bb' * 20)
+        set_build_id('nvpcf_hook', DISK_ID)
         if cfg.get('hook_waits_for_init') or cfg.get('hook_stays_waiting'):
             st['hook_state'], st['hook_error'] = 'waiting', -11
         else:
             st['hook_state'], st['hook_error'] = 'active', 0
         st['hook_guards'] = 0 if cfg.get('hook_no_guard_after_load') else 1
         save(st)
-    usable = st['hook_state'] == 'active' or (st['hook_state'] == 'waiting' and st['hook_guards'] == 1)
-    sys.exit(0 if usable else 1)
+    sys.exit(0 if guarded(st) else 1)
 elif cmd == 'nvpcf-hookctl':
     st = load()
     op = args[0]
@@ -148,12 +162,16 @@ elif cmd == 'nvpcf-hookctl':
         print(f"state: {st['hook_state']}\npci: 0000:01:00.0\nguards_registered: {guards}\n"
               f"initialization_blocked: {blocked}\npending_requests: 0\n"
               f"received_requests: 3\ndeferred_requests: 3\nrequests_dispatched: 3\n"
-              f"dispatch_failures: 0\nretirement_failed: {1 if cfg.get('hook_retirement_failed') else 0}\n"
+              f"dispatch_failures: 0\nretirement_failed: {1 if st.get('hook_retirement_failed') else 0}\n"
               f"last_error: {st['hook_error']}")
     elif op == 'prepare':
         if cfg.get('hook_prepare_fails') or st['hook_state'] == 'unavailable':
             refuse('[Errno 117] Structure needs cleaning')
     elif op == 'detach':
+        if cfg.get('retirement_fails_at_detach'):
+            st['hook_retirement_failed'] = True
+            save(st)
+            refuse('[Errno 16] Device or resource busy')
         if cfg.get('hook_detach_fails'):
             refuse('[Errno 11] Resource temporarily unavailable')
         st['hook_state'] = 'guard-only'
@@ -161,7 +179,7 @@ elif cmd == 'nvpcf-hookctl':
         if cfg.get('pause_after_detach'):
             pause()
     elif op == 'resume':
-        if st['hook_state'] == 'unavailable':
+        if st['hook_state'] == 'unavailable' or st.get('hook_retirement_failed'):
             refuse('[Errno 117] Structure needs cleaning')
         if st['hook_state'] != 'active':
             st['hook_state'], st['hook_guards'] = 'waiting', 1
@@ -224,7 +242,7 @@ elif cmd == 'modprobe':
         sys.exit(1)
     if m not in loaded():
         set_loaded(loaded() + [m])
-        set_build_id(m, 'cc' * 20 if cfg.get('stale_module') == m else 'bb' * 20)
+        set_build_id(m, 'cc' * 20 if cfg.get('stale_module') == m else DISK_ID)
         if m == 'nvpcf_hook':
             st = load()
             if cfg.get('hook_waits_for_init') or cfg.get('hook_stays_waiting'):
@@ -242,7 +260,7 @@ elif cmd == 'nm':
         print('0000000000000000 T RmDeferNvpcfNotifyIfIdle')
     print('0000000000000000 T nv_acpi_nvpcf_event')
 elif cmd == 'readelf':
-    print('    Build ID: ' + 'bb' * 20)
+    print('    Build ID: ' + DISK_ID)
 elif cmd == 'runuser':
     st = load()
     if cfg.get('reapply_releases', True) and cfg.get('reapply_rc', 0) == 0:
@@ -312,7 +330,7 @@ def build_tree(root, nvidia_drm, patched, leftover, connected=False, hook=False)
 
 def rewrite(text, root):
     text = text.replace('/run/nvidia-live-swap.last', str(root / 'last-swap'))
-    text = text.replace('/usr/local/lib/nvpcf-hook/', f'{root}/lib-nvpcf-hook/')
+    text = text.replace('/usr/local/lib/nvpcf-hook', f'{root}/lib-nvpcf-hook')
     for f in HIDE:
         text = text.replace(f, str(root / 'files' / f.lstrip('/')))
     return text.replace('/proc/', f'{root}/proc/').replace('/sys/', f'{root}/sys/')
@@ -338,17 +356,31 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
     (root / 'state.json').write_text(json.dumps({
         'kms_holders': list(kms_holders), 'holders': list(holders), 'revoked': [],
         'active': {'lactd.service': True}, 'hook_state': hook or 'absent', 'hook_error': 0,
-        'unguarded': []}))
+        'hook_retirement_failed': bool(cfg.get('hook_retirement_failed')), 'unguarded': []}))
     (root / 'calls.jsonl').write_text('')
     script_dir = root / 'scripts'
     script_dir.mkdir()
     for f in ('swap.sh', 'lib.sh'):
         (script_dir / f).write_text(rewrite((SRC / f).read_text(), root))
-    (script_dir / 'hook').mkdir()
+    (script_dir / 'hook/tests').mkdir(parents=True)
     (script_dir / 'hook' / 'nvpcf-hookctl').symlink_to(mock)
-    (root / 'lib-nvpcf-hook').mkdir()
-    if not cfg.get('loader_missing'):
-        (root / 'lib-nvpcf-hook' / 'load-hook.sh').symlink_to(mock)
+    (script_dir / 'load-hook.sh').symlink_to(mock)
+    lib = root / 'lib-nvpcf-hook'
+    lib.mkdir()
+    (lib / 'nvpcf-hookctl').symlink_to(mock)
+    if cfg.get('loader_not_executable'):
+        shutil.copy(mock, lib / 'load-hook.sh')
+        (lib / 'load-hook.sh').chmod(0o644)
+    elif not cfg.get('loader_missing'):
+        (lib / 'load-hook.sh').symlink_to(mock)
+    for f in ('check_nvidia.py', 'expected_dispatcher.c'):
+        shutil.copy(SRC / 'hook/tests' / f, script_dir / 'hook/tests' / f)
+        shutil.copy(SRC / 'hook/tests' / f, lib / f)
+    if cfg.get('installed_tool_differs'):
+        (lib / 'check_nvidia.py').write_text('# an older checker\n')
+    (root / 'real-load-hook.sh').write_text(rewrite((SRC / 'load-hook.sh').read_text(), root))
+    (root / 'loader-bin').mkdir()
+    (root / 'loader-bin' / 'readelf').symlink_to(mock)
     env = dict(os.environ, PATH=f'{root}/bin:/usr/bin:/bin', MOCK_ROOT=str(root))
     p = subprocess.Popen(['/bin/bash', str(script_dir / 'swap.sh'), *args], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -370,7 +402,7 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
         if c == 'nvpcf-hookctl':
             return a[0] != 'status'
         if c == 'load-hook.sh':
-            return not a or a[0] != '--check-disk'
+            return not a
         return c in MODIFYING
     changes = [f'hookctl {a[0]}' if c == 'nvpcf-hookctl' else c for c, a in calls if changing(c, a)]
     r = {
@@ -390,7 +422,7 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
         'rmmod': [a[0] for c, a in calls if c == 'rmmod'],
         'modprobe': [a[0] if c == 'modprobe' else 'nvpcf_hook' for c, a in calls
                      if c == 'modprobe' or (c == 'load-hook.sh' and not a)],
-        'disk_checks': [a for c, a in calls if c == 'load-hook.sh' and a],
+        'disk_checks': [a for c, a in calls if c == 'load-hook.sh' and a and a[0] == '--check-disk'],
         'hidden': sorted(str(x) for x in (root / 'files').rglob('*.hotswap')),
         'lactd_active': st['active'].get('lactd.service'),
         'loaded': [l.split()[0] for l in (root / 'proc/modules').read_text().splitlines()],
@@ -638,6 +670,32 @@ check(r, r['exit'] == 1 and 'could not remove its interception' in r['out'] and 
       f"exits with status 1, names the failed removal and the command that retries it, got status {r['exit']}")
 expect_untouched(r)
 
+r = run('hook-active-retirement-failed', dict(UNPATCHED, hook_retirement_failed=True), holders=[777], patched=False)
+check(r, r['exit'] == 1 and 'could not remove its interception' in r['out'] and '(state active,' in r['out'],
+      f"refuses an active hook whose retirement failed, got status {r['exit']}")
+expect_untouched(r)
+
+r = run('retirement-fails-at-detach', dict(UNPATCHED, retirement_fails_at_detach=True), holders=[777], patched=False)
+check(r, r['exit'] == 1 and r['rmmod'] == [] and r['hookctl'] == ['prepare', 'detach', 'resume'],
+      f"stops after the failed detach and tries to resume the hook, got status {r['exit']} and {r['hookctl']}")
+check(r, r['lactd_active'] is False and 'not started again: lactd.service' in r['out'] and r['hidden'] == [],
+      "moves the files back, but leaves lactd.service stopped while the hook reports active with retirement_failed, and says so")
+
+r = run('installed-tool-differs', dict(SVC, installed_tool_differs=True), holders=[777])
+check(r, r['exit'] == 1 and 'lib-nvpcf-hook/check_nvidia.py differs from' in r['out'] and 'install-hook.sh' in r['out'],
+      f"refuses while an installed tool differs from the repository's, and names install-hook.sh, got status {r['exit']}")
+expect_untouched(r)
+
+for size in (16, 32, 64):
+    r = run(f'build-id-{size}-bytes', dict(SVC, build_id='a5' * size), holders=[777])
+    check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'),
+          f"compares {size}-byte build IDs and ends with END, got status {r['exit']}")
+
+r = run('loaded-build-id-missing', dict(SVC, note_missing='nvidia_uvm'), holders=[777])
+check(r, r['exit'] == 1 and 'cannot read the build ID of the loaded nvidia_uvm' in r['out']
+      and r['out'].rstrip().endswith('END (failed)'),
+      f"reports the unreadable build ID instead of comparing it, got status {r['exit']}")
+
 r = run('hook-detached', UNPATCHED, holders=[777], patched=False, hook='detached')
 check(r, r['exit'] == 1 and 'nvpcf-hookctl resume, or unload it and load it again' in r['out'],
       f"exits with status 1 and says how to attach the hook again, got status {r['exit']}"); expect_untouched(r)
@@ -724,8 +782,12 @@ r = run('swap-uncached', dict(SVC, disk_check='uncached'), holders=[777])
 check(r, r['exit'] == 0 and r['disk_checks'] == [['--check-disk']],
       f"lets a swap download the archive before its first change, got status {r['exit']} and {r['disk_checks']}")
 
+r = run('loader-not-executable', dict(SVC, loader_not_executable=True), holders=[777])
+check(r, r['exit'] == 1 and 'lib-nvpcf-hook/load-hook.sh is not executable' in r['out'] and r['disk_checks'] == [],
+      f"refuses an installed loader without its executable bit, got status {r['exit']}"); expect_untouched(r)
+
 r = run('loader-missing', dict(SVC, loader_missing=True), holders=[777])
-check(r, r['exit'] == 1 and 'load-hook.sh is missing; install-hook.sh installs it' in r['out'],
+check(r, r['exit'] == 1 and 'lib-nvpcf-hook/load-hook.sh is missing; sudo' in r['out'] and 'install-hook.sh installs it' in r['out'],
       f"exits with status 1 when the loader is not installed, got status {r['exit']}"); expect_untouched(r)
 
 r = run('service-start-fails', dict(SVC, start_fails=True), holders=[777])

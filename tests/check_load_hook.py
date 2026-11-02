@@ -9,8 +9,17 @@ script, where the installed script finds its copies. A mock module file
 holds its build ID and version as text, which the mock readelf and modinfo
 report for that file, so the cases can tell which file the script checked
 and where a version came from. Asked for nvidia's version by name, the mock
-modinfo answers with a different version, which a case would notice. The loaded nvidia's build ID is a real
-GNU note under the throwaway /sys/module, which the script parses itself."""
+modinfo answers with a different version, which a case would notice. The
+loaded nvidia's build ID is a real GNU note under the throwaway /sys/module,
+which the script parses itself.
+
+The cases for --build-id and --loaded-build-id read the script's stdout
+apart from its messages on stderr, and check that it prints IDs of 16, 20, 32
+and 64 bytes in lowercase, and refuses an ID of 0 or 65 bytes, a file
+without an ID, a missing file, and a loaded module without a note. The cases
+for --check-loaded and for the end of a load check that the hook counts as
+usable only when it is active or waiting, with its guards registered, GPU
+initialization allowed and retirement_failed 0."""
 import json
 import os
 from pathlib import Path
@@ -98,8 +107,9 @@ elif cmd == 'check_nvidia.py':
     sys.exit(1 if cfg.get('checker_fails') else 0)
 elif cmd == 'nvpcf-hookctl':
     st = load()
-    state, guards, blocked = st['hook']
-    print(f'state: {state}\nguards_registered: {guards}\ninitialization_blocked: {blocked}\nlast_error: 0')
+    state, guards, blocked, *rest = st['hook']
+    print(f'state: {state}\nguards_registered: {guards}\ninitialization_blocked: {blocked}\n'
+          f'retirement_failed: {rest[0] if rest else 0}\nlast_error: 0')
 '''
 
 failures = []
@@ -169,11 +179,12 @@ def run(name, cfg=None, args=(), nvidia_loaded=True, hook_loaded=False, disk_id=
         (root / 'state.json').write_text(json.dumps({'hook': cfg.get('hook_before', ['active', 1, 0]),
                                                      'checked': None}))
     env = dict(os.environ, PATH=f'{root}/bin:/usr/bin:/bin', MOCK_ROOT=str(root))
+    args = [a.format(root=root) for a in args]
     p = subprocess.run(['/bin/bash', str(scripts / 'load-hook.sh'), *args], env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
     calls = [json.loads(l) for l in (root / 'calls.jsonl').read_text().splitlines()]
     st = json.loads((root / 'state.json').read_text())
-    return {'case': name, 'exit': p.returncode, 'out': p.stdout,
+    return {'case': name, 'exit': p.returncode, 'out': p.stdout + p.stderr, 'stdout': p.stdout,
             'modprobe': [a for c, a in calls if c == 'modprobe'],
             'curl': [a for c, a in calls if c == 'curl'],
             'checker': [a for c, a in calls if c == 'check_nvidia.py'],
@@ -236,15 +247,60 @@ r = run('hook-load-fails', {'hook_load_fails': True})
 check(r, r['exit'] == 1 and 'could not load nvpcf_hook' in r['out'], f"exits with status 1, got {r['exit']}")
 
 for state, ok in ((['waiting', 1, 0], True), (['waiting', 0, 0], False), (['waiting', 1, 1], False),
+                  (['active', 0, 0], False), (['active', 1, 1], False), (['active', 1, 0, 1], False),
+                  (['waiting', 1, 0, 1], False),
                   (['quiesced', 1, 0], False), (['guard-only', 1, 1], False), (['unavailable', 0, 1], False)):
-    r = run(f"state-{state[0]}-{state[1]}{state[2]}", {'hook_after_load': state})
+    r = run('state-' + '-'.join(map(str, state)), {'hook_after_load': state})
     check(r, (r['exit'] == 0) == ok,
-          f"exits with status {0 if ok else 1} when the hook ends {state[0]} with guards {state[1]} and "
-          f"initialization blocked {state[2]}, got {r['exit']}")
+          f"exits with status {0 if ok else 1} when the hook ends {state[0]} with guards {state[1]}, "
+          f"initialization blocked {state[2]} and retirement_failed {state[3] if len(state) > 3 else 0}, got {r['exit']}")
 
 r = run('already-loaded', hook_loaded=True)
 check(r, r['exit'] == 0 and r['modprobe'] == [] and r['checker'] == [],
       f"only reads the state of a loaded hook, got status {r['exit']} and {r['modprobe']}")
+
+r = run('check-loaded', args=('--check-loaded',), hook_loaded=True)
+check(r, r['exit'] == 0 and r['modprobe'] == [] and r['checker'] == [] and r['curl'] == [],
+      f"only reads the state of a usable hook, got status {r['exit']}, {r['modprobe']} and {r['checker']}")
+
+r = run('check-loaded-retirement-failed', {'hook_before': ['active', 1, 0, 1]}, args=('--check-loaded',), hook_loaded=True)
+check(r, r['exit'] == 1 and 'retirement_failed 1' in r['out'],
+      f"exits with status 1 for an active hook with retirement_failed 1, and says so, got status {r['exit']}")
+
+r = run('check-loaded-not-loaded', args=('--check-loaded',))
+check(r, r['exit'] == 1 and 'nvpcf_hook is not loaded' in r['out'] and r['modprobe'] == [],
+      f"exits with status 1 without loading anything, got status {r['exit']} and {r['modprobe']}")
+
+DISK = '{root}/lib/modules/' + RUNNING + '/updates/dkms/nvidia.ko.zst'
+for size in (16, 20, 32, 64):
+    hexid = bytes(range(size)).hex()
+    r = run(f'build-id-{size}-bytes', args=('--build-id', DISK), disk_id=hexid.upper())
+    check(r, r['exit'] == 0 and r['stdout'] == hexid + '\n',
+          f"prints the {size}-byte build ID in lowercase and nothing else, got status {r['exit']} and {r['stdout']!r}")
+    r = run(f'loaded-build-id-{size}-bytes', {'loaded_id': hexid}, args=('--loaded-build-id', 'nvidia'))
+    check(r, r['exit'] == 0 and r['stdout'] == hexid + '\n',
+          f"prints the loaded {size}-byte build ID and nothing else, got status {r['exit']} and {r['stdout']!r}")
+
+for name, disk_id in (('build-id-65-bytes', 'ab' * 65), ('build-id-missing', None)):
+    r = run(name, args=('--build-id', DISK), disk_id=disk_id)
+    check(r, r['exit'] == 1 and r['stdout'] == '',
+          f"exits with status 1 and prints no build ID, got status {r['exit']} and {r['stdout']!r}")
+
+r = run('build-id-no-file', args=('--build-id', '{root}/no-such-module.ko'))
+check(r, r['exit'] == 1 and r['stdout'] == '', f"exits with status 1 for a missing file, got status {r['exit']}")
+
+for name, loaded_id in (('loaded-build-id-0-bytes', ''), ('loaded-build-id-65-bytes', 'ab' * 65)):
+    r = run(name, {'loaded_id': loaded_id}, args=('--loaded-build-id', 'nvidia'))
+    check(r, r['exit'] == 1 and r['stdout'] == '',
+          f"exits with status 1 and prints no build ID, got status {r['exit']} and {r['stdout']!r}")
+
+r = run('loaded-build-id-no-note', args=('--loaded-build-id', 'nvidia'), nvidia_loaded=False)
+check(r, r['exit'] == 1 and r['stdout'] == '' and r['modprobe'] == [],
+      f"exits with status 1 for a module without a note, without loading it, got status {r['exit']}")
+
+for name, args in (('loaded-build-id-path', ('--loaded-build-id', '../nvidia')), ('build-id-without-file', ('--build-id',))):
+    r = run(name, args=args)
+    check(r, r['exit'] == 2, f"exits with status 2 for the arguments {args}, got {r['exit']}")
 
 r = run('already-loaded-unusable', {'hook_before': ['unavailable', 0, 1]}, hook_loaded=True)
 check(r, r['exit'] == 1, f"exits with status 1 for a loaded hook that is unavailable, got {r['exit']}")
