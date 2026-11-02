@@ -28,10 +28,11 @@
 # module, because DKMS replaces the file before it runs depmod, and removes
 # the new file when depmod fails. After a failed install or check, the script
 # installs the kernel's previous version again from DKMS's build of it, checks
-# it in the same way, and reports whether that worked. It keeps the previous
-# version's registration, source and builds in both cases. Afterwards it
-# removes every older version that is not installed for any kernel, unless a
-# failed kernel had it installed.
+# it in the same way, and reports whether that worked. Older versions that no
+# kernel has installed are removed only by a run in which every target kernel
+# ends with this version installed and checked. After a failure they stay,
+# also through later runs that find the failed kernel without any installed
+# version, so that dkms install can still put one of their builds back.
 #
 # It installs load-hook.sh, check_nvidia.py, expected_dispatcher.c and
 # nvpcf-hookctl as root-owned copies in /usr/local/lib/nvpcf-hook, and enables
@@ -107,7 +108,7 @@ hook_status=$(dkms status nvpcf-hook) || fail "dkms status nvpcf-hook failed"
 running=$(uname -r)
 mapfile -t kernels < <({ printf '%s\n' "$status" | sed -nE 's#^nvidia/[0-9.]+, ([^,]+),.*#\1#p'; echo "$running"; } | sort -u)
 mapfile -t versions < <(printf '%s\n' "$status" | sed -nE 's#^nvidia/([0-9.]+)[,:].*#\1#p' | sort -u)
-targets=() skipped=() failed=() keep=()
+targets=() skipped=() failed=()
 for k in "${kernels[@]}"; do
     if [ -d "/lib/modules/$k/build" ]; then targets+=("$k"); else skipped+=("$k"); fi
 done
@@ -154,10 +155,9 @@ for k in "${targets[@]}"; do
     dkms install -m nvpcf-hook -v "$ver" -k "$k" --force && installed_is "$ver" "$k" && continue
     failed+=("$k: installing nvpcf-hook/$ver, or checking that modprobe finds it")
     if [ -z "$prev" ]; then
-        failed+=("$k: has no nvpcf_hook that this run installed or checked")
+        failed+=("$k: had no installed nvpcf-hook version to go back to")
         continue
     fi
-    keep+=("$prev")
     if installed_is "$prev" "$k"; then
         echo "== $k still has nvpcf-hook/$prev"
     elif dkms install -m nvpcf-hook -v "$prev" -k "$k" --force && installed_is "$prev" "$k"; then
@@ -167,22 +167,23 @@ for k in "${targets[@]}"; do
     fi
 done
 
-# Remove the older versions that are not installed for any kernel, except
-# the ones that a failed kernel had installed. The check above made every
-# other registered version rank below $ver.
+# Remove the older versions that are not installed for any kernel, but only
+# when every target kernel has $ver installed and checked. A failed kernel can
+# need one of their builds again, also after a later run that finds it
+# without any installed version. The check above made every other registered
+# version rank below $ver.
 hook_status=$(dkms status nvpcf-hook) || fail "dkms status nvpcf-hook failed after the install"
-mapfile -t old < <(sed -nE 's#^nvpcf-hook/([^,:]+)[,:].*#\1#p' <<<"$hook_status" | sort -u)
-for v in "${old[@]}"; do
-    [ "$v" = "$ver" ] && continue
-    installed_anywhere "$v" && continue
-    if [[ " ${keep[*]} " == *" $v "* ]]; then
-        echo "== keeping nvpcf-hook/$v, which a kernel had installed before its install failed"
-        continue
-    fi
-    [[ $v =~ ^[0-9A-Za-z.+~-]+$ ]] || { failed+=("nvpcf-hook/$v: not removed, unexpected version"); continue; }
-    echo "== removing nvpcf-hook/$v, which is not installed for any kernel"
-    if dkms remove "nvpcf-hook/$v" --all; then rm -rf "/usr/src/nvpcf-hook-$v"; else failed+=("nvpcf-hook/$v: remove"); fi
-done
+mapfile -t old < <(sed -nE 's#^nvpcf-hook/([^,:]+)[,:].*#\1#p' <<<"$hook_status" | grep -vxF "$ver" | sort -u)
+if [ ${#failed[@]} -gt 0 ]; then
+    [ ${#old[@]} -eq 0 ] || echo "== keeping ${old[*]/#/nvpcf-hook/} until every kernel has nvpcf-hook/$ver"
+else
+    for v in "${old[@]}"; do
+        installed_anywhere "$v" && continue
+        [[ $v =~ ^[0-9A-Za-z.+~-]+$ ]] || { failed+=("nvpcf-hook/$v: not removed, unexpected version"); continue; }
+        echo "== removing nvpcf-hook/$v, which is not installed for any kernel"
+        if dkms remove "nvpcf-hook/$v" --all; then rm -rf "/usr/src/nvpcf-hook-$v"; else failed+=("nvpcf-hook/$v: remove"); fi
+    done
+fi
 
 for f in "${HOOK_TOOLS[@]}"; do
     mode=0644

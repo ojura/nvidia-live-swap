@@ -204,7 +204,8 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
     for them before the run. registered maps versions that are only added to
     the text of their nvpcf_hook.c, or to None for hook/'s text.
     package_version replaces PACKAGE_VERSION in the copied hook/dkms.conf.
-    between runs with the copied scripts directory after the first run."""
+    between(scripts, i) runs before every run i after the first, with the
+    copied scripts directory."""
     root = BASE / name
     (root / 'bin').mkdir(parents=True)
     mock = root / 'mock'
@@ -258,8 +259,8 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
     env = dict(os.environ, PATH=f'{root}/bin:/usr/bin:/bin', MOCK_ROOT=str(root))
     exits = []
     for i in range(runs):
-        if i == 1 and between:
-            between(scripts)
+        if i > 0 and between:
+            between(scripts, i)
         (root / 'calls.jsonl').write_text('')
         p = subprocess.run(['/bin/bash', str(scripts / 'install-hook.sh'), *args], env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
@@ -296,6 +297,18 @@ def keeps_old(r):
 
 def built_path_exists(r, v, k):
     return (r['root'] / 'var/lib/dkms/nvpcf-hook' / v / k / 'x86_64/module/nvpcf_hook.ko').exists()
+
+
+def clearing(key, before_run):
+    """A between function that removes a fault from the case's config before
+    run number before_run, counted from 0."""
+    def clear(scripts, i):
+        if i == before_run:
+            conf = scripts.parent / 'config.json'
+            c = json.loads(conf.read_text())
+            del c[key]
+            conf.write_text(json.dumps(c))
+    return clear
 
 
 r = run('fresh-install', {})
@@ -370,6 +383,21 @@ check(r, f'installing nvpcf-hook/{OLD} again failed' in r['out'] and f'keeping n
       'reports the failed reinstall and keeps the old version')
 keeps_old(r)
 
+r = run('persistent-failed-rollback-retry', {'depmod_fails': [RUNNING]}, installed={RUNNING: OLD, OTHER: OLD}, runs=2)
+check(r, r['exits'] == [1, 1] and RUNNING not in r['state']['installed'] and r['state']['installed'].get(OTHER) == NEW,
+      f"fails both runs and leaves the failed kernel without a module, got {r['exits']} and {r['state']['installed']}")
+check(r, f'keeping nvpcf-hook/{OLD} until every kernel has nvpcf-hook/{NEW}' in r['out']
+      and sorted(r['state']['added']) == sorted([OLD, NEW]),
+      f"keeps {OLD} on the second run too, although no kernel has it installed, got {r['state']['added']}")
+keeps_old(r)
+
+r = run('reinstall-fails-then-recovers', {'depmod_fails': [RUNNING]}, installed={RUNNING: OLD, OTHER: OLD}, runs=3,
+        between=clearing('depmod_fails', 2))
+check(r, r['exits'] == [1, 1, 0] and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW},
+      f"installs the new version everywhere once depmod works again, got {r['exits']} and {r['state']['installed']}")
+check(r, r['removed'] == [f'nvpcf-hook/{OLD}'] and OLD not in r['state']['added'] and f'nvpcf-hook-{OLD}' not in r['sources'],
+      f"removes {OLD} only in the run that installs the new version everywhere, got {r['removed']}")
+
 r = run('build-id-unreadable', {'readelf_fails': True}, installed={RUNNING: OLD, OTHER: OLD})
 check(r, r['exit'] == 1 and f'{RUNNING}: installing nvpcf-hook/{NEW}, or checking that modprobe finds it' in r['out']
       and f'{OTHER}: installing nvpcf-hook/{NEW}, or checking that modprobe finds it' in r['out'],
@@ -412,14 +440,7 @@ check(r, r['installs'] == [(NEW, RUNNING)],
       f"checks the kernel that DKMS lists as installed again, and installs it again, got the installs {r['installs']}")
 
 
-def clear_wrong_file(scripts):
-    conf = scripts.parent / 'config.json'
-    c = json.loads(conf.read_text())
-    del c['wrong_file']
-    conf.write_text(json.dumps(c))
-
-
-r = run('wrong-file-repaired', {'wrong_file': [RUNNING]}, runs=2, between=clear_wrong_file)
+r = run('wrong-file-repaired', {'wrong_file': [RUNNING]}, runs=2, between=clearing('wrong_file', 1))
 installed_file = r['root'] / 'lib/modules' / RUNNING / 'updates/dkms/nvpcf_hook.ko'
 built_file = r['root'] / 'var/lib/dkms/nvpcf-hook' / NEW / RUNNING / 'x86_64/module/nvpcf_hook.ko'
 check(r, r['exits'] == [1, 0] and r['installs'] == [(NEW, RUNNING)]
@@ -427,7 +448,7 @@ check(r, r['exits'] == [1, 0] and r['installs'] == [(NEW, RUNNING)]
       f"repairs the kernel on the second run and checks it, got the exit statuses {r['exits']} and the installs {r['installs']}")
 
 built = {}
-def build_in_hook(scripts):
+def build_in_hook(scripts, i):
     built['result'] = kbuild(scripts / 'hook')
     built['generated'] = (scripts / 'hook/nvpcf_hook.mod.c').exists()
 

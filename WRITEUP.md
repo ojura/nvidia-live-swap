@@ -525,10 +525,12 @@ missing headers. A failed install can leave the kernel without a module:
 and removes the new file when depmod fails (`/usr/sbin/dkms`, lines 1345-1380
 in DKMS 3.0.11). After a failed install or check, the script installs the
 kernel's previous version again from DKMS's build of it, checks it in the same
-way, and reports whether that worked. It keeps the previous version's
-registration, source and builds in both cases. Afterwards it removes every
-older version that is not installed for any kernel, unless a failed kernel had
-it installed.
+way, and reports whether that worked. Older versions that no kernel has
+installed are removed only by a run in which every target kernel ends with
+the new version installed and checked. After a failure, their registrations,
+sources and builds stay, also through later runs that find the failed kernel
+without any installed version, so that `dkms install` can still put one of
+their builds back.
 
 It installs `load-hook.sh`, `check_nvidia.py`, `expected_dispatcher.c` and
 `nvpcf-hookctl` as root-owned copies in `/usr/local/lib/nvpcf-hook`.
@@ -662,7 +664,10 @@ the number of deliveries.
   - an install that fails before the copy, which leaves the old module, and a
     depmod failure after the copy, after which the kernel gets its previous
     version back from DKMS's build. When depmod fails for that reinstall too,
-    the previous version's registration, source and builds stay;
+    the previous version's registration, source and builds stay, also through
+    a second run under the same fault, which finds the kernel without any
+    installed version. A third run without the fault installs the new version
+    everywhere and only then removes the old one;
   - a build ID that cannot be read, which fails the check;
   - an install that DKMS reports as successful but that leaves another file,
     which fails two runs in a row while the fault stays, and is installed
