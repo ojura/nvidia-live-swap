@@ -5,7 +5,8 @@ instance through a mock mkdir, which makes set_ftrace_filter a symbolic
 link to /dev/full. Writing the function filter therefore fails, as it does
 when tracefs rejects an unknown function name. trace.sh must then stop
 before it selects the function_graph tracer, and it must remove the
-instance."""
+instance. An empty, extra or non-numeric argument must make trace.sh exit
+with status 2 before it creates an instance."""
 import os
 from pathlib import Path
 import shutil
@@ -50,6 +51,14 @@ env = dict(os.environ, TRACE_TEST_ROOT=str(root), PATH=f'{root}/bin:/usr/bin:/bi
 r = subprocess.run(['/bin/bash', str(root / 'trace.sh'), '0'], env=env, stdout=subprocess.PIPE,
                    stderr=subprocess.STDOUT, text=True, timeout=20)
 echoed = (root / 'echo.log').read_text().splitlines()
+usage = []
+for args in (('',), ('5', '5'), ('5s',)):
+    (root / 'echo.log').write_text('')
+    u = subprocess.run(['/bin/bash', str(root / 'trace.sh'), *args], env=env, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True, timeout=20)
+    usage.append((u.returncode == 2 and os.listdir(root / 'instances') == []
+                  and (root / 'echo.log').read_text().splitlines() == ['usage: trace.sh [seconds]'],
+                  f'exits with status 2 before creating an instance for the arguments {args!r}'))
 failures = []
 for cond, what in [
     (r.returncode != 0, 'exits with a failure status'),
@@ -57,6 +66,7 @@ for cond, what in [
     ('function_graph' not in echoed, 'never selects function_graph'),
     (not any(l.endswith(' +p') for l in echoed), 'never turns EC debug lines on'),
     (os.listdir(root / 'instances') == [], 'removes the instance'),
+    *usage,
 ]:
     print(('ok   ' if cond else 'FAIL ') + what)
     if not cond:

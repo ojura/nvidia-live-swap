@@ -36,7 +36,8 @@
 set -u
 usage() { echo "usage: trace.sh [seconds]" >&2; exit 2; }
 [ $# -le 1 ] || usage
-seconds=${1:-60}
+# Only a missing argument means the default; an empty one is a usage error.
+seconds=${1-60}
 case "$seconds" in
     '' | *[!0-9]*) usage ;;
 esac

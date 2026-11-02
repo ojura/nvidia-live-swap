@@ -36,7 +36,9 @@ registers the new version checks that the new version is the greatest one,
 with VER taken from /usr/sbin/dkms when it exists.
 
 With --no-enable, the script installs the unit without enabling it, and
-leaves a unit that is enabled already as it is; a case covers each.
+leaves a unit that is enabled already as it is; a case covers each. An empty
+argument, also next to --no-enable, and an extra argument make the script
+exit with status 2 before it runs any command.
 
 The source-directory cases cover a directory that matches and one that
 differs, a source file that is a symbolic or hard link to an identical file,
@@ -747,6 +749,12 @@ check(r, r['exit'] == 2 and r['calls'] == [], f"exits with status 2 before runni
 
 r = run('no-enable-extra-argument', {}, args=('--no-enable', 'now'))
 check(r, r['exit'] == 2 and r['calls'] == [], f"exits with status 2 before running any command, got {r['exit']}")
+
+for name, args in (('empty-argument', ('',)), ('two-empty-arguments', ('', '')),
+                   ('no-enable-empty-argument', ('--no-enable', '')), ('empty-argument-no-enable', ('', '--no-enable'))):
+    r = run(name, {}, args=args)
+    check(r, r['exit'] == 2 and r['calls'] == [] and 'usage: install-hook.sh' in r['out'],
+          f"exits with status 2 before running any command for the arguments {args!r}, got status {r['exit']} and {r['calls']}")
 
 r = run('no-enable', {}, args=('--no-enable',))
 check(r, r['exit'] == 0 and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW} and r['unit'],

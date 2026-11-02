@@ -714,6 +714,9 @@ the number of deliveries.
   - The loader's status is 0 only for `active` or `waiting`, with guards
     registered, initialization allowed and `retirement_failed` 0, at the end of
     a load and with `--check-loaded`.
+  - An unknown option, an empty argument, an extra argument, an option with an
+    empty value, and two options in one argument make the loader exit with
+    status 2 before it runs any command.
   - For `--build-id` and `--loaded-build-id`, the test reads stdout apart from
     the messages. With the mock `objcopy`, it checks IDs of 16, 20, 32 and 64
     bytes, IDs of 0 and 65 bytes, a file without an ID, a missing file, a
@@ -781,9 +784,9 @@ the number of deliveries.
     run finds the registered source unchanged, and the registered source
     builds with Kbuild. This case needs the running kernel's headers;
   - a failing `dkms status` for `nvidia` and for `nvpcf-hook`, missing headers
-    for the running kernel, and an extra argument. A running kernel without
-    headers that has the new version installed and passes the check does not
-    stop the script; one whose installed file does not pass it does;
+    for the running kernel, and an empty or extra argument. A running kernel
+    without headers that has the new version installed and passes the check
+    does not stop the script; one whose installed file does not pass it does;
   - `--no-enable`, which installs the unit without enabling it, and leaves a
     unit that is enabled already as it is.
 
@@ -813,7 +816,9 @@ the number of deliveries.
 - `tests/check_trace_filter.py` runs `trace.sh` as an ordinary user, with
   ordinary files in place of the tracing and debug control files, and with a
   filter write that fails. It checks that `trace.sh` stops before selecting
-  `function_graph`, and that it removes the instance.
+  `function_graph`, and that it removes the instance. An empty, extra or
+  non-numeric argument makes `trace.sh` exit with status 2 before it creates
+  an instance.
 - `tests/check_revoke.py` runs as root. It runs `revoke.py` against a throwaway
   two-thread process owned by the user `nobody`. It checks that `revoke.py`
   refuses PID 1 and a root-owned process. It also checks that the revoke runs

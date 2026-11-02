@@ -30,21 +30,28 @@ usage() {
     echo "                     --build-id FILE | --loaded-build-id MODULE]" >&2
     exit 2
 }
+# The arguments are checked by count and one by one, so that an empty
+# argument cannot select the default mode, which loads the hook, and two
+# options in one argument are not read as two arguments.
 mode=load download=1 arg=
-case "$*" in
-    '') ;;
-    --check-loaded) mode=check-loaded ;;
-    --check-disk) mode=check-disk ;;
-    '--check-disk --no-download') mode=check-disk download=0 ;;
-    *)
-        [ $# = 2 ] || usage
+case $# in
+    0) ;;
+    1)
         case $1 in
-            --fetch) mode=fetch ;;
-            --build-id) mode=build-id ;;
-            --loaded-build-id) [[ $2 =~ ^[A-Za-z0-9_]+$ ]] || usage; mode=loaded-build-id ;;
+            --check-loaded) mode=check-loaded ;;
+            --check-disk) mode=check-disk ;;
             *) usage ;;
-        esac
-        arg=$2 ;;
+        esac ;;
+    2)
+        [ -n "$2" ] || usage
+        case $1 in
+            --check-disk) [ "$2" = --no-download ] || usage; mode=check-disk download=0 ;;
+            --fetch) mode=fetch arg=$2 ;;
+            --build-id) mode=build-id arg=$2 ;;
+            --loaded-build-id) [[ $2 =~ ^[A-Za-z0-9_]+$ ]] || usage; mode=loaded-build-id arg=$2 ;;
+            *) usage ;;
+        esac ;;
+    *) usage ;;
 esac
 here=$(cd "$(dirname "$0")" && pwd)
 CHECKER=$here/check_nvidia.py HOOKCTL=$here/nvpcf-hookctl

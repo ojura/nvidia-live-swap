@@ -16,10 +16,12 @@
 # failed installs and old versions, and the exit statuses.
 set -u
 usage() { echo "usage: install-hook.sh [--no-enable]" >&2; exit 2; }
+# The arguments are checked by count and one by one, so that an empty
+# argument cannot select the default install, which enables the unit.
 enable=1
-case "$*" in
-    '') ;;
-    --no-enable) enable=0 ;;
+case $# in
+    0) ;;
+    1) [ "$1" = --no-enable ] || usage; enable=0 ;;
     *) usage ;;
 esac
 here=$(cd "$(dirname "$0")" && pwd)

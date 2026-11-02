@@ -35,7 +35,11 @@ and 64 bytes in lowercase, and refuses an ID of 0 or 65 bytes, a file
 without an ID, a missing file, and a loaded module without a note. The cases
 for --check-loaded and for the end of a load check that the hook counts as
 usable only when it is active or waiting, with its guards registered, GPU
-initialization allowed and retirement_failed 0."""
+initialization allowed and retirement_failed 0.
+
+An unknown option, an empty argument, an extra argument, an option with an
+empty value, and two options in one argument make the script exit with
+status 2 before it runs any command."""
 import json
 import os
 from pathlib import Path
@@ -214,6 +218,7 @@ def run(name, cfg=None, args=(), nvidia_loaded=True, hook_loaded=False, disk_id=
             'modprobe': [a for c, a in calls if c == 'modprobe'],
             'curl': [a for c, a in calls if c == 'curl'],
             'checker': [a for c, a in calls if c == 'check_nvidia.py'],
+            'calls': calls,
             'checked': st['checked'],
             'cache': sorted(f.name for f in (root / 'cache').iterdir()),
             'root': root}
@@ -536,8 +541,18 @@ check(r, r['exit'] == 0 and len(r['curl']) == 1 and r['modprobe'] == [],
 r = run('fetch-bad-version', args=('--fetch', '../../etc'), cached=False)
 check(r, r['exit'] == 1 and r['curl'] == [], f"refuses a version that is not a version, got status {r['exit']}")
 
-r = run('bad-arguments', args=('--check',))
-check(r, r['exit'] == 2 and r['modprobe'] == [], f"exits with status 2 for an unknown option, got {r['exit']}")
+for name, args in (('unknown-option', ('--check',)), ('empty-argument', ('',)), ('two-empty-arguments', ('', '')),
+                   ('joined-check-disk-options', ('--check-disk --no-download',)),
+                   ('check-disk-empty-option', ('--check-disk', '')),
+                   ('check-disk-other-option', ('--check-disk', '--check-loaded')),
+                   ('check-loaded-empty-option', ('--check-loaded', '')),
+                   ('joined-fetch', (f'--fetch {VER}',)), ('fetch-empty-version', ('--fetch', '')),
+                   ('fetch-extra-argument', ('--fetch', VER, VER)), ('build-id-empty-file', ('--build-id', '')),
+                   ('loaded-build-id-empty-module', ('--loaded-build-id', ''))):
+    r = run(f'usage-{name}', args=args)
+    check(r, r['exit'] == 2 and r['calls'] == [] and 'usage: load-hook.sh' in r['out'],
+          f"exits with status 2 before running any command for the arguments {args!r}, "
+          f"got status {r['exit']} and the calls {r['calls']}")
 
 if failures:
     print(f'{len(failures)} failures; the cases are in {BASE}')
