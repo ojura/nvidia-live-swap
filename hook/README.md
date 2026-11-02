@@ -45,8 +45,9 @@ The kernel reference uses `nvidia_dev_get_uuid` and `nvidia_dev_put_uuid`. These
 use NVIDIA's normal open/close count under `ldata_lock`, without the VFS close
 path's system-PM read lock or its later PCI-removal operation. The reference is
 not a persistent Linux power reference in fine-grained mode. NVIDIA's UVM code
-calls `nvidia_dev_block_gc6` separately after acquiring this reference; this
-helper does not call that function.
+calls `nvidia_dev_block_gc6` separately after acquiring this reference. This
+helper uses a temporary block/unblock pair during delivery, not a permanent
+block while attached.
 
 NVIDIA WARN-checks an external-kernel-client count update but does not return its
 failure. Successful acquisition establishes device ownership, not proof that
@@ -144,8 +145,8 @@ stale requests retain the helper's diagnostic state until explicit
 unsupported cached legacy-method state instead retains ownership and reports
 that removal may wait.
 
-Failed hook retirement blocks `resume` and every new attachment, including a
-replacement NVIDIA module that reuses the old module address. The helper
+Failed hook retirement blocks `resume` and every new attachment, including
+automatic post-PM reattachment and a replacement NVIDIA module that reuses the old module address. The helper
 disables and drains redirects before clearing every old NVIDIA function pointer.
 `retirement_failed` remains set until `detach` completes a cleanup-only retry
 that actually unregisters the old hooks. That retry does not clear a separate
@@ -242,6 +243,24 @@ listeners are normal completion. The counter records a normal dispatch-loop
 return, not consumer receipt. A missed observation retains pending requests and
 can cause duplicate dispatch on a later retry.
 
+Delivery holds two distinct references. It first obtains conditional Linux
+active ownership, or deliberately wakes Linux runtime PM for a forced flush.
+Only then does it call `nvidia_dev_block_gc6` on the owned UUID. The NVIDIA FINE
+reference changes its internal state from IDLE_INDICATED to IN_USE. Linux ACTIVE
+alone does not perform that transition. The original callback can therefore
+dispatch with either stock code or PR #1299's internal deferral. Delivery
+unblocks GC6 before releasing Linux power and keeps feedback suppression through
+both releases. Normal replay does not call block_gc6 if Linux is suspended.
+
+A block error retains pending requests and balances Linux power. Every successful
+block gets an unblock attempt, including missing dispatch. If UUID lookup fails
+during unblock, the outstanding reference remains recorded: replay stops in
+`quiesced`, and device/stack/text ownership cannot be released. A later explicit
+flush or revalidation can retry cleanup once, including with zero pending. The
+normal ownership/pre-unbind ordering keeps that lookup available; an unavailable
+lookup is an error, not a balanced reference. Observed dispatch remains accounted
+for even if subsequent power cleanup fails.
+
 The replay trigger pairs `rpm_resume` entry from SUSPENDED with a later
 `rpm_return_int` event showing ACTIVE under the PM lock. Idle/put events cannot
 rearm it. Own delivery and reference-release events are suppressed. Failed
@@ -263,6 +282,8 @@ pointer for `:mod:`. The 6.8 entry-address adjustment matches its ENDBR helper;
   separate ownership records. A successfully allocated NVIDIA stack can be NULL.
 - `guards_registered`, `initialization_blocked`, `replay_paused`: lifecycle state.
 - `retirement_failed`: incomplete cleanup that blocks reuse of NVIDIA addresses.
+- `nvidia_power_reference`, `nvidia_power_release_error`: temporary NVIDIA FINE
+  ownership and any failed release that still needs cleanup.
 - `received_requests`: captured CHANGE calls. Ordinary calls after interception
   stops are not counted.
 - `pending_requests`: captured requests not covered by observed dispatch or an
@@ -365,15 +386,23 @@ distinct states. A separate matrix checks 64 readiness/error combinations. The
 portable suite also passes AddressSanitizer and UndefinedBehaviorSanitizer.
 
 The suite also compiles the production activation, restoration, module-GOING,
-pinning, guard admission, symbol invalidation and retirement-retry bodies with
-mocked kernel operations. It checks failed unregistration followed by replacement
+pinning, guard admission, symbol invalidation, real disabled handlers/drain,
+PM prepare/post, resume work, attachment and retirement-retry bodies with mocked
+kernel operations. It checks failed unregistration followed by replacement
 and manual recovery, including address reuse and preserved independent faults.
+The drain model records disabled redirects, both grace periods, reservation
+waits, work joining and final invalidation, checking old callable pointers and
+arguments throughout. A deliberately premature-invalidation mutation must fail.
+This checks C operation order, not live kernel RCU progress. The same harness
+models Linux ACTIVE separately from NVIDIA IN_USE and tests stock/patched
+preflight/detach, conditional deferral and temporary-reference failures/recovery.
 
 These tests execute shared logic and model kernel ordering. They do not execute
 kernel attachment, ACPI, runtime PM or NVIDIA. The source checker reads archives
 without extracting or executing their code. It compares the complete dispatcher
 body's C token sequence with the inspected body in `tests/expected_dispatcher.c`.
-Comments and whitespace are ignored, but unrecognized code changes require
+C backslash-newline splicing runs before comments and tokenization. Comments
+and whitespace are ignored, but unrecognized code changes require
 source review. This checks that one function's implementation remains compatible;
 it does not prove arbitrary C semantics or identify compatible version numbers.
 ELF checks require calls to exact symbol entries or corresponding
@@ -389,7 +418,8 @@ BTF generation is skipped without vmlinux. `dkms.conf` describes building the
 package but these commands do not install DKMS configuration or load modules.
 
 Live stock-core acceptance is still required. The source-patched core can mask
-an interception defect and can defer internally without an observed dispatcher
-return. Non-live checks and builds are not that acceptance test. Live checks
+an interception defect. Its two-state delivery interaction is covered by the
+non-live production-body tests but still needs live acceptance. Non-live checks
+and builds are not that acceptance test. Live checks
 must establish idle behavior, replay during a real external wake, system PM and
 rollback, final detach/teardown, and failed-swap recovery before deployment.

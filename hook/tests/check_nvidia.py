@@ -23,16 +23,32 @@ PATHS = {
 }
 
 
-def c_text(text):
+SPLICE = re.compile(r'\\(?:\r\n|\n|\r)')
+
+
+def splice_lines(text):
+    # C translation phase 2 precedes comments and token recognition. One pass
+    # matters: a removed pair must not make another physical line splice again.
+    return SPLICE.sub('', text)
+
+
+def stripped_c_text(text):
     pattern = r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
     return re.sub(pattern, lambda m: ''.join('\n' if c == '\n' else ' ' for c in m[0]),
                   text, flags=re.S)
 
 
+def c_text(text):
+    return stripped_c_text(splice_lines(text))
+
+
 def function(text, name, *, raw=False):
-    clean = c_text(text)
+    original = text
+    spans = list(SPLICE.finditer(original))
+    text = splice_lines(text)
+    clean = stripped_c_text(text)
     match = re.search(
-        r'(?m)^(?:static\s+)?(?:void|int|bool|NV_STATUS|NvLength)\s+(?:NV_API_CALL\s+)?'
+        r'(?m)^(?:static\s+)?(?:void|int|bool|NV_STATUS|NvLength)\s+(?:(?:NV_API_CALL|notrace)\s+)?'
         + re.escape(name) + r'\s*\([^;]*?\)\s*\{', clean)
     assert match, f'missing function definition: {name}'
     opening = clean.index('{', match.start())
@@ -41,7 +57,13 @@ def function(text, name, *, raw=False):
         depth += (clean[end] == '{') - (clean[end] == '}')
         end += 1
     signature = re.sub(r'\s+', '', clean[match.start():opening])
-    return signature, (text if raw else clean)[opening:end], text.count('\n', 0, match.start()) + 1
+    removed = 0
+    for span in spans:
+        if span.start() - removed > match.start():
+            break
+        removed += span.end() - span.start()
+    line = original.count('\n', 0, match.start() + removed) + 1
+    return signature, (text if raw else clean)[opening:end], line
 
 
 def check_kernel_sources(texts):
@@ -51,6 +73,8 @@ def check_kernel_sources(texts):
         'nv_shutdown_adapter': 'voidnv_shutdown_adapter(nvidia_stack_t*sp,nv_state_t*nv,nv_linux_state_t*nvl)',
         'nvidia_dev_get_uuid': 'intnvidia_dev_get_uuid(constNvU8*uuid,nvidia_stack_t*sp)',
         'nvidia_dev_put_uuid': 'voidnvidia_dev_put_uuid(constNvU8*uuid,nvidia_stack_t*sp)',
+        'nvidia_dev_block_gc6': 'intnvidia_dev_block_gc6(constNvU8*uuid,nvidia_stack_t*sp)',
+        'nvidia_dev_unblock_gc6': 'intnvidia_dev_unblock_gc6(constNvU8*uuid,nvidia_stack_t*sp)',
     }
     bodies = {}
     for name, expected_signature in expected.items():
@@ -69,6 +93,12 @@ def check_kernel_sources(texts):
     body = bodies['nvidia_dev_put_uuid']
     assert body.index('find_uuid(') < body.index('nv_close_device(')
     assert 'pci_stop_and_remove' not in body and 'nv_system_pm_lock' not in body
+    for name, operation in [('nvidia_dev_block_gc6', 'rm_ref_dynamic_power'),
+                            ('nvidia_dev_unblock_gc6', 'rm_unref_dynamic_power')]:
+        body = bodies[name]
+        assert body.index('find_uuid(') < body.index(operation + '(')
+        assert 'NV_DYNAMIC_PM_FINE' in body and 'return -ENODEV' in body
+        assert 'up(&nvl->ldata_lock)' in body
     signature, body, _ = function(texts['modeset'], 'nvidia_modeset_rm_ops_alloc_stack')
     assert signature == 'staticintnvidia_modeset_rm_ops_alloc_stack(nvidia_stack_t**sp)'
     assert 'return nv_kmem_cache_alloc_stack(sp)' in body
@@ -95,7 +125,9 @@ def compact(text):
     return re.sub(r'\s+', '', text)
 
 
-def c_tokens(text):
+def c_tokens(text, *, spliced=False):
+    if not spliced:
+        text = splice_lines(text)
     token = re.compile(
         r'(?P<skip>\s+|/\*.*?\*/|//[^\n]*)|'
         r'(?:u8|u|U|L)?"(?:\\.|[^"\\])*"|(?:u|U|L)?\'(?:\\.|[^\'\\])*\'|'
@@ -120,7 +152,7 @@ def check_dispatch_source(text, notification):
     reference = Path(__file__).with_name('expected_dispatcher.c').read_text()
     expected_signature, expected_body, _ = function(reference, 'gpuNotifySubDeviceEvent_IMPL', raw=True)
     assert signature == expected_signature, 'dispatcher declaration changed; source review required'
-    assert c_tokens(body) == c_tokens(expected_body), 'unrecognized dispatcher body; source review required'
+    assert c_tokens(body, spliced=True) == c_tokens(expected_body, spliced=True), 'unrecognized dispatcher body; source review required'
     index = int(re.search(r'#define\s+NV2080_NOTIFIERS_NVPCF_EVENTS\s+\((\d+)\)', notification)[1])
     maximum = int(re.search(r'#define\s+NV2080_NOTIFIERS_MAXCOUNT\s+\((\d+)\)', notification)[1])
     assert index == 177 and index < maximum
@@ -200,7 +232,9 @@ def check_module(name):
     targets = ('nv_open_device', 'nv_start_device', 'nv_shutdown_adapter',
                'nv_acpi_methods_uninit', 'nv_acpi_nvpcf_event', 'nvidia_dev_get_uuid',
                'nvidia_dev_put_uuid', 'nvidia_modeset_rm_ops_alloc_stack',
-               'nvidia_modeset_rm_ops_free_stack', 'nv_stop_device', 'nv_close_device')
+               'nvidia_modeset_rm_ops_free_stack', 'nv_stop_device', 'nv_close_device',
+               'nvidia_dev_block_gc6', 'nvidia_dev_unblock_gc6',
+               'rm_ref_dynamic_power', 'rm_unref_dynamic_power')
     for target in targets:
         assert target in symbols, target
 
@@ -214,7 +248,9 @@ def check_module(name):
     for caller, callee in [('nvidia_dev_get_uuid', 'nv_open_device'),
                            ('nvidia_dev_put_uuid', 'nv_close_device'),
                            ('nv_open_device', 'nv_start_device'),
-                           ('nv_stop_device', 'nv_shutdown_adapter')]:
+                           ('nv_stop_device', 'nv_shutdown_adapter'),
+                           ('nvidia_dev_block_gc6', 'rm_ref_dynamic_power'),
+                           ('nvidia_dev_unblock_gc6', 'rm_unref_dynamic_power')]:
         assert direct_call_to_entry(disassemble(caller), caller, callee, symbols), (caller, callee)
     print('PASS: linked NVIDIA module has ownership/allocator/guard symbols, entry fentry and exact entry calls:', name)
 

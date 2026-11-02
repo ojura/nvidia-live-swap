@@ -105,7 +105,7 @@ static void test_transition_observations(void)
 struct fixture {
 	struct nh_state s;
 	bool owner, observer, capture, rm_locks;
-	bool capture_fail, power_fail, dispatch_fail, restore_fail, in_flight_arrival;
+	bool capture_fail, power_fail, dispatch_fail, restore_fail, in_flight_arrival, owner_put_fail;
 	bool held_power, power_unavailable, resources_alive, psr_object, nvpcf_object, pci_remove;
 	bool linux_ldata, linux_devices, keep_instance;
 	unsigned int queued_c0, queued_psr, context_frees, cleanup_calls, ordinary_failures;
@@ -271,13 +271,15 @@ static void *release_bus_callback(void *ctx)
 	return NULL;
 }
 
-static void release_owner(void *ctx)
+static int release_owner(void *ctx)
 {
 	struct fixture *f = ctx;
 	pthread_t thread;
 	pthread_mutex_t action = PTHREAD_MUTEX_INITIALIZER;
 
 	record(f, "release ");
+	if (f->owner_put_fail)
+		return -5;
 	assert((!nh_pending(&f->s) || f->s.stale) && f->owner && !f->observer &&
 	       (f->held_power || f->power_unavailable));
 	f->action = &action;
@@ -301,6 +303,7 @@ static void release_owner(void *ctx)
 		assert(!pthread_join(thread, NULL));
 	assert(!pthread_mutex_destroy(f->action));
 	f->action = NULL;
+	return 0;
 }
 
 static void observer_stop(void *ctx)
@@ -377,6 +380,19 @@ static void test_detach(void)
 	f.restore_fail = false;
 	r = nh_quiesce(&f, &ops);
 	assert(!r.error && !nh_pending(&f.s));
+}
+
+static void test_owner_release_error(void)
+{
+	struct fixture f = fixture();
+	struct nh_quiesce_result result;
+
+	f.owner_put_fail = true;
+	result = nh_quiesce(&f, &ops);
+	assert(result.error == -5 && !result.restore_error);
+	assert(f.owner && !f.capture && !f.observer && !f.held_power);
+	assert(!nh_pending(&f.s) && f.completed_release == 0);
+	conserved(&f.s);
 }
 
 static void test_power_and_guard_lifetime(void)
@@ -1051,6 +1067,7 @@ int main(void)
 	test_missed_observer();
 	test_transition_observations();
 	test_detach();
+	test_owner_release_error();
 	test_power_and_guard_lifetime();
 	test_waiting_and_admission();
 	test_pm_rollback();

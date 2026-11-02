@@ -46,6 +46,11 @@ struct nh_owner {
 	void *stack;
 };
 
+struct nh_fine_ops {
+	int (*block)(const unsigned char *, void *);
+	int (*unblock)(const unsigned char *, void *);
+};
+
 struct nh_owner_ops {
 	int (*alloc)(void **);
 	void (*free)(void *);
@@ -127,7 +132,7 @@ struct nh_lifecycle_ops {
 	int (*dispatch)(void *);
 	int (*restore_capture)(void *);
 	void (*release_active)(void *);
-	void (*release_owner)(void *);
+	int (*release_owner)(void *);
 	void (*stop_observer)(void *);
 };
 
@@ -153,7 +158,7 @@ nh_quiesce(void *ctx, const struct nh_lifecycle_ops *ops)
 		return result;
 	}
 	ops->stop_observer(ctx);
-	ops->release_owner(ctx);
+	result.error = ops->release_owner(ctx);
 	ops->release_active(ctx);
 	return result;
 }

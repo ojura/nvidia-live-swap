@@ -37,7 +37,12 @@ def test_source():
                  NOTIFICATION) == (177, 202)
     assert check(SOURCE.replace('NV_ASSERT_OR_RETURN_VOID(',
                                 'NV_ASSERT_OR_RETURN_VOID \n ('), NOTIFICATION) == (177, 202)
+    final_decrement = '        portAtomicDecrementU32(&pSubdevice->notificationRefCount);'
+    location = SOURCE.rfind(final_decrement)
+    assert location >= 0
+    spliced_comment = SOURCE[:location] + '// continuation ' + chr(92) + '\n' + SOURCE[location:]
     fixtures = {
+        'line-spliced comment hiding final decrement': spliced_comment,
         'NVPCF-excluding assertion': SOURCE.replace(
             'notifyIndex < NV2080_NOTIFIERS_MAXCOUNT',
             'notifyIndex < NV2080_NOTIFIERS_MAXCOUNT && notifyIndex != 177'),
@@ -59,6 +64,11 @@ def test_source():
         'conditionally guarded notification work': mutate_loop('\nif (notifyIndex != 177) {\n', '\n}\n'),
         'post-loop control flow': SOURCE[:SOURCE.rfind('}')] + 'unexpectedOperation();\n' + SOURCE[SOURCE.rfind('}'):],
     }
+    assert CHECK['splice_lines']('x' + chr(92) + chr(92) + '\n\n') == 'x' + chr(92) + '\n'
+    baseline = subprocess.check_output(['cc', '-E', '-P', '-x', 'c', '-'], input=SOURCE, text=True)
+    mutated = subprocess.check_output(['cc', '-E', '-P', '-x', 'c', '-'], input=spliced_comment, text=True)
+    assert baseline.count('portAtomicDecrementU32') == 4
+    assert mutated.count('portAtomicDecrementU32') == 3
     assert CHECK['c_tokens']('x + +y') != CHECK['c_tokens']('x++ + y')
     for name, source in fixtures.items():
         assert source != SOURCE, name
@@ -71,7 +81,8 @@ TARGETS = (
     'nv_acpi_methods_uninit', 'nv_acpi_nvpcf_event', 'nvidia_dev_get_uuid',
     'nvidia_dev_put_uuid', 'nvidia_modeset_rm_ops_alloc_stack',
     'nvidia_modeset_rm_ops_free_stack', 'nv_stop_device', 'nv_close_device',
-    'nv_start_device_wrong', '__fentry__',
+    'nv_start_device_wrong', '__fentry__', 'nvidia_dev_block_gc6',
+    'nvidia_dev_unblock_gc6', 'rm_ref_dynamic_power', 'rm_unref_dynamic_power',
 )
 INSTRUMENTED = ('nv_open_device', 'nv_start_device', 'nv_shutdown_adapter', 'nv_acpi_nvpcf_event')
 
@@ -82,6 +93,8 @@ def assembly(destination, prefix=''):
         'nvidia_dev_put_uuid': 'nv_close_device',
         'nv_open_device': destination,
         'nv_stop_device': 'nv_shutdown_adapter',
+        'nvidia_dev_block_gc6': 'rm_ref_dynamic_power',
+        'nvidia_dev_unblock_gc6': 'rm_unref_dynamic_power',
     }
     lines = ['.text']
     for name in TARGETS:

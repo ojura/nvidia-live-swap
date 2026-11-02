@@ -100,6 +100,9 @@ static struct {
 	struct nh_replay_control replay;
 	uuid_t gpu_uuid;
 	struct nh_owner_ops owner_ops;
+	struct nh_fine_ops fine_ops;
+	bool fine_held;
+	int fine_release_error;
 	struct module *nvidia_module;
 	char nvidia_version[64];
 	nvpcf_callback original;
@@ -382,7 +385,7 @@ static void notrace guard_hook(unsigned long ip, unsigned long parent_ip,
 
 static int start_guards(void)
 {
-	unsigned long cleanup_ip, get_ip, put_ip, alloc_ip, free_ip;
+	unsigned long cleanup_ip, get_ip, put_ip, alloc_ip, free_ip, block_ip, unblock_ip;
 	int ret;
 
 	if (!nh_instance_attach_allowed(h.retirement_failed, h.guards_registered,
@@ -420,6 +423,14 @@ static int start_guards(void)
 	ret = resolve_nvidia("nvidia:nvidia_modeset_rm_ops_free_stack", &free_ip);
 	if (ret)
 		return ret;
+	ret = resolve_nvidia("nvidia:nvidia_dev_block_gc6", &block_ip);
+	if (ret)
+		return ret;
+	ret = resolve_nvidia("nvidia:nvidia_dev_unblock_gc6", &unblock_ip);
+	if (ret)
+		return ret;
+	h.fine_ops.block = (int (*)(const u8 *, void *))event_symaddr(block_ip);
+	h.fine_ops.unblock = (int (*)(const u8 *, void *))event_symaddr(unblock_ip);
 	h.owner_ops.get = (int (*)(const u8 *, void *))event_symaddr(get_ip);
 	h.owner_ops.put = (void (*)(const u8 *, void *))event_symaddr(put_ip);
 	h.owner_ops.alloc = (int (*)(void **))event_symaddr(alloc_ip);
@@ -549,6 +560,67 @@ static int observer_return(struct kretprobe_instance *instance, struct pt_regs *
 	return 0;
 }
 
+/* delivery held; the existing kernel reference/stack owns the UUID lookup. */
+static int acquire_fine_reference(void)
+{
+	unsigned long flags;
+	int ret;
+
+	if (h.fine_held)
+		return -EBUSY;
+	ret = h.fine_ops.block(h.gpu_uuid.b, h.owner.stack);
+	if (!ret) {
+		spin_lock_irqsave(&h.lock, flags);
+		h.fine_held = true;
+		spin_unlock_irqrestore(&h.lock, flags);
+	}
+	return ret;
+}
+
+static int release_fine_reference(void)
+{
+	unsigned long flags;
+	int ret;
+
+	if (!h.fine_held)
+		return 0;
+	ret = h.fine_ops.unblock(h.gpu_uuid.b, h.owner.stack);
+	spin_lock_irqsave(&h.lock, flags);
+	h.fine_release_error = ret;
+	if (!ret) {
+		h.fine_held = false;
+	} else {
+		h.state.power_failures++;
+		h.last_error = ret;
+		h.replay.enabled = false;
+		if (READ_ONCE(h.phase) == ACTIVE)
+			h.phase = QUIESCED;
+	}
+	spin_unlock_irqrestore(&h.lock, flags);
+	if (ret) {
+		pr_err("nvpcf_hook: cannot release temporary NVIDIA power reference (%d); ownership retained\n", ret);
+	}
+	return ret;
+}
+
+static int cleanup_fine_reference_if_active(void)
+{
+	int ret;
+
+	if (!h.fine_held)
+		return 0;
+	WRITE_ONCE(h.dispatch_task, current);
+	ret = pm_runtime_get_if_active(&h.pci->dev);
+	if (ret > 0) {
+		ret = release_fine_reference();
+		pm_runtime_put(&h.pci->dev);
+	} else if (!ret) {
+		ret = -EAGAIN;
+	}
+	WRITE_ONCE(h.dispatch_task, NULL);
+	return ret;
+}
+
 /* Called in process context with delivery held, never under an NVIDIA lock. */
 static int deliver_one(bool force)
 {
@@ -557,11 +629,12 @@ static int deliver_one(bool force)
 	nvpcf_callback callback;
 	acpi_handle handle;
 	void *data;
-	bool seen;
-	int ret;
+	bool seen, cleanup_only, acquired_fine = false;
+	int ret, released;
 
 	spin_lock_irqsave(&h.lock, flags);
-	if (!nh_pending(&h.state)) {
+	cleanup_only = !nh_pending(&h.state);
+	if (cleanup_only && !h.fine_held) {
 		spin_unlock_irqrestore(&h.lock, flags);
 		return 0;
 	}
@@ -574,33 +647,56 @@ static int deliver_one(bool force)
 	handle = h.handle;
 	data = h.data;
 	spin_unlock_irqrestore(&h.lock, flags);
-	if (!callback || !data || !h.owner.held)
+	if (!h.owner.held || (!cleanup_only && (!callback || !data)))
 		return power_failure(-ENODEV);
 
 	WRITE_ONCE(h.dispatch_task, current);
-	WRITE_ONCE(h.dispatch_seen, false);
 	ret = force ? pm_runtime_resume_and_get(&h.pci->dev) :
 		      pm_runtime_get_if_active(&h.pci->dev);
 	if (ret < 0 || (!force && ret == 0)) {
 		WRITE_ONCE(h.dispatch_task, NULL);
 		return ret < 0 ? power_failure(ret) : -EAGAIN;
 	}
-	/* The reference excludes a new runtime suspend through the entire call. */
+	/* Obtain Linux power first: ordinary replay must not wake a suspended GPU.
+	 * Its ACTIVE state alone does not change NVIDIA's IDLE_INDICATED state.
+	 */
 	spin_lock_irqsave(&h.pci->dev.power.lock, flags);
 	ret = h.pci->dev.power.runtime_error;
 	spin_unlock_irqrestore(&h.pci->dev.power.lock, flags);
-	if (!ret && pci_device_is_present(h.pci)) {
-		callback(handle, NVPCF_CHANGE, data);
-		seen = READ_ONCE(h.dispatch_seen);
-		ret = seen ? 0 : -EIO;
-		if (!seen)
-			pr_err_ratelimited("nvpcf_hook: RM dispatch completion was not observed; requests remain pending\n");
-		spin_lock_irqsave(&h.lock, flags);
-		nh_finish(&h.state, snapshot, seen);
-		h.last_error = ret;
-		spin_unlock_irqrestore(&h.lock, flags);
-	} else {
+	if (ret || !pci_device_is_present(h.pci)) {
 		ret = power_failure(ret ? ret : -ENODEV);
+		goto put_linux;
+	}
+	/* A failed earlier unblock owns a reference even with zero pending. Retry
+	 * its cleanup once here before acquiring another NVIDIA reference.
+	 */
+	ret = release_fine_reference();
+	if (ret || cleanup_only)
+		goto put_linux;
+	ret = acquire_fine_reference();
+	if (ret) {
+		ret = power_failure(ret);
+		goto put_linux;
+	}
+	acquired_fine = true;
+	/* Reference acquisition can itself run RM work. Observe only the original
+	 * callback's dispatch, not an event emitted by that earlier power work.
+	 */
+	WRITE_ONCE(h.dispatch_seen, false);
+	callback(handle, NVPCF_CHANGE, data);
+	seen = READ_ONCE(h.dispatch_seen);
+	ret = seen ? 0 : -EIO;
+	if (!seen)
+		pr_err_ratelimited("nvpcf_hook: RM dispatch completion was not observed; requests remain pending\n");
+	spin_lock_irqsave(&h.lock, flags);
+	nh_finish(&h.state, snapshot, seen);
+	h.last_error = ret;
+	spin_unlock_irqrestore(&h.lock, flags);
+put_linux:
+	if (acquired_fine) {
+		released = release_fine_reference();
+		if (released)
+			ret = released;
 	}
 	pm_runtime_put(&h.pci->dev);
 	WRITE_ONCE(h.dispatch_task, NULL);
@@ -667,7 +763,8 @@ static void activate_capture(void)
 	h.state.resume_armed = false;
 	h.accepting = nh_capture_ready(h.owner.held, h.observer_registered,
 		h.event_registered && h.guards_registered, READ_ONCE(h.legacy_safe));
-	active = nh_activate_replay(&h.replay, h.accepting, h.fine_verified,
+	active = nh_activate_replay(&h.replay, h.accepting,
+		h.fine_verified && !h.fine_release_error,
 		&h.phase, &h.last_error);
 	if (h.replay.enabled && nh_pending(&h.state))
 		queue_work(h.replay_wq, &h.replay_work);
@@ -676,7 +773,7 @@ static void activate_capture(void)
 		pr_info("nvpcf_hook: attached to %s, NVIDIA %s\n", pci_name(h.pci), h.nvidia_version);
 	else
 		pr_err("nvpcf_hook: capture restored without replay readiness: state=%s error=%d\n",
-			phase_names[h.phase], READ_ONCE(h.last_error));
+			phase_names[READ_ONCE(h.phase)], READ_ONCE(h.last_error));
 }
 
 static int stop_capture(void)
@@ -719,8 +816,10 @@ static int stop_capture(void)
 	return 0;
 }
 
-static void put_gpu(void)
+static int put_gpu(void)
 {
+	if (h.fine_held)
+		return power_failure(-EBUSY);
 	/* action serializes this against pre-unbind. The UUID lookup must still
 	 * precede NVIDIA's removal from its Linux-device list.
 	 */
@@ -729,6 +828,7 @@ static void put_gpu(void)
 	h.handle = NULL;
 	h.fine_verified = false;
 	nh_owner_release(&h.owner, &h.owner_ops, h.gpu_uuid.b);
+	return 0;
 }
 
 static void stop_observer(void)
@@ -789,9 +889,9 @@ static void lifecycle_unhold(void *unused)
 	release_active(false);
 }
 
-static void lifecycle_release(void *unused)
+static int lifecycle_release(void *unused)
 {
-	put_gpu();
+	return put_gpu();
 }
 
 static void lifecycle_observer_stop(void *unused)
@@ -958,6 +1058,12 @@ static int get_gpu_locked(void)
 	return ret;
 }
 
+/* action held; these conditions also block automatic reattachment after PM. */
+static bool attachment_blocked(void)
+{
+	return h.retirement_failed || h.guard_poisoned || h.legacy_blocked || h.state.stale;
+}
+
 /* Action and system sleep held; pre-unbind waits for action before RM teardown. */
 static int attach_locked(bool activate)
 {
@@ -965,11 +1071,18 @@ static int attach_locked(bool activate)
 	bool new_observer = false;
 	int ret;
 
+	if (attachment_blocked())
+		return -EUCLEAN;
 	if (!READ_ONCE(h.legacy_safe)) {
 		h.legacy_blocked = true;
 		pr_crit("nvpcf_hook: legacy ACPI methods changed during attachment; retaining ownership\n");
 		return -EOPNOTSUPP;
 	}
+	mutex_lock(&h.delivery);
+	ret = cleanup_fine_reference_if_active();
+	mutex_unlock(&h.delivery);
+	if (ret)
+		return ret;
 	ret = check_configuration();
 	h.fine_verified = !ret;
 	if (ret)
@@ -1132,8 +1245,13 @@ static void resume_work(struct work_struct *work)
 	spin_lock_irqsave(&h.lock, flags);
 	h.replay.paused = false;
 	spin_unlock_irqrestore(&h.lock, flags);
-	if (!READ_ONCE(h.exiting) &&
-	    ((h.auto_resume && h.phase == SUSPENDED) || h.phase == WAITING)) {
+	if (attachment_blocked()) {
+		WRITE_ONCE(h.auto_resume, false);
+		WRITE_ONCE(h.block_initialization, true);
+		h.phase = UNAVAILABLE;
+	}
+	if (!READ_ONCE(h.exiting) && !attachment_blocked() &&
+	    ((h.auto_resume && READ_ONCE(h.phase) == SUSPENDED) || READ_ONCE(h.phase) == WAITING)) {
 		already_owned = h.owner.held;
 		WRITE_ONCE(h.auto_resume, false);
 		WRITE_ONCE(h.block_initialization, false);
@@ -1148,14 +1266,18 @@ static void resume_work(struct work_struct *work)
 			/* Existing ownership also owns buffered callbacks through PM.
 			 * A validation error must not destroy their context.
 			 */
-			if (!already_owned && !h.legacy_blocked)
-				put_gpu();
+			if (!already_owned && !h.legacy_blocked) {
+				int released = put_gpu();
+
+				if (released)
+					ret = released;
+			}
 			h.phase = h.owner.held ? QUIESCED :
 				  ret == -EAGAIN ? WAITING : UNAVAILABLE;
 			set_error(ret);
-			if (ret != -EAGAIN)
+			if (ret != -EAGAIN || already_owned)
 				pr_err("nvpcf_hook: attachment failed: state=%s error=%d\n",
-				       phase_names[h.phase], ret);
+				       phase_names[READ_ONCE(h.phase)], ret);
 		}
 		if (!h.legacy_blocked)
 			release_active(false);
@@ -1178,6 +1300,7 @@ static void invalidate_nvidia_symbols(void)
 	h.original_shutdown = NULL;
 	h.acpi_cleanup = NULL;
 	h.owner_ops = (struct nh_owner_ops){ 0 };
+	h.fine_ops = (struct nh_fine_ops){ 0 };
 	h.open_ip = 0;
 	h.start_ip = 0;
 	h.shutdown_ip = 0;
@@ -1234,11 +1357,11 @@ static int module_notify(struct notifier_block *nb, unsigned long action, void *
 		drain_disabled_redirects();
 	stop_observer();
 	release_active(true);
-	WARN_ON(h.owner.held || h.nvidia_ref);
+	WARN_ON(h.owner.held || h.nvidia_ref || h.fine_held);
 	invalidate_nvidia_symbols();
 	h.retirement_failed = ret != 0;
 	if (!nh_may_unpin_helper(!ret && !h.guards_registered && !h.event_registered,
-				!h.owner.held && !h.owner.stack_ready && !h.nvidia_ref && !h.power_hold,
+				!h.owner.held && !h.owner.stack_ready && !h.nvidia_ref && !h.power_hold && !h.fine_held,
 				pending(), h.guard_poisoned || h.retirement_failed)) {
 		h.phase = UNAVAILABLE;
 		if (ret)
@@ -1279,9 +1402,12 @@ static int pm_notify(struct notifier_block *nb, unsigned long action, void *unus
 			 * retains context while capture counts notifications.
 			 */
 			cancel_work_sync(&h.replay_work);
-			if (h.owner.held) {
+			if (h.owner.held && !attachment_blocked()) {
 				h.phase = SUSPENDED;
 				WRITE_ONCE(h.auto_resume, true);
+			} else if (attachment_blocked()) {
+				WRITE_ONCE(h.auto_resume, false);
+				h.phase = UNAVAILABLE;
 			}
 		}
 		unlock_action();
@@ -1347,8 +1473,20 @@ static int bus_notify(struct notifier_block *nb, unsigned long action, void *dev
 			spin_lock_irqsave(&h.lock, flags);
 			nh_mark_stale(&h.state);
 			spin_unlock_irqrestore(&h.lock, flags);
+			if (h.fine_held) {
+				h.retirement_failed = true;
+				set_error(h.fine_release_error ? h.fine_release_error : -EBUSY);
+				pr_crit("nvpcf_hook: outstanding NVIDIA power reference retains ownership during removal\n");
+				unlock_action();
+				return NOTIFY_DONE;
+			}
 			stop_observer();
-			put_gpu();
+			ret = put_gpu();
+			if (ret) {
+				h.retirement_failed = true;
+				unlock_action();
+				return NOTIFY_DONE;
+			}
 			pr_err("nvpcf_hook: ownership ended with undelivered requests; inspect status\n");
 		}
 	}
@@ -1367,19 +1505,25 @@ static int status_show(struct seq_file *seq, void *unused)
 {
 	struct nh_state s;
 	unsigned long flags;
-	int error;
+	int error, fine_error;
+	bool fine_held;
+	enum nh_phase phase;
 
 	mutex_lock(&h.action);
 	spin_lock_irqsave(&h.lock, flags);
 	s = h.state;
 	error = h.last_error;
+	phase = h.phase;
+	fine_held = h.fine_held;
+	fine_error = h.fine_release_error;
 	spin_unlock_irqrestore(&h.lock, flags);
 	seq_printf(seq, "state: %s\npci: %s\nnvidia_version: %s\ndevice_reference: %u\n",
-		phase_names[h.phase], pci_name(h.pci), h.nvidia_version, !!h.owner.held);
+		phase_names[phase], pci_name(h.pci), h.nvidia_version, !!h.owner.held);
 	if (h.uuid_valid)
 		seq_printf(seq, "gpu_uuid: GPU-%pUb\n", &h.gpu_uuid);
 	seq_printf(seq, "stack_ready: %u\nreplay_paused: %u\n", h.owner.stack_ready,
 		READ_ONCE(h.replay.paused));
+	seq_printf(seq, "nvidia_power_reference: %u\nnvidia_power_release_error: %d\n", fine_held, fine_error);
 	seq_printf(seq, "retirement_failed: %u\n", h.retirement_failed);
 	seq_printf(seq, "guards_registered: %u\ninitialization_blocked: %u\nnvidia_reference: %u\npower_reference: %u\n",
 		h.guards_registered, READ_ONCE(h.block_initialization), h.nvidia_ref,
@@ -1421,7 +1565,7 @@ static int preflight(void)
 
 	if (h.legacy_blocked || h.guard_poisoned || h.state.stale || h.retirement_failed)
 		return -EUCLEAN;
-	if (h.phase == GUARD_ONLY || h.phase == WAITING)
+	if (READ_ONCE(h.phase) == GUARD_ONLY || READ_ONCE(h.phase) == WAITING)
 		return 0;
 	if (!h.owner.held)
 		return h.last_error ? h.last_error : -ENODEV;
@@ -1467,7 +1611,7 @@ static int retry_retirement(void)
 		if (ret)
 			drain_disabled_redirects();
 		stop_observer();
-		if (!ret && (h.owner.held || h.owner.stack_ready || h.nvidia_ref))
+		if (!ret && (h.owner.held || h.owner.stack_ready || h.nvidia_ref || h.fine_held))
 			ret = -EUCLEAN;
 	}
 	if (ret) {
@@ -1476,7 +1620,7 @@ static int retry_retirement(void)
 	}
 	h.retirement_failed = false;
 	h.phase = h.guard_poisoned || h.state.stale ? UNAVAILABLE : DETACHED;
-	if (h.phase == UNAVAILABLE)
+	if (READ_ONCE(h.phase) == UNAVAILABLE)
 		return -EUCLEAN;
 	set_error(0);
 	return 0;
@@ -1518,8 +1662,8 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 	} else if (!strcmp(command, "resume")) {
 		if (h.state.stale || h.guard_poisoned || h.legacy_blocked || h.retirement_failed) {
 			ret = -EUCLEAN;
-		} else if (!nh_monitoring_active(h.phase, &h.replay,
-			READ_ONCE(h.accepting), h.fine_verified)) {
+		} else if (!nh_monitoring_active(READ_ONCE(h.phase), &h.replay,
+			READ_ONCE(h.accepting), h.fine_verified && !READ_ONCE(h.fine_release_error))) {
 			if (!h.self_ref) {
 				__module_get(THIS_MODULE);
 				h.self_ref = true;
@@ -1527,14 +1671,16 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 			WRITE_ONCE(h.target_unavailable, false);
 			WRITE_ONCE(h.block_initialization, false);
 			WRITE_ONCE(h.auto_resume, false);
+			spin_lock_irqsave(&h.lock, flags);
 			h.phase = WAITING;
+			spin_unlock_irqrestore(&h.lock, flags);
 			restore = true;
 			schedule_work(&h.resume_work);
 		}
 	} else if (!strcmp(command, "acknowledge-loss")) {
 		spin_lock_irqsave(&h.lock, flags);
 		if (h.owner.held || h.nvidia_module || h.guards_registered ||
-		    h.phase != UNAVAILABLE || h.retirement_failed || (!h.state.stale && !h.guard_poisoned)) {
+		    READ_ONCE(h.phase) != UNAVAILABLE || h.retirement_failed || (!h.state.stale && !h.guard_poisoned)) {
 			ret = -EINVAL;
 		} else {
 			if (h.state.stale)
@@ -1549,7 +1695,7 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 		cancel_resume = !h.retirement_failed;
 	} else if (h.state.stale || h.guard_poisoned) {
 		ret = -EUCLEAN;
-	} else if (h.phase != GUARD_ONLY) {
+	} else if (READ_ONCE(h.phase) != GUARD_ONLY) {
 		WRITE_ONCE(h.auto_resume, false);
 		if (!h.nvidia_module) {
 			ret = stop_capture();
@@ -1576,7 +1722,7 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 		}
 		cancel_resume = !ret;
 	}
-	if (!ret && h.phase == DETACHED && h.self_ref) {
+	if (!ret && READ_ONCE(h.phase) == DETACHED && h.self_ref) {
 		h.self_ref = false;
 		put_self = true;
 	}
@@ -1588,7 +1734,7 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 	if (restore) {
 		flush_work(&h.resume_work);
 		mutex_lock(&h.action);
-		if (h.phase != ACTIVE && h.phase != WAITING)
+		if (READ_ONCE(h.phase) != ACTIVE && READ_ONCE(h.phase) != WAITING)
 			ret = h.last_error ? h.last_error : -ENODEV;
 		unlock_action();
 	}
@@ -1673,8 +1819,13 @@ static int initial_rollback(void *unused)
 	ret = stop_capture();
 	if (ret)
 		return ret;
+	ret = release_fine_reference();
+	if (ret)
+		return ret;
 	stop_observer();
-	put_gpu();
+	ret = put_gpu();
+	if (ret)
+		return ret;
 	release_active(false);
 	ret = stop_guards();
 	if (!ret)
@@ -1803,7 +1954,7 @@ static void __exit hook_exit(void)
 	unregister_module_notifier(&h.module_nb);
 	cancel_work_sync(&h.resume_work);
 	/* A retained self-reference excludes module exit before preparation. */
-	WARN_ON(h.owner.held || h.owner.stack_ready || h.self_ref || pending() || h.event_registered ||
+	WARN_ON(h.owner.held || h.owner.stack_ready || h.fine_held || h.self_ref || pending() || h.event_registered ||
 		h.observer_registered || atomic_read(&h.redirected) ||
 		h.guards_registered || h.nvidia_ref || h.power_hold ||
 		atomic_read(&h.starting_calls) || atomic_read(&h.opening_calls) ||
