@@ -7,16 +7,21 @@
 # For the given number of seconds, trace.sh shows:
 # - the events the laptop's embedded controller (EC) raises, which the
 #   kernel logs as EC queries;
-# - how long the NVIDIA driver takes to handle each NVPCF notification, the
-#   firmware's power-limit message to the driver;
+# - each call of nv_acpi_nvpcf_event, the NVIDIA driver's handler for the
+#   NVPCF notification, the firmware's power-limit message to the driver,
+#   with how long the call took;
 # - whether the GPU is active or suspended (its runtime power state).
 # It prints the platform profile first. On the Legion 7 16IRX9, the EC
 # raises query 0x48 about every 7 seconds in the balanced profile, and the
 # firmware sends an NVPCF notification with each one. A notification that
 # wakes the GPU takes about 2 seconds to handle; one that leaves it asleep
 # takes microseconds. Before and after the trace, it prints nvpcf_hook's
-# state and request counts, or why they are unknown. The difference between
-# the two counts shows what the hook did during the trace.
+# state and request counts, or why they are unknown. With the hook loaded,
+# nv_acpi_nvpcf_event also runs when the hook passes held notifications on,
+# so the calls are not all firmware notifications. Between the two printouts,
+# the growth of received_requests is the number of firmware notifications
+# that the hook caught, and the growth of dispatch_attempts is the number of
+# calls that the hook made to pass them on.
 #
 # The durations come from a function_graph trace of nv_acpi_nvpcf_event,
 # the driver's handler for the notification. The trace runs in a private
@@ -97,7 +102,7 @@ records=$(grep nv_acpi_nvpcf_event "$I/trace")
 echo "--- EC queries:"
 dmesg --time-format iso | grep -E "Query\(0x[0-9a-f]+\) started" | awk -v s="$since" '$1 >= s' \
     | sed -E 's/^[^T]+T([^,]+),([0-9]{3}).*(Query\(0x[0-9a-f]+\)).*/\1.\2 \3/'
-echo "--- NVPCF notifications (CPU, duration):"
+echo "--- calls of nv_acpi_nvpcf_event (CPU, duration):"
 [ -z "$records" ] || printf '%s\n' "$records"
-echo "$(printf '%s' "$records" | grep -c nv_acpi_nvpcf_event) notifications"
+echo "$(printf '%s' "$records" | grep -c nv_acpi_nvpcf_event) calls of nv_acpi_nvpcf_event"
 hook_summary

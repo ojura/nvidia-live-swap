@@ -195,6 +195,14 @@ hook's state with `nvpcf-hookctl status`, which does not change the hook.
 swap, `swap.sh` also decompresses the nvidia module that `modprobe` would load
 and looks for `RmDeferNvpcfNotifyIfIdle` with `nm`.
 
+Before the swap changes anything, `swap.sh` runs `load-hook.sh --check-disk`,
+which checks the nvidia module that `modprobe` would load in the same way as the
+loader checks a loaded one, and `swap.sh` refuses if the check fails. So a
+driver that the hook cannot use is found before the working one is unloaded.
+With `--check`, `swap.sh` adds `--no-download`. If NVIDIA's source archive for
+that version is not in the cache yet, `--check` then reports that the check
+could not run, and a swap downloads the archive before its first change.
+
 A swap runs these steps in order:
 
 1. If the previous swap ended less than 20 seconds earlier, `swap.sh` waits for
@@ -228,11 +236,18 @@ A swap runs these steps in order:
    order.
 9. It unloads `nvpcf_hook`. The hook keeps itself loaded until NVIDIA's
    unload has finished, and then moves to `detached`.
-10. It loads from disk each module that was loaded at the start, in the order
-    `nvidia`, `nvidia_modeset`, `nvidia_drm`, `nvidia_uvm`.
-11. It loads `nvpcf_hook` again.
-12. It renames the registration files back and starts the services.
-13. It checks the build IDs and the fix, as described below.
+10. It loads `nvidia` from disk.
+11. It runs the loader, `load-hook.sh`, which checks the loaded `nvidia` and
+    loads the hook for it. `swap.sh` then reads the hook's status, and stops
+    here unless the state is `active` or `waiting`, with the guards installed
+    and GPU initialization allowed.
+12. It loads from disk the other modules that were loaded at the start, in the
+    order `nvidia_modeset`, `nvidia_drm`, `nvidia_uvm`. Loading `nvidia_drm`
+    initializes the GPU. It sets up an NVKMS device and frees it again if its
+    setup fails, which ends in NVIDIA's shutdown, so the guard has to be in
+    place by then.
+13. It renames the registration files back and starts the services.
+14. It checks the build IDs and the fix, as described below.
 
 If an interrupted earlier run left one of the registration files renamed,
 `swap.sh` refuses to swap.
@@ -263,12 +278,17 @@ step that fails, and exits with a non-zero status. Revoked handles stay revoked.
 arrives after a change has taken effect, but before its command has returned,
 `swap.sh` still tries to undo the change.
 
-After the hook's `detach`, the hook refuses to let NVIDIA initialize the GPU
-until its `resume`. Loading `nvidia_modeset` or `nvidia_drm`, or starting a
-service such as `lactd`, can make NVIDIA initialize the GPU. So on a failure
-after the detach, `swap.sh` runs the hook's `resume` first, while `nvidia` is
-loaded. If the swap had already unloaded the hook, `swap.sh` loads it again
-after the NVIDIA modules. It never runs `acknowledge-loss`.
+The hook's guard has to be in place before anything makes NVIDIA initialize the
+GPU: loading `nvidia_modeset` or `nvidia_drm`, or starting a service such as
+`lactd`. After its `detach`, the hook also refuses that initialization until
+its `resume`. So on a failure, `swap.sh` first loads `nvidia` again if it is
+missing. Then it runs the loader if the hook is not loaded, or the hook's
+`resume` if the swap had detached it. Only if the hook then reports the state
+`active` or `waiting`, with the guards installed and initialization allowed,
+does it load the other missing modules and start the stopped services.
+Otherwise it renames the registration files back, leaves those modules
+unloaded and those services stopped, and names them. It never runs
+`acknowledge-loss`.
 
 `swap.sh` logs `END` only when every module it loaded, including `nvpcf_hook`,
 has the same build ID as its file on disk, and the fix is in place. Otherwise
@@ -404,21 +424,63 @@ Its control client, `hook/nvpcf-hookctl`, has the commands `status`, `prepare`,
 not deliver the notifications it held, for example because the GPU
 disappeared.
 
+### load-hook.sh and nvpcf-hook.service
+
+`load-hook.sh` runs as root, and is the only way that loads the hook. The hook
+calls functions inside NVIDIA's driver, so it may attach only to a driver build
+whose code `hook/tests/check_nvidia.py` has checked. The loader runs that
+checker on three inputs, and does not run or extract any code from them:
+
+- the nvidia module file with the build's GNU build ID, for its symbols, its
+  ftrace instrumentation and its calls;
+- the version's kernel-open source in `/usr/src/nvidia-<version>`, for the C
+  declarations and roles of the functions that the hook uses;
+- NVIDIA's source archive for the version's tag on GitHub, for the source of
+  the precompiled driver core, where the dispatcher that the hook observes
+  lives.
+
+The archives are kept in `/var/cache/nvpcf-hook`, downloaded over https when one
+is missing, and checked again at every load. By default, the loader loads
+`nvidia` if needed, and reads the loaded build ID from
+`/sys/module/nvidia/notes`. It checks the module file with that build ID, which
+is the file `modprobe` would load, or DKMS's copy for the loaded version and the
+running kernel. It stops when it cannot find a file with the loaded build ID,
+because a check of a different file does not cover the loaded driver. After the
+checks pass, it loads `nvpcf_hook` with `expected_nvidia_build_id` set to the
+checked build ID, and the hook refuses to attach to any other build. The loader
+exits with status 0 only if the hook then reports `active`, or `waiting` with
+its guards installed and GPU initialization allowed. `--check-disk` checks the
+file that `modprobe` would load without loading anything. `--no-download` makes
+a missing archive end the run with status 3, which means the check could not
+run. `--fetch VERSION` only downloads an archive.
+
+`nvpcf-hook.service` runs the installed loader once at boot, after the network
+is up, because a new driver version can need its archive. A unit runs it rather
+than `/etc/modules-load.d`, and `swap.sh` calls the loader directly rather than
+`modprobe`, because a plain `modprobe nvpcf_hook` lacks the build ID and fails.
+
 ### install-hook.sh
 
-`install-hook.sh` runs as root. It reads the hook's version from
-`hook/dkms.conf`, and copies the hook's source files to
-`/usr/src/nvpcf-hook-<version>`, where DKMS expects them. It builds and installs
-the module with DKMS for every kernel that DKMS lists for the NVIDIA driver,
-plus the running kernel. An earlier copy of the same version is removed from
-DKMS first. It writes `/etc/modules-load.d/nvpcf-hook.conf`, so that systemd
-loads the module at boot. The module's soft dependency on `nvidia` loads
-NVIDIA's driver before it. `install-hook.sh` does not load the module.
+`install-hook.sh` runs as root. DKMS builds each version of a module from its
+own source directory, `/usr/src/<package>-<version>`. The script gives each
+content of `hook/` its own version: the version in `hook/dkms.conf`, a hyphen,
+and the first 12 hex digits of a SHA-256 over the hook's source files. It
+copies the source there, and builds and installs that version with DKMS for
+every kernel that DKMS lists for the NVIDIA driver, plus the running kernel.
+For each kernel it checks that the module `modprobe` finds is the one DKMS
+built. A kernel keeps its installed module when the new version does not build
+or install for it, and so does a kernel whose headers are missing. Afterwards
+the script removes every other version that is not installed for any kernel.
 
-It works out the kernels before it changes anything. If `dkms status` fails or
-the running kernel's headers are missing, it stops there. If it has to skip
-another kernel because that kernel's headers are missing, it exits with status
-1 at the end.
+It installs `load-hook.sh`, `check_nvidia.py` and `nvpcf-hookctl` as root-owned
+copies in `/usr/local/lib/nvpcf-hook`, enables `nvpcf-hook.service`, and
+downloads the source archive for each NVIDIA version that DKMS lists. It does
+not load the hook.
+
+It reads the DKMS state and works out the kernels before it changes anything.
+If a `dkms status` fails or the running kernel's headers are missing, it stops
+there. It exits with status 1 at the end if it skipped a kernel, if a build,
+install or check failed, or if an archive could not be downloaded.
 
 ### trace.sh
 
@@ -443,9 +505,12 @@ instance and turns off the debug messages it turned on.
 
 Before and after the trace, `trace.sh` prints nvpcf_hook's state and request
 counts, or why they are unknown. With the hook loaded, `nv_acpi_nvpcf_event`
-runs either the hook's short replacement, when the hook holds the
-notification, or NVIDIA's handler, when the hook delivers one. The traced
-durations then cover both.
+runs for each firmware notification, as the hook's short replacement, and
+again for each delivery the hook makes, as NVIDIA's handler. So `trace.sh`
+labels its records as calls of `nv_acpi_nvpcf_event`. Between the two
+printouts, the growth of `received_requests` is the number of firmware
+notifications that the hook caught, and the growth of `dispatch_attempts` is
+the number of deliveries.
 
 ## Tests
 
@@ -471,23 +536,51 @@ durations then cover both.
   - After a recent swap, `swap.sh` waits, and `--check` reports the wait. A swap
     after an older swap starts at once. A failed swap still records its end
     time.
-  - With nvpcf_hook, a mock `nvpcf-hookctl` keeps the hook's state. A full swap
-    prepares, detaches, unloads and loads the hook in the order described
-    above, and ends with the hook active. `swap.sh` refuses, without changing
-    anything, when the hook is not loaded, also with a patched driver on disk,
-    and when it is not installed, unreadable, unavailable, detached or
-    starting. A failed `prepare` stops the swap before any change. After a
-    failed `detach`, a failed NVIDIA unload or a SIGTERM after the detach,
-    `swap.sh` resumes the hook before it loads a module again or starts a
-    service. When NVIDIA's unload leaves the hook unavailable, `swap.sh` reports
-    it and never acknowledges the loss. A hook that cannot load again, or does
-    not become active, ends the swap with `END (failed)`.
+  - With nvpcf_hook, a mock `nvpcf-hookctl` keeps the hook's state, and a mock
+    `load-hook.sh` loads the hook. Every case starts with the hook loaded and
+    active. The mock records each module load or service start that could make
+    NVIDIA initialize the GPU while the hook's guard is missing, and every case
+    fails if it finds one, or if `swap.sh` runs `modprobe nvpcf_hook` itself.
+    A full swap prepares, detaches, unloads and loads the hook in the order
+    described above, and ends with the hook active. `swap.sh` refuses, without
+    changing anything, when the hook is not loaded, also with a patched driver
+    on disk, when it is not installed, unreadable, unavailable, detached or
+    starting, when the loader is missing, and when the driver on disk fails the
+    loader's check. With `--check`, an archive that is not cached yet is
+    reported as a check still to run, and a swap lets the loader download it
+    first. A failed `prepare` stops the swap before any change. After a failed
+    `detach`, a failed NVIDIA unload, or a SIGTERM after the detach or after
+    `nvidia`'s unload, `swap.sh` brings the hook back before it loads another
+    module or starts a service. When the hook cannot guard, after NVIDIA's
+    unload left it unavailable, after it could not load again, or when it lacks
+    its guards after loading, `swap.sh` leaves the other modules unloaded and
+    the services stopped, says so, and never acknowledges a loss. A hook that
+    does not become active, or a service that does not start, ends the swap
+    with `END (failed)`.
+- `tests/check_load_hook.py` runs `load-hook.sh` as an ordinary user, against a
+  mock `modprobe`, `modinfo`, `zstd`, `readelf`, `curl`, `uname`, checker and
+  control client, and a throwaway directory in place of `/sys/module`,
+  `/proc/modules`, the cache, `/var/lib/dkms`, `/lib/modules` and `/usr/src`.
+  The loaded build ID is a real GNU note that the script parses. The cases check
+  that it checks the file with the loaded build ID, or DKMS's copy when only
+  that matches, and that it stops without a check when neither matches. They
+  check that it passes the build ID in lowercase, and downloads a missing
+  archive over https into the cache without leaving a partial file. A failed
+  download, a rejected check, a missing source tree, a version string that is
+  not a version and a failed module load all stop it before the hook loads or
+  with a failure status. Its status is 0 only for `active`, or `waiting` with
+  guards and initialization allowed. It also checks `--check-disk`,
+  `--no-download`, `--fetch` and an already loaded hook.
 - `tests/check_install_hook.py` runs `install-hook.sh` as an ordinary user,
-  against a mock `dkms`, `uname` and `modinfo` and a throwaway directory in
-  place of `/usr/src`, `/lib/modules` and `/etc/modules-load.d`. Its cases are
-  a failing `dkms status`, missing headers for the running kernel and for
-  another kernel, an extra argument, a full install for two kernels, and a
-  reinstall of the same version.
+  against a mock `dkms` that keeps the added, built and installed versions, and
+  whose `remove` uninstalls a version from every kernel that has it, as DKMS
+  does. The cases are a fresh install, an upgrade that removes the old version
+  only after the new one is installed everywhere, a build failure on one kernel
+  and on both, an install failure, a kernel with missing headers, a second run
+  with the same source, a failing `dkms status` for `nvidia` and for
+  `nvpcf-hook`, missing headers for the running kernel, a failed archive
+  download and an extra argument. A kernel whose new build fails keeps its
+  working module.
 - `make -C hook check` runs nvpcf_hook's own tests, which
   [hook/README.md](hook/README.md) describes.
 - `tests/check_build.py` runs `build.sh` as an ordinary user, against mock

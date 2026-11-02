@@ -53,9 +53,12 @@
 # prevent that, because the patched driver takes the same lock before it
 # defers a notification. swap.sh therefore refuses unless nvpcf_hook is
 # loaded, installed for the running kernel, and in a state that allows a
-# swap. A swap runs the hook's prepare before any change, and its detach
-# once the other holders are gone. It unloads NVIDIA while the hook's guard
-# remains, then unloads the hook, and loads it again after the new driver.
+# swap. It also refuses when the driver it would load fails the checks of
+# the hook's loader, load-hook.sh, which it runs before any change. A swap
+# runs the hook's prepare before any change, and its detach once the other
+# holders are gone. It unloads NVIDIA while the hook's guard remains, then
+# unloads the hook. It loads nvidia, then the hook through load-hook.sh, and
+# the other NVIDIA modules only once the hook's guard is in place.
 #
 # Once the display device is free, a swap hides the files that register
 # NVIDIA's EGL and Vulkan libraries with their loaders (HIDE), so that these
@@ -94,6 +97,7 @@ STOPPABLE=(lactd.service nvidia-persistenced.service nvidia-powerd.service)
 STAMP=/run/nvidia-live-swap.last  # when the previous swap ended (date +%s)
 GAP=20                            # rtkit-daemon's --actions-burst-sec default
 HOOK_WAIT=15                      # seconds for nvpcf_hook to become active
+LOADER=/usr/local/lib/nvpcf-hook/load-hook.sh  # installed by install-hook.sh
 
 log() { echo "$(date +%T.%N | cut -c1-12) $*"; }
 
@@ -241,8 +245,25 @@ case $patch_rc in
 esac
 modinfo -n nvpcf_hook >/dev/null 2>&1 ||
     hook_problems+=("nvpcf_hook is not installed for kernel $(uname -r), so swap.sh could not load it after the swap")
+if [ ! -x "$LOADER" ]; then
+    hook_problems+=("$LOADER is missing; install-hook.sh installs it")
+else
+    # Check the driver that the swap would load before changing anything, so
+    # that a driver which the hook cannot use is refused here. --check does
+    # not download NVIDIA's source archive; a swap downloads it first.
+    if [ $check_only = 1 ]; then
+        disk_check=$("$LOADER" --check-disk --no-download 2>&1)
+    else
+        disk_check=$("$LOADER" --check-disk 2>&1)
+    fi
+    case $? in
+        0) log "the nvidia module on disk passes nvpcf_hook's checks" ;;
+        3) log "$disk_check; a swap would download it first" ;;
+        *) hook_problems+=("the nvidia module on disk does not pass nvpcf_hook's checks: $disk_check") ;;
+    esac
+fi
 if ! hook_loaded; then
-    hook_problems+=("nvpcf_hook is not loaded; load it with modprobe nvpcf_hook, and check that $DIR/hook/nvpcf-hookctl status reports the state active")
+    hook_problems+=("nvpcf_hook is not loaded; load it with $LOADER, which checks the loaded driver first")
 elif ! hook_status=$(hookctl status 2>&1); then
     hook_problems+=("cannot read the status of nvpcf_hook: $hook_status")
 else
@@ -252,7 +273,7 @@ else
         active|waiting|guard-only|quiesced) ;;
         starting|suspended) hook_problems+=("nvpcf_hook is $hook_state; check again in a few seconds") ;;
         unavailable) hook_problems+=("nvpcf_hook is unavailable with last_error $(sed -n 's/^last_error: //p' <<<"$hook_status"); its status and the kernel log say why, and swap.sh does not acknowledge a loss") ;;
-        *) hook_problems+=("nvpcf_hook is ${hook_state:-in an unknown state}, so it does not guard a swap; run $DIR/hook/nvpcf-hookctl resume, or unload it and load it again") ;;
+        *) hook_problems+=("nvpcf_hook is ${hook_state:-in an unknown state}, so it does not guard a swap; run $DIR/hook/nvpcf-hookctl resume, or unload it and load it again with $LOADER") ;;
     esac
 fi
 for x in "${hook_problems[@]}"; do log "$x"; done
@@ -279,19 +300,26 @@ fi
 # cannot stop gdb in the middle of a call it injected into the target
 # process.
 #
-# After nvpcf_hook's detach, the hook refuses to let NVIDIA initialize the
-# GPU until it resumes. hook_detached records the detach before it runs. The
-# trap then resumes the hook before it reloads NVIDIA modules or starts
-# services, because both can make NVIDIA initialize the GPU. If the swap
-# had already unloaded the hook, the trap loads it again.
+# nvpcf_hook has to guard NVIDIA's shutdown before anything makes NVIDIA
+# initialize the GPU, because a failed initialization ends in that shutdown.
+# Loading nvidia_drm initializes the GPU: it sets up an NVKMS device, and
+# frees it again if its setup fails. A started service such as lactd does
+# too. So the swap and the trap load nvidia first, then load or resume the
+# hook, and check from its status that its guard is installed and
+# initialization is allowed. Only then do they load the other modules and
+# start the services. If the hook does not reach that state, the trap leaves
+# those modules unloaded and the services stopped, and reports them. After
+# its detach, the hook refuses initialization until it resumes.
+# hook_detached records the detach before it runs, so that the trap resumes
+# the hook.
 MODULES=(nvidia nvidia_modeset nvidia_drm nvidia_uvm)  # load order
 hidden=() stopped=() initial=()
-hook_detached=0 hook_resumed=0
+hook_detached=0
 succeeded=0
 
 is_loaded() { grep -q "^$1 " /proc/modules; }
-restore() {
-    local f u status=0
+restore_files() {
+    local f status=0
     for f in "${hidden[@]}"; do
         if [ -e "$f.hotswap" ]; then
             if mv "$f.hotswap" "$f"; then log "restored $f"; else log "could not restore $f"; status=1; fi
@@ -300,37 +328,65 @@ restore() {
         fi
     done
     hidden=()
+    return $status
+}
+restore_services() {
+    local u status=0
     for u in "${stopped[@]}"; do
         if systemctl start "$u"; then log "started $u"; else log "could not start $u"; status=1; fi
     done
     stopped=()
     return $status
 }
-hook_resume() {
-    hook_resumed=1
-    if hookctl resume 2>&1; then log "resumed nvpcf_hook"; else log "could not resume nvpcf_hook: $(hook_summary)"; fi
+restore() {
+    local status=0
+    restore_files || status=1
+    restore_services || status=1
+    return $status
+}
+# Exit status 0 if nvpcf_hook reports its shutdown guard installed and GPU
+# initialization allowed, as in the states waiting and active.
+hook_guarding() {
+    local s
+    s=$(hookctl status 2>/dev/null) || return 1
+    case "$(sed -n 's/^state: //p' <<<"$s")" in
+        active|waiting) ;;
+        *) return 1 ;;
+    esac
+    [ "$(sed -n 's/^guards_registered: //p' <<<"$s")" = 1 ] &&
+        [ "$(sed -n 's/^initialization_blocked: //p' <<<"$s")" = 0 ]
 }
 cleanup() {
-    local status=$? m
+    local status=$? m missing=()
     trap - EXIT INT TERM HUP
     date +%s > "$STAMP" || log "could not write $STAMP"
     [ $succeeded = 1 ] && exit 0
-    if [ $hook_detached = 1 ] && is_loaded nvidia && hook_loaded; then
-        hook_resume
+    if contains nvidia "${initial[@]}" && ! is_loaded nvidia; then
+        if modprobe nvidia; then log "loaded nvidia again"; else log "could not load nvidia again"; fi
     fi
-    for m in "${MODULES[@]}"; do
-        if contains "$m" "${initial[@]}" && ! is_loaded "$m"; then
-            if modprobe "$m"; then log "loaded $m again"; else log "could not load $m again"; fi
-        fi
-    done
     if is_loaded nvidia; then
         if ! hook_loaded; then
-            if modprobe nvpcf_hook; then log "loaded nvpcf_hook again"; else log "could not load nvpcf_hook again"; fi
-        elif [ $hook_detached = 1 ] && [ $hook_resumed = 0 ]; then
-            hook_resume
+            if "$LOADER" 2>&1; then log "loaded nvpcf_hook again"; else log "could not load nvpcf_hook again"; fi
+        elif [ $hook_detached = 1 ]; then
+            if hookctl resume 2>&1; then log "resumed nvpcf_hook"; else log "could not resume nvpcf_hook"; fi
         fi
     fi
-    restore
+    if hook_guarding; then
+        for m in "${MODULES[@]}"; do
+            if contains "$m" "${initial[@]}" && ! is_loaded "$m"; then
+                if modprobe "$m"; then log "loaded $m again"; else log "could not load $m again"; fi
+            fi
+        done
+        restore
+    else
+        restore_files
+        for m in "${MODULES[@]}"; do
+            if contains "$m" "${initial[@]}" && ! is_loaded "$m"; then missing+=("$m"); fi
+        done
+        log "nvpcf_hook does not guard NVIDIA's shutdown, so swap.sh does not make NVIDIA initialize the GPU"
+        [ ${#missing[@]} -eq 0 ] || log "not loaded again: ${missing[*]}"
+        [ ${#stopped[@]} -eq 0 ] || log "not started again: ${stopped[*]}"
+    fi
     log "$(hook_summary)"
     log "END (failed)"
     [ $status = 0 ] && status=1
@@ -420,9 +476,12 @@ for m in "${MODULES[@]}"; do
     contains "$m" "${initial[@]}" || continue
     modprobe "$m" || fail "could not load $m"
     log "loaded $m"
+    if [ "$m" = nvidia ]; then
+        "$LOADER" 2>&1 || fail "could not load nvpcf_hook for the new driver, so the swap stops before the modules that initialize the GPU: $(hook_summary)"
+        hook_guarding || fail "nvpcf_hook does not guard NVIDIA's shutdown, so the swap stops before the modules that initialize the GPU: $(hook_summary)"
+        log "loaded $(hook_summary)"
+    fi
 done
-modprobe nvpcf_hook || fail "could not load nvpcf_hook"
-log "loaded $(hook_summary)"
 
 restore || fail "the modules were replaced, but restoring the files or services failed"
 head -1 /proc/driver/nvidia/version

@@ -1,0 +1,14 @@
+[Unit]
+Description=Check the loaded NVIDIA driver and load nvpcf_hook for it
+# The loader downloads NVIDIA's source archive when the archive for a new
+# driver version is not in /var/cache/nvpcf-hook yet.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/nvpcf-hook/load-hook.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

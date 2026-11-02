@@ -23,11 +23,11 @@ There are two ways to install the fix:
   request's code, which can happen only if a memory allocation fails while the
   driver loads. Each new driver version needs `build.sh` again.
 - `install-hook.sh` installs nvpcf_hook, a separate kernel module that catches
-  the messages before Ubuntu's unchanged driver handles them. It keeps working
-  when Ubuntu installs a new driver version, for example through automatic
-  updates, as long as NVIDIA keeps the internal functions that the hook uses.
-  It also guards NVIDIA's shutdown of the GPU against a hang described in
-  [Limitations](#limitations).
+  the messages before Ubuntu's unchanged driver handles them. When Ubuntu
+  installs a new driver version, for example through automatic updates, the
+  hook's loader checks the new driver's code before the hook attaches to it, so
+  the fix carries over without a rebuild. The hook also guards NVIDIA's
+  shutdown of the GPU against a hang described in [Limitations](#limitations).
 
 The scripts are tested on a Legion 7 16IRX9 (RTX 4070 Laptop GPU) with Ubuntu
 24.04, kernel 7.0, GNOME 46 on Wayland, and Ubuntu's packages of NVIDIA's open
@@ -48,22 +48,28 @@ Run the scripts from the repository directory.
   disk, and that nvpcf_hook is active. Every swap needs nvpcf_hook, as
   [Limitations](#limitations) explains.
 - `sudo ./install-hook.sh` installs nvpcf_hook with DKMS for the installed
-  kernels, and makes it load at boot. `sudo modprobe nvpcf_hook` loads it now.
-- `sudo ./hook/nvpcf-hookctl status` shows nvpcf_hook's state and counts. The
-  hook holds messages only in the state `active`.
-  [hook/README.md](hook/README.md) describes the other states and the counts.
-- `sudo ./trace.sh [seconds]` records the firmware's messages to the driver for
-  60 seconds, or for the given number of seconds. It shows each message, how
-  long the driver takes to handle it, and when the GPU goes to sleep or wakes
-  up. Run it in the Balanced mode. A message that wakes the GPU takes about 2
-  seconds to handle. A message that leaves the GPU asleep takes microseconds.
-  When nvpcf_hook is loaded, it also prints the hook's counts before and after
-  the trace.
+  kernels, together with its loader and a systemd unit that runs the loader at
+  boot. `sudo /usr/local/lib/nvpcf-hook/load-hook.sh` loads the hook now. The
+  loader checks the loaded NVIDIA driver's code first, and loads the hook only
+  if the checks pass.
+- `sudo ./hook/nvpcf-hookctl status` shows nvpcf_hook's state and counts. In the
+  state `active`, the hook holds messages while the GPU sleeps, and passes them
+  on when the GPU wakes up. In `waiting`, it waits for a program to start the
+  GPU. [hook/README.md](hook/README.md) describes the other states and the
+  counts.
+- `sudo ./trace.sh [seconds]` records, for 60 seconds or the given number of
+  seconds, the firmware's queries, each call of NVIDIA's handler for the
+  messages with its duration, and when the GPU goes to sleep or wakes up. Run
+  it in the Balanced mode. A call that wakes the GPU takes about 2 seconds. A
+  call that leaves the GPU asleep takes microseconds. With nvpcf_hook loaded,
+  the handler also runs when the hook passes held messages on. `trace.sh` then
+  prints the hook's counts before and after the trace, which tell the two
+  apart.
 
 To install the fix without logging out:
 
-- With nvpcf_hook, run `sudo ./install-hook.sh` and `sudo modprobe nvpcf_hook`,
-  and check that `sudo ./hook/nvpcf-hookctl status` reports the state `active`.
+- With nvpcf_hook, run `sudo ./install-hook.sh`, and then
+  `sudo /usr/local/lib/nvpcf-hook/load-hook.sh`, which reports the hook's state.
   The hook attaches to the running driver, so the fix works without a swap.
 - With `build.sh`, run `sudo ./build.sh`. The patched driver loads at the next
   boot.
@@ -112,8 +118,10 @@ away from the programs that have it open.
   can make the swap fail if it holds them open when the driver is unloaded.
 - `swap.sh` prepares nvpcf_hook before it changes anything, and detaches it
   once the other programs have let go of the GPU. It unloads the hook after
-  NVIDIA's driver, and loads it again after the new driver. The swap succeeds
-  only if the hook is active afterwards.
+  NVIDIA's driver. Then it loads NVIDIA's main module, the hook, and the
+  modules that start the GPU, in that order, so that the hook's guard is in
+  place before the GPU starts. The swap succeeds only if the hook is active
+  afterwards.
 
 ## Limitations
 
@@ -133,6 +141,8 @@ before it renames files, stops services or takes the GPU away from any program.
 - A registration file is still renamed from an interrupted earlier swap.
   `swap.sh --check` names the file. Remove its `.hotswap` suffix before the next
   swap.
+- The driver that the swap would load fails nvpcf_hook's checks. The loader
+  runs them on that driver before the swap changes anything.
 - nvpcf_hook is not loaded, not installed for the running kernel, or in a state
   that does not allow a swap. `swap.sh --check` says which. If the hook lost
   messages it held, for example because the GPU disappeared, it stays
@@ -177,13 +187,19 @@ login.
 
 ## Driver and kernel updates
 
-With nvpcf_hook, a new NVIDIA driver version keeps the fix by itself. The hook
-attaches to the loaded NVIDIA driver of any version, if it finds the functions
-it needs.
-DKMS builds the hook for each new kernel. If a new driver changes those
-functions, the hook does not become active, and the GPU wakes up for every
-firmware message again. `sudo ./hook/nvpcf-hookctl status` then shows the
-state and the error, and the kernel log has the details.
+With nvpcf_hook, a new NVIDIA driver version keeps the fix without a rebuild.
+Each time the hook loads, its loader checks the code of the loaded driver. It
+reads the module file with the same build ID, the version's source in
+`/usr/src`, and NVIDIA's source archive for the version, which it downloads once
+and keeps in `/var/cache/nvpcf-hook`. It loads the hook only if the checks pass,
+and the hook then refuses to attach to any other driver build. DKMS builds the
+hook for each new kernel.
+
+If the checks fail, or the hook cannot attach, the GPU wakes up for every
+firmware message again. The loader's output, `journalctl -u nvpcf-hook` after a
+boot, and the kernel log say why. The checks look at the functions, calls and
+source that [hook/README.md](hook/README.md) lists. A change in NVIDIA's driver
+outside those can still break the hook.
 
 With `build.sh`, the fix is part of the driver. When Ubuntu's NVIDIA driver
 package is installed, DKMS compiles the kernel modules on the machine. Only the
@@ -209,7 +225,8 @@ diversion is in place.
 2. Put Ubuntu's driver core back, and rebuild the driver for each kernel, with
    the commands in [Restoring Ubuntu's driver
    core](#restoring-ubuntus-driver-core).
-3. Reboot. Ubuntu's unchanged driver and the hook load at boot.
+3. Reboot. Ubuntu's unchanged driver loads, and `nvpcf-hook.service` checks it
+   and loads the hook.
 4. Run `sudo ./hook/nvpcf-hookctl status`, and check that the state is
    `active`.
 
