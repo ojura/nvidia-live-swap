@@ -485,10 +485,12 @@ when the new version does not build or install for it, and so does a kernel
 whose headers are missing. Afterwards the script removes every older version
 that is not installed for any kernel.
 
-It installs `load-hook.sh`, `check_nvidia.py` and `nvpcf-hookctl` as root-owned
-copies in `/usr/local/lib/nvpcf-hook`, enables `nvpcf-hook.service`, and
-downloads the source archive for each NVIDIA version that DKMS lists. It does
-not load the hook.
+It installs `load-hook.sh`, `check_nvidia.py`, `expected_dispatcher.c` and
+`nvpcf-hookctl` as root-owned copies in `/usr/local/lib/nvpcf-hook`.
+`check_nvidia.py` compares the dispatcher function in NVIDIA's source archive
+with the copy in `expected_dispatcher.c`, which it reads from its own
+directory. The script enables `nvpcf-hook.service`, and downloads the source
+archive for each NVIDIA version that DKMS lists. It does not load the hook.
 
 It reads the DKMS state and works out the kernels before it changes anything.
 If a `dkms status` fails or the running kernel's headers are missing, it stops
@@ -599,7 +601,10 @@ the number of deliveries.
   extra argument. A kernel whose new build fails keeps its working module.
   Every case that registers the new version checks, with `VER` from
   `/usr/sbin/dkms`, that DKMS would build the new version for the next
-  kernel.
+  kernel. The fresh install also runs `hook/tests/check_checker.py`,
+  nvpcf_hook's tests of its checker, in a copy of the installed directory, so
+  the installed `check_nvidia.py` has to find `expected_dispatcher.c` where
+  `install-hook.sh` put it.
 - `make -C hook check` runs nvpcf_hook's own tests, which
   [hook/README.md](hook/README.md) describes.
 - `tests/check_build.py` runs `build.sh` as an ordinary user, against mock

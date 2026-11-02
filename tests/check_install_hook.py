@@ -19,7 +19,13 @@ and that a failing dkms status stops the script before it changes anything.
 For a new kernel, DKMS builds the greatest registered version, as its VER
 function orders them. Every case that registers the new version checks that
 the new version is that greatest one, with VER taken from /usr/sbin/dkms when
-it exists."""
+it exists.
+
+The fresh install also runs hook/tests/check_checker.py, nvpcf_hook's tests of
+its checker, in a copy of the installed /usr/local/lib/nvpcf-hook, with -I and
+-B as load-hook.sh runs the checker. So the installed check_nvidia.py has to
+find its data file, expected_dispatcher.c, in the directory that
+install-hook.sh filled."""
 import hashlib
 import json
 import os
@@ -216,8 +222,21 @@ r = run('fresh-install', {})
 check(r, r['exit'] == 0 and r['new'] is not None, f"exits with status 0 and adds a new version, got status {r['exit']}")
 check(r, r['state']['installed'] == {RUNNING: r['new'], OTHER: r['new']},
       f"installs the new version for both kernels, got {r['state']['installed']}")
-check(r, r['loader'] == ['check_nvidia.py', 'load-hook.sh', 'nvpcf-hookctl'] and r['unit'] and r['enabled'],
-      f"installs the loader, its checker and the control client, and enables the boot unit, got {r['loader']}")
+check(r, r['loader'] == ['check_nvidia.py', 'expected_dispatcher.c', 'load-hook.sh', 'nvpcf-hookctl']
+      and r['unit'] and r['enabled'],
+      f"installs the loader, its checker with the checker's data file and the control client, and enables the boot unit, got {r['loader']}")
+lib = BASE / r['case'] / 'usr/local/lib/nvpcf-hook'
+data = lib / 'expected_dispatcher.c'
+check(r, data.is_file() and data.read_bytes() == (SRC / 'hook/tests/expected_dispatcher.c').read_bytes()
+      and data.stat().st_mode & 0o777 == 0o644,
+      'installs an unchanged copy of hook/tests/expected_dispatcher.c with mode 0644')
+layout = BASE / 'installed-checker'
+shutil.copytree(lib, layout)
+shutil.copy(SRC / 'hook/tests/check_checker.py', layout)
+p = subprocess.run(['python3', '-I', '-B', str(layout / 'check_checker.py')],
+                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+check(r, p.returncode == 0,
+      f"the installed checker passes nvpcf_hook's checker tests with its installed data file, got status {p.returncode}:\n{p.stdout}")
 check(r, r['archives'] == ['open-gpu-kernel-modules-615.71.09.tar.gz'],
       f"downloads NVIDIA's source archive for the installed version, got {r['archives']}")
 check(r, r['new'] == NEW, f"registers PACKAGE_VERSION from hook/dkms.conf, {NEW}, got {r['state']['added']}")

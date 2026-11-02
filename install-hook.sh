@@ -19,12 +19,15 @@
 # whose headers are missing. Afterwards, the script removes every older
 # version that is not installed for any kernel.
 #
-# It installs load-hook.sh, check_nvidia.py and nvpcf-hookctl as root-owned
-# copies in /usr/local/lib/nvpcf-hook, and enables nvpcf-hook.service, which
-# runs load-hook.sh at boot. It downloads NVIDIA's source archive for each
-# NVIDIA version that DKMS lists into /var/cache/nvpcf-hook, so that loading
-# the hook does not need the network. It does not load the hook now; running
-# /usr/local/lib/nvpcf-hook/load-hook.sh does.
+# It installs load-hook.sh, check_nvidia.py, expected_dispatcher.c and
+# nvpcf-hookctl as root-owned copies in /usr/local/lib/nvpcf-hook, and enables
+# nvpcf-hook.service, which runs load-hook.sh at boot. check_nvidia.py compares
+# the dispatcher function in NVIDIA's source archive with the copy in
+# expected_dispatcher.c, which it reads from its own directory. The script
+# downloads NVIDIA's source archive for each NVIDIA version that DKMS lists into
+# /var/cache/nvpcf-hook, so that loading the hook does not need the network. It
+# does not load the hook now; running /usr/local/lib/nvpcf-hook/load-hook.sh
+# does.
 #
 # It reads the DKMS state and works out the kernels before it changes
 # anything, and stops there if a dkms status fails or the running kernel's
@@ -124,6 +127,7 @@ done
 
 install -D -m 0755 "$here/load-hook.sh" "$LIB/load-hook.sh" &&
     install -D -m 0644 "$here/hook/tests/check_nvidia.py" "$LIB/check_nvidia.py" &&
+    install -D -m 0644 "$here/hook/tests/expected_dispatcher.c" "$LIB/expected_dispatcher.c" &&
     install -D -m 0755 "$here/hook/nvpcf-hookctl" "$LIB/nvpcf-hookctl" &&
     install -D -m 0644 "$here/nvpcf-hook.service" "$UNIT" || fail "could not install the loader in $LIB"
 systemctl daemon-reload && systemctl enable nvpcf-hook.service || failed+=("enabling nvpcf-hook.service")
