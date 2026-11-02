@@ -533,10 +533,20 @@ such as `nvpcf_hook.mod.c`, which are not part of the source. A registered
 version has the same source only if its directory holds exactly these files,
 with the same content. For a version that DKMS does not have registered, an
 existing directory, such as the copy from a run whose `dkms add` failed, is
-reused only if it holds exactly the source. Otherwise the script refuses,
-names the files that differ, and leaves the directory as it is, because it
-can hold someone's work. A failed `dkms add` stops the run before any module
-is built or installed, and leaves the copied source for the next run.
+reused only if its entries are exactly the source files. Each has to be a
+regular file, not a symbolic link, with no other hard link, because DKMS
+copies a link as a link, and another name of the file could change it later.
+The script reads the entries with NUL separators and compares each whole name
+with the source files, so a name with a space or a newline cannot pass for
+two of them. If the directory differs, or the listing or a file cannot be
+read, the script refuses, names the differences, and leaves the directory as
+it is, because it can hold someone's work. When the directory does not exist,
+the script creates it with `mkdir` without `-p`, which fails if anything
+appeared there in the meantime. A failed copy removes only the files that the
+run copied and the directory it created. A failed `dkms add` stops the run
+before any module is built or installed, and leaves the copied source for the
+next run. When the script removes an older version, it deletes that version's
+source files and then the directory only if nothing else is in it.
 
 The script builds and installs the version with DKMS for every kernel that
 DKMS lists for the NVIDIA driver or for nvpcf-hook, plus the running kernel.
@@ -571,8 +581,9 @@ script enables `nvpcf-hook.service`, and downloads the source archive for each
 NVIDIA version that DKMS lists. It does not load the hook.
 
 It reads the DKMS state and works out the kernels before it changes anything.
-If a `dkms status` fails or the running kernel's headers are missing, it stops
-there. It exits with status 1 at the end if it skipped a kernel, if a build,
+It stops there if a `dkms status` fails, or if the running kernel's headers
+are missing and that kernel does not have the version installed and passing
+the check. It exits with status 1 at the end if it skipped a kernel, if a build,
 install or check failed, or if an archive could not be downloaded.
 
 ### trace.sh
@@ -729,14 +740,25 @@ the number of deliveries.
   - an unregistered source directory that holds exactly the source, which the
     script registers and installs, and one with a changed, a missing and an
     extra file, or a file in the directory's place, which stop the script with
-    every difference named and stay as they were;
+    every difference named and stay as they were. The same holds for a
+    directory whose `build_id.h` is a symbolic link or a hard link to an
+    identical file, for extra names with a space and with a newline that read
+    like source names, and for a directory whose listing or one of whose files
+    cannot be read;
+  - another process creating a file at the source directory's path just before
+    the script's `mkdir`, which leaves that file as it was, and a failed copy,
+    which removes the run's own directory;
+  - an older version whose source directory holds an extra file, whose source
+    files go while the directory and that file stay;
   - a failed `dkms add`, which keeps the copied source, and a retry that
     registers that copy;
   - a real Kbuild build in `hook/` between two runs, after which the second
     run finds the registered source unchanged, and the registered source
     builds with Kbuild. This case needs the running kernel's headers;
   - a failing `dkms status` for `nvidia` and for `nvpcf-hook`, missing headers
-    for the running kernel, and an extra argument.
+    for the running kernel, and an extra argument. A running kernel without
+    headers that has the new version installed and passes the check does not
+    stop the script; one whose installed file does not pass it does.
 
   Every case that registers the new version checks, with `VER` from
   `/usr/sbin/dkms`, that DKMS would build the new version for the next

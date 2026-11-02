@@ -33,6 +33,15 @@ anything. Every case that registers the new version checks that the new
 version is the greatest one, with VER taken from /usr/sbin/dkms when it
 exists.
 
+The source-directory cases cover a directory that matches and one that
+differs, a source file that is a symbolic or hard link to an identical file,
+extra names with a space and with a newline that read like source names, a
+listing and a file read that fail, a file that another process creates at the
+directory's path just before mkdir, a failed copy, and an older version's
+source directory with an extra file. mkdir, cp, find and cmp are mocks only in
+the cases that need them. A running kernel without headers passes when it has
+the version installed and checked, and stops the script otherwise.
+
 One case builds hook/ with the real Kbuild between two runs, as hook/README.md
 describes, so the second run sees the generated files, such as
 nvpcf_hook.mod.c. The second run has to find the registered source unchanged,
@@ -193,6 +202,31 @@ elif cmd == 'curl':
     if cfg.get('fetch_fails'):
         sys.exit(22)
     out.write_text('archive')
+elif cmd == 'mkdir':
+    # Another process creates a file at the source directory's path between
+    # install-hook.sh's check and its mkdir; then the real mkdir runs.
+    target = Path(args[-1])
+    if target.name == cfg.get('mkdir_race') and not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('another process made this\n')
+    os.execv('/bin/mkdir', ['mkdir', *args])
+elif cmd == 'find':
+    # The listing of the source directory fails, as with an I/O error.
+    if Path(args[0]).name == cfg.get('find_fails'):
+        print(f'find: {args[0]}: Input/output error', file=sys.stderr)
+        sys.exit(1)
+    os.execv('/usr/bin/find', ['find', *args])
+elif cmd == 'cmp':
+    # Reading a source file fails, which cmp reports with status 2.
+    if Path(args[-1]).name == cfg.get('cmp_fails'):
+        print(f'cmp: {args[-1]}: Input/output error', file=sys.stderr)
+        sys.exit(2)
+    os.execv('/usr/bin/cmp', ['cmp', *args])
+elif cmd == 'cp':
+    # Copy the first file, then fail, as a full disk would.
+    sources, dest = args[args.index('--') + 1:-1], Path(args[-1])
+    shutil.copy(sources[0], dest / Path(sources[0]).name)
+    sys.exit(1)
 '''
 
 failures = []
@@ -211,7 +245,7 @@ def kbuild(directory):
 
 
 def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, registered=None,
-        package_version=None, between=None, unregistered=None):
+        package_version=None, between=None, unregistered=None, prepare=None, mocks=()):
     """installed maps kernels to an old version that is built and installed
     for them before the run. registered maps versions that are only added to
     the text of their nvpcf_hook.c, or to None for hook/'s text.
@@ -220,13 +254,15 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
     copied scripts directory. unregistered maps a version to the files that
     its /usr/src directory gets without a DKMS registration: hook/'s source
     with the given files replaced, or deleted for None, or to 'file' for a
-    regular file in place of the directory."""
+    regular file in place of the directory. prepare(root) runs once the
+    throwaway tree exists. mocks names more commands for the mock, such as
+    mkdir or cp."""
     root = BASE / name
     (root / 'bin').mkdir(parents=True)
     mock = root / 'mock'
     mock.write_text(MOCK)
     mock.chmod(0o755)
-    for cmd in ('dkms', 'uname', 'modinfo', 'objcopy', 'systemctl', 'curl'):
+    for cmd in ('dkms', 'uname', 'modinfo', 'objcopy', 'systemctl', 'curl', *mocks):
         (root / 'bin' / cmd).symlink_to(mock)
     for k in headers:
         (root / 'lib/modules' / k / 'build').mkdir(parents=True)
@@ -264,6 +300,8 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
             shutil.copy(SRC / 'hook' / f, d / f)
         if text is not None:
             (d / 'nvpcf_hook.c').write_text(text)
+    if prepare:
+        prepare(root)
     (root / 'state.json').write_text(json.dumps(st))
     (root / 'config.json').write_text(json.dumps(dict({'running': RUNNING, 'status': NVIDIA}, **cfg)))
     (root / 'calls.jsonl').write_text('')
@@ -540,6 +578,77 @@ check(r, r['exit'] == 1 and r['changing'] == [] and 'is not a directory' in r['o
       and (r['root'] / f'usr/src/nvpcf-hook-{NEW}').read_text() == 'not a directory\n',
       f"refuses and leaves a file in the source directory's place, got status {r['exit']}")
 
+def entries(r, v=NEW):
+    """The entries of a version's source directory and their types, or None
+    when the directory is gone."""
+    d = r['root'] / f'usr/src/nvpcf-hook-{v}'
+    if not d.is_dir():
+        return None
+    return {e.name: ('link' if e.is_symlink() else 'file' if e.is_file() else 'other') for e in d.iterdir()}
+
+
+def linked(kind):
+    """A prepare function that replaces build_id.h in the unregistered source
+    directory with a link to an identical file next to the directory."""
+    def prepare(root):
+        d = root / f'usr/src/nvpcf-hook-{NEW}'
+        outside = d.parent / 'build_id.h.elsewhere'
+        shutil.copy(SRC / 'hook/build_id.h', outside)
+        (d / 'build_id.h').unlink()
+        if kind == 'symlink':
+            (d / 'build_id.h').symlink_to('../build_id.h.elsewhere')
+        else:
+            os.link(outside, d / 'build_id.h')
+    return prepare
+
+
+for kind, words in (('symlink', 'build_id.h is a symbolic link'), ('hardlink', 'build_id.h has another hard link')):
+    r = run(f'unregistered-source-{kind}', {}, unregistered={NEW: {}}, prepare=linked(kind))
+    check(r, r['exit'] == 1 and r['changing'] == [] and words in r['out'] and 'leaves it as it is' in r['out'],
+          f"refuses a source directory whose build_id.h is a {kind} to an identical file, got status {r['exit']}")
+    check(r, (entries(r) or {}).get('build_id.h') == ('link' if kind == 'symlink' else 'file'),
+          f"leaves the {kind} as it was, got {entries(r)}")
+
+for label, extra in (('space', 'Makefile dkms.conf'), ('newline', 'Kbuild\nMakefile')):
+    r = run(f'unregistered-source-{label}-name', {}, unregistered={NEW: {extra: 'not part of the source\n'}})
+    check(r, r['exit'] == 1 and r['changing'] == [] and 'is not part of the source' in r['out'],
+          f"refuses an extra file whose name has a {label} and matches source names, got status {r['exit']}")
+    check(r, extra in (entries(r) or {}), f"leaves the extra file as it was, got {entries(r)}")
+
+r = run('source-listing-fails', {'find_fails': f'nvpcf-hook-{NEW}'}, mocks=('find',),
+        unregistered={NEW: {'notes.txt': 'keep me\n'}})
+check(r, r['exit'] == 1 and r['changing'] == [] and 'cannot list' in r['out']
+      and (entries(r) or {}).get('notes.txt') == 'file',
+      f"refuses the directory when its listing fails, instead of taking no entries as a match, got status {r['exit']}")
+
+r = run('source-read-fails', {'cmp_fails': 'nvpcf_hook.c'}, mocks=('cmp',), unregistered={NEW: {}})
+check(r, r['exit'] == 1 and r['changing'] == [] and 'cannot read nvpcf_hook.c' in r['out'],
+      f"refuses the directory when a source file cannot be read, got status {r['exit']}")
+
+r = run('mkdir-race', {'mkdir_race': f'nvpcf-hook-{NEW}'}, mocks=('mkdir',))
+src_path = r['root'] / f'usr/src/nvpcf-hook-{NEW}'
+check(r, r['exit'] == 1 and r['changing'] == [] and 'could not create' in r['out']
+      and src_path.is_file() and src_path.read_text() == 'another process made this\n',
+      f"leaves the file that another process made at the source path, got status {r['exit']} and {r['changing']}")
+
+r = run('copy-fails', {}, mocks=('cp',))
+check(r, r['exit'] == 1 and r['changing'] == [] and 'could not copy' in r['out']
+      and not (r['root'] / f'usr/src/nvpcf-hook-{NEW}').exists(),
+      f"removes the directory and the partial copy that the run made, got status {r['exit']}")
+
+
+def old_source_with_notes(root):
+    d = root / f'usr/src/nvpcf-hook-{OLD}'
+    for f in SOURCES:
+        shutil.copy(SRC / 'hook' / f, d / f)
+    (d / 'notes.txt').write_text('keep me\n')
+
+
+r = run('old-source-with-extra-file', {}, installed={RUNNING: OLD, OTHER: OLD}, prepare=old_source_with_notes)
+check(r, r['exit'] == 0 and r['removed'] == [f'nvpcf-hook/{OLD}'] and OLD not in r['state']['added']
+      and entries(r, OLD) == {'notes.txt': 'file'} and 'kept' in r['out'],
+      f"removes the old version's source files but keeps the directory with the extra file, got {r['exit']} and {entries(r, OLD)}")
+
 r = run('add-fails-then-retry', {'add_fails': True}, runs=2, between=clearing('add_fails', 1))
 check(r, r['exits'] == [1, 0] and 'holds hook/\'s source already' in r['out']
       and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW} and r['registered_new'] == sorted(SOURCES),
@@ -599,6 +708,23 @@ check(r, r['exit'] == 1 and 'dkms status nvpcf-hook failed' in r['out'] and r['c
 r = run('running-headers-missing', {}, headers=(OTHER,))
 check(r, r['exit'] == 1 and 'headers of the running kernel' in r['out'] and r['changing'] == [],
       f"stops before changing anything when the running kernel lacks headers, got {r['changing']}")
+
+r = run('running-installed-without-headers', {}, headers=(OTHER,), registered={NEW: None},
+        installed={RUNNING: NEW, OTHER: OLD})
+check(r, r['exit'] == 0 and f'nvpcf-hook/{NEW} is installed for {RUNNING} already' in r['out']
+      and r['installs'] == [(NEW, OTHER)] and r['removed'] == [f'nvpcf-hook/{OLD}'],
+      f"goes ahead when the running kernel has the version installed and checked, got status {r['exit']} and {r['installs']}")
+
+
+def running_file_differs(root):
+    (root / 'lib/modules' / RUNNING / 'updates/dkms/nvpcf_hook.ko').write_text(
+        f"BUILDID={hashlib.sha1(b'another build').hexdigest()} {NEW}\n")
+
+
+r = run('running-unchecked-without-headers', {}, headers=(OTHER,), registered={NEW: None},
+        installed={RUNNING: NEW}, prepare=running_file_differs)
+check(r, r['exit'] == 1 and 'headers of the running kernel' in r['out'] and r['changing'] == [],
+      f"stops before changing anything when the running kernel needs a new install but lacks headers, got {r['changing']}")
 
 r = run('fetch-fails', {'fetch_fails': True})
 check(r, r['exit'] == 1 and 'source archive not downloaded' in r['out']

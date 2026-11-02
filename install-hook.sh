@@ -18,11 +18,16 @@
 # The source is the files of hook/ that DKMS's build reads: Kbuild, Makefile,
 # dkms.conf, nvpcf_hook.c and its headers. Files that a build in hook/
 # generates, such as nvpcf_hook.mod.c, are not part of it. For a version that
-# DKMS does not have registered, the script copies the source to
-# /usr/src/nvpcf-hook-<version> and registers it with dkms add. An existing
-# directory there, such as the copy from a run whose dkms add failed, is
-# reused only if it holds exactly that source. Otherwise the script refuses,
-# names the files that differ, and leaves the directory as it is.
+# DKMS does not have registered, the script creates
+# /usr/src/nvpcf-hook-<version> with mkdir, which fails if anything appeared
+# there in the meantime, copies the source into it, and registers it with dkms
+# add. An existing directory there, such as the copy from a run whose dkms add
+# failed, is reused only if its entries are exactly these files, each a
+# regular file with no other link and with hook/'s content. Otherwise, and
+# when the directory or a file in it cannot be read, the script refuses, names
+# the differences, and leaves the directory as it is. When it removes an older
+# version, it deletes only that version's source files and an empty
+# directory, and keeps anything else there.
 #
 # It builds and installs that version with DKMS for every kernel that DKMS
 # lists for the NVIDIA driver or for nvpcf-hook, plus the running kernel. The
@@ -59,8 +64,9 @@
 # does.
 #
 # It reads the DKMS state and works out the kernels before it changes
-# anything, and stops there if a dkms status fails or the running kernel's
-# headers are missing. It exits with status 1 at the end if it skipped a
+# anything. It stops there if a dkms status fails, or if the running kernel's
+# headers are missing and that kernel does not have this version installed
+# and passing the check. It exits with status 1 at the end if it skipped a
 # kernel, if a build, install or check failed, or if an archive could not be
 # downloaded.
 set -u
@@ -93,26 +99,64 @@ installed_is() {
     b=$(ls /var/lib/dkms/nvpcf-hook/"$1"/"$2"/*/module/nvpcf_hook.ko* 2>/dev/null | head -1)
     [ -n "$b" ] && x=$(build_id "$f") && y=$(build_id "$b") && [ "$x" = "$y" ]
 }
-# Print each way in which the directory $src differs from hook/'s source, one
-# per line: a file of SOURCES that is missing or has other content, and any
-# other entry.
-source_differences() {
-    local f
+# Exit status 0 if $1 equals one of the other arguments.
+contains() {
+    local x=$1 y
+    shift
+    for y in "$@"; do [ "$x" = "$y" ] && return 0; done
+    return 1
+}
+# Compare the directory $src with hook/'s source, print each difference on a
+# line, and exit with status 0 only if the comparison completed and found
+# none. Each file of SOURCES has to be a regular file, not a symbolic link,
+# with no other hard link, and with hook/'s content: DKMS copies a link as a
+# link, and another name of the file could change it later. Every other entry
+# counts as a difference. The entries are read with NUL separators, so that a
+# name with a space or a newline is one entry, and printed with printf %q.
+# A file or a listing that cannot be read makes the comparison fail.
+compare_source() {
+    local f n entries=() status=0
+    if [ -L "$src" ] || [ ! -d "$src" ]; then
+        echo "$src is not a directory"
+        return 1
+    fi
     for f in "${SOURCES[@]}"; do
-        if [ ! -f "$src/$f" ]; then
-            echo "$f is missing"
-        elif ! cmp -s "$here/hook/$f" "$src/$f"; then
-            echo "$f differs"
+        if [ -L "$src/$f" ]; then
+            echo "$f is a symbolic link"; status=1
+        elif [ ! -e "$src/$f" ]; then
+            echo "$f is missing"; status=1
+        elif [ ! -f "$src/$f" ]; then
+            echo "$f is not a regular file"; status=1
+        elif ! n=$(stat -c %h -- "$src/$f"); then
+            echo "cannot read $f"; status=1
+        elif [ "$n" != 1 ]; then
+            echo "$f has another hard link"; status=1
+        else
+            cmp -s -- "$here/hook/$f" "$src/$f"
+            case $? in
+                0) ;;
+                1) echo "$f differs"; status=1 ;;
+                *) echo "cannot read $f"; status=1 ;;
+            esac
         fi
     done
-    while IFS= read -r f; do
-        [[ " ${SOURCES[*]} " == *" $f "* ]] || echo "$f is not part of the source"
-    done < <(ls -A "$src")
+    mapfile -d '' -t entries < <(find "$src" -mindepth 1 -maxdepth 1 -printf '%f\0')
+    wait $! || { echo "cannot list $src"; return 1; }
+    for f in "${entries[@]}"; do
+        contains "$f" "${SOURCES[@]}" || { printf '%q is not part of the source\n' "$f"; status=1; }
+    done
+    return $status
 }
-# Exit status 0 if $src is a directory that holds exactly the files in
-# SOURCES, with hook/'s content.
-same_source() {
-    [ -d "$src" ] && [ ! -L "$src" ] && [ -z "$(source_differences)" ]
+# Remove the files of SOURCES from the source directory $1, and then the
+# directory if nothing else is in it. A file that is not part of the source,
+# or a link, stays, and so does the directory then.
+remove_source() {
+    local d=$1 f
+    [ -d "$d" ] && [ ! -L "$d" ] || return 0
+    for f in "${SOURCES[@]}"; do
+        if [ -f "$d/$f" ] && [ ! -L "$d/$f" ]; then rm -f -- "$d/$f"; fi
+    done
+    rmdir -- "$d" 2>/dev/null || echo "== kept $d, which holds files that are not nvpcf-hook's source"
 }
 # Exit status 0 if version $1 is installed for some kernel.
 installed_anywhere() {
@@ -139,13 +183,18 @@ mapfile -t kernels < <({ printf '%s\n' "$status" | sed -nE 's#^nvidia/[0-9.]+, (
                          echo "$running"; } | sort -u)
 mapfile -t versions < <(printf '%s\n' "$status" | sed -nE 's#^nvidia/([0-9.]+)[,:].*#\1#p' | sort -u)
 skipped=() failed=()
-[ -d "/lib/modules/$running/build" ] || fail "the headers of the running kernel $running are missing"
-echo "== nvpcf-hook/$ver for kernels: ${kernels[*]}"
 # The version that each kernel has installed before the run.
 declare -A before=()
 while IFS= read -r line; do
     [[ $line =~ ^nvpcf-hook/([^,]+),\ ([^,]+),\ [^:]+:\ installed ]] && before[${BASH_REMATCH[2]}]=${BASH_REMATCH[1]}
 done <<<"$hook_status"
+# Headers are for building. The running kernel needs them unless it has
+# $ver installed already and passes the check, which reads only files.
+if [ ! -d "/lib/modules/$running/build" ]; then
+    [ "${before[$running]:-}" = "$ver" ] && installed_is "$ver" "$running" ||
+        fail "the headers of the running kernel $running are missing, and it does not have nvpcf-hook/$ver installed and checked"
+fi
+echo "== nvpcf-hook/$ver for kernels: ${kernels[*]}"
 
 mapfile -t registered < <(sed -nE 's#^nvpcf-hook/([^,:]+)[,:].*#\1#p' <<<"$hook_status" | sort -u)
 for v in "${registered[@]}"; do
@@ -156,19 +205,25 @@ done
 # An existing $src of an unregistered version can hold the copy from a run
 # whose dkms add failed, or someone's work. The script reuses it only if it
 # holds exactly hook/'s source, and otherwise leaves it as it is.
-if [[ " ${registered[*]} " == *" $ver "* ]]; then
-    same_source ||
-        fail "nvpcf-hook/$ver is registered with source that differs from hook/: $(source_differences | paste -sd ';' | sed 's/;/; /g'). A changed hook needs a greater PACKAGE_VERSION in hook/dkms.conf"
+if contains "$ver" "${registered[@]}"; then
+    differences=$(compare_source) ||
+        fail "nvpcf-hook/$ver is registered with source that differs from hook/: $(paste -sd ';' <<<"$differences" | sed 's/;/; /g'). A changed hook needs a greater PACKAGE_VERSION in hook/dkms.conf"
 else
     if [ -L "$src" ] || { [ -e "$src" ] && [ ! -d "$src" ]; }; then
         fail "$src exists and is not a directory. DKMS does not have nvpcf-hook/$ver registered, and the script leaves $src as it is; move it away to install"
     elif [ -d "$src" ]; then
-        same_source ||
-            fail "$src exists, but DKMS does not have nvpcf-hook/$ver registered, and it differs from hook/'s source: $(source_differences | paste -sd ';' | sed 's/;/; /g'). The script leaves it as it is; move it away to install"
+        differences=$(compare_source) ||
+            fail "$src exists, but DKMS does not have nvpcf-hook/$ver registered, and it differs from hook/'s source: $(paste -sd ';' <<<"$differences" | sed 's/;/; /g'). The script leaves it as it is; move it away to install"
         echo "== $src holds hook/'s source already, and the script registers it"
-    elif ! { mkdir -p "$src" && (cd "$here/hook" && cp "${SOURCES[@]}" "$src/"); }; then
-        rm -rf "$src"  # the partial copy that this run made
-        fail "could not copy the hook's source to $src"
+    else
+        # mkdir without -p fails if anything appeared at $src since the check
+        # above, and then the script has created nothing to remove.
+        mkdir -p -- "${src%/*}" && mkdir -- "$src" ||
+            fail "could not create $src. The script leaves anything there as it is"
+        if ! (cd "$here/hook" && cp -- "${SOURCES[@]}" "$src/"); then
+            remove_source "$src"
+            fail "could not copy the hook's source to $src"
+        fi
     fi
     dkms add -m nvpcf-hook -v "$ver" ||
         fail "dkms add nvpcf-hook/$ver failed, before any module was built or installed. $src keeps hook/'s source, and the next run registers it while it still matches"
@@ -227,7 +282,7 @@ else
         installed_anywhere "$v" && continue
         [[ $v =~ ^[0-9A-Za-z.+~-]+$ ]] || { failed+=("nvpcf-hook/$v: not removed, unexpected version"); continue; }
         echo "== removing nvpcf-hook/$v, which is not installed for any kernel"
-        if dkms remove "nvpcf-hook/$v" --all; then rm -rf "/usr/src/nvpcf-hook-$v"; else failed+=("nvpcf-hook/$v: remove"); fi
+        if dkms remove "nvpcf-hook/$v" --all; then remove_source "/usr/src/nvpcf-hook-$v"; else failed+=("nvpcf-hook/$v: remove"); fi
     done
 fi
 
