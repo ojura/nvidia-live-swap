@@ -4,12 +4,16 @@
 
 #ifdef __KERNEL__
 #include <linux/types.h>
+#include <linux/errno.h>
 typedef u64 nh_u64;
 #else
 #include <stdbool.h>
+#include <errno.h>
 #include <stdint.h>
 typedef uint64_t nh_u64;
 #endif
+
+enum nh_phase { STARTING, WAITING, ACTIVE, QUIESCED, SUSPENDED, GUARD_ONLY, UNAVAILABLE, DETACHED };
 
 struct nh_replay_control {
 	bool enabled;
@@ -31,6 +35,31 @@ static inline void nh_resume_replay(struct nh_replay_control *replay, bool ready
 {
 	replay->paused = false;
 	replay->enabled = ready;
+}
+
+/* Called after the system-PM barrier. Restoring capture without validated PM
+ * readiness preserves count-only capture, the non-active phase and the error.
+ */
+static inline bool nh_activate_replay(struct nh_replay_control *replay,
+		bool accepting, bool fine_verified, enum nh_phase *phase, int *error)
+{
+	nh_resume_replay(replay, accepting && fine_verified);
+	if (replay->enabled) {
+		*phase = ACTIVE;
+		*error = 0;
+	} else {
+		*phase = QUIESCED;
+		if (!*error)
+			*error = -EAGAIN;
+	}
+	return replay->enabled;
+}
+
+static inline bool nh_monitoring_active(enum nh_phase phase,
+		const struct nh_replay_control *replay, bool accepting, bool fine_verified)
+{
+	return phase == ACTIVE && replay->enabled && !replay->paused &&
+		accepting && fine_verified;
 }
 
 /* The caller serializes access. A batch covers the requests in its snapshot. */

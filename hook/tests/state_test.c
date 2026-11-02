@@ -810,42 +810,238 @@ static void test_text(void)
 	assert(!strcmp(nh_field(uuid, "GPU UUID:"), "GPU-00112233-4455-6677-8899-aabbccddeeff"));
 }
 
-static void test_many_interleavings(void)
+static void test_readiness_recovery(void)
 {
-	struct nh_state s = { 0 };
-	uint32_t random = 1;
-	unsigned int i;
+	struct nh_state requests = { 0 };
+	struct nh_replay_control replay = { 0 };
+	enum nh_phase phase = QUIESCED;
+	bool fine_verified = false, accepting = true;
+	int error = -EOPNOTSUPP;
+	unsigned int prerequisites, prior_error;
 
-	for (i = 0; i < 100000; ++i) {
-		random = random * UINT32_C(1664525) + UINT32_C(1013904223);
-		switch (random % 4) {
-		case 0:
-		case 1:
-			nh_receive(&s, (random & 16) != 0);
-			break;
-		case 2:
-			if (nh_pending(&s)) {
-				nh_u64 snapshot = nh_snapshot(&s);
-				if (random & 32)
-					nh_receive(&s, false);
-				nh_finish(&s, snapshot, (random & 64) != 0);
-			}
-			break;
-		default:
-			if (nh_pending(&s) && (random & 128)) {
-				nh_mark_stale(&s);
-				assert(nh_acknowledge_loss(&s));
-			}
-			break;
-		}
-		conserved(&s);
+	nh_receive(&requests, true);
+	/* Failed post-PM validation retained the owner. Failed detach restores the
+	 * real production activation transition, not a fixture's generic phase.
+	 */
+	assert(!nh_activate_replay(&replay, accepting, fine_verified, &phase, &error));
+	assert(phase == QUIESCED && error == -EOPNOTSUPP && !replay.enabled);
+	assert(!nh_monitoring_active(phase, &replay, accepting, fine_verified));
+	/* The production resume condition must therefore schedule revalidation. */
+	phase = WAITING;
+	fine_verified = true; /* The transient configuration failure has cleared. */
+	assert(nh_activate_replay(&replay, accepting, fine_verified, &phase, &error));
+	assert(phase == ACTIVE && error == 0 && nh_pending(&requests) == 1);
+	assert(nh_monitoring_active(phase, &replay, accepting, fine_verified));
+	nh_finish(&requests, nh_snapshot(&requests), true);
+	assert(!nh_pending(&requests));
+	conserved(&requests);
+
+	for (prerequisites = 0; prerequisites < 32; ++prerequisites)
+	for (prior_error = 0; prior_error < 2; ++prior_error) {
+		bool capture = nh_capture_ready((prerequisites & 1u) != 0,
+			(prerequisites & 2u) != 0, (prerequisites & 4u) != 0,
+			(prerequisites & 8u) != 0);
+		bool fine = (prerequisites & 16u) != 0;
+		bool ready = prerequisites == 31;
+
+		phase = QUIESCED;
+		error = prior_error ? -EIO : 0;
+		assert(nh_activate_replay(&replay, capture, fine, &phase, &error) == ready);
+		assert(nh_monitoring_active(phase, &replay, capture, fine) == ready);
+		assert(phase == (ready ? ACTIVE : QUIESCED));
+		assert(error == (ready ? 0 : prior_error ? -EIO : -EAGAIN));
 	}
+}
+
+/* Exhaust all operation sequences through depth five. Inapplicable operations
+ * leave state unchanged; counts below distinguish choices from applied steps.
+ */
+enum exploration_op {
+	RECEIVE, BEGIN_DISPATCH, FINISH_SEEN, FINISH_MISSED, PM_PREPARE,
+	PM_CONFIG_FAIL, PM_CONFIG_OK, DETACH_FAIL, MANUAL_RESUME, DEVICE_LOSS,
+	ACK_LOSS, ATTACH_OK, DETACH_OK, DRIVER_EXIT, EXPLORATION_OPS
+};
+struct exploration_state {
+	struct nh_state requests;
+	struct nh_replay_control replay;
+	enum nh_phase phase;
+	bool owned, fine_verified, accepting, in_dispatch;
+	nh_u64 snapshot;
+	int error;
+};
+struct exploration_coverage {
+	unsigned long nodes, leaves, applied[EXPLORATION_OPS];
+	unsigned int phases;
+	bool arrival_during_dispatch, successful_batch, missed_batch;
+	bool invalid_restore, recovered, acknowledged;
+};
+
+static bool explore_step(struct exploration_state *s, enum exploration_op op,
+		struct exploration_coverage *coverage)
+{
+	switch (op) {
+	case RECEIVE:
+		if (!s->accepting)
+			return false;
+		nh_receive(&s->requests, !s->replay.enabled);
+		coverage->arrival_during_dispatch |= s->in_dispatch;
+		break;
+	case BEGIN_DISPATCH:
+		if (s->in_dispatch || !s->replay.enabled || !nh_pending(&s->requests))
+			return false;
+		s->snapshot = nh_snapshot(&s->requests);
+		s->in_dispatch = true;
+		break;
+	case FINISH_SEEN:
+	case FINISH_MISSED:
+		if (!s->in_dispatch)
+			return false;
+		nh_finish(&s->requests, s->snapshot, op == FINISH_SEEN);
+		s->in_dispatch = false;
+		coverage->successful_batch |= op == FINISH_SEEN;
+		coverage->missed_batch |= op == FINISH_MISSED;
+		break;
+	case PM_PREPARE:
+		if (s->in_dispatch || !s->owned || s->phase == SUSPENDED)
+			return false;
+		nh_pause_replay(&s->replay);
+		s->phase = SUSPENDED;
+		break;
+	case PM_CONFIG_FAIL:
+		if (s->phase != SUSPENDED)
+			return false;
+		s->replay.paused = false; /* Complete system-sleep barrier. */
+		s->fine_verified = false;
+		s->phase = QUIESCED;
+		s->error = -EOPNOTSUPP;
+		break;
+	case PM_CONFIG_OK:
+		if (s->phase != SUSPENDED)
+			return false;
+		s->fine_verified = true;
+		assert(nh_activate_replay(&s->replay, s->accepting, s->fine_verified,
+			&s->phase, &s->error));
+		break;
+	case DETACH_FAIL:
+		if (s->in_dispatch || !s->owned)
+			return false;
+		s->replay.paused = false; /* Manual control acquired system-sleep lock. */
+		s->phase = QUIESCED;
+		s->error = -EIO;
+		nh_activate_replay(&s->replay, s->accepting, s->fine_verified,
+			&s->phase, &s->error);
+		coverage->invalid_restore |= !s->fine_verified && s->phase == QUIESCED;
+		break;
+	case MANUAL_RESUME:
+		if (s->in_dispatch || s->requests.stale ||
+		    nh_monitoring_active(s->phase, &s->replay, s->accepting, s->fine_verified))
+			return false;
+		s->replay.paused = false;
+		s->phase = WAITING;
+		break;
+	case DEVICE_LOSS:
+		if (s->in_dispatch || !s->owned)
+			return false;
+		s->owned = false;
+		s->accepting = false;
+		s->replay.enabled = false;
+		s->phase = UNAVAILABLE;
+		s->error = -ENODEV;
+		nh_mark_stale(&s->requests);
+		break;
+	case ACK_LOSS:
+		if (s->owned || !s->requests.stale)
+			return false;
+		assert(nh_acknowledge_loss(&s->requests));
+		s->phase = DETACHED;
+		s->fine_verified = false;
+		coverage->acknowledged = true;
+		break;
+	case ATTACH_OK:
+		if (s->in_dispatch || s->requests.stale || s->phase != WAITING)
+			return false;
+		coverage->recovered |= !s->fine_verified && s->owned;
+		s->owned = true;
+		s->fine_verified = true;
+		s->accepting = true;
+		assert(nh_activate_replay(&s->replay, s->accepting, s->fine_verified,
+			&s->phase, &s->error));
+		break;
+	case DETACH_OK:
+		if (s->in_dispatch || !s->owned || nh_pending(&s->requests))
+			return false;
+		s->owned = false;
+		s->accepting = false;
+		s->fine_verified = false;
+		s->replay.enabled = false;
+		s->phase = GUARD_ONLY;
+		break;
+	case DRIVER_EXIT:
+		if (s->owned || nh_pending(&s->requests) || s->phase == DETACHED)
+			return false;
+		s->phase = DETACHED;
+		break;
+	case EXPLORATION_OPS:
+		assert(false);
+	}
+	return true;
+}
+
+static void explore(const struct exploration_state *s, unsigned int depth,
+		struct exploration_coverage *coverage)
+{
+	unsigned int op;
+
+	coverage->nodes++;
+	coverage->phases |= 1u << (unsigned int)s->phase;
+	conserved(&s->requests);
+	assert(s->phase != ACTIVE || (s->owned &&
+		nh_monitoring_active(s->phase, &s->replay, s->accepting, s->fine_verified)));
+	assert(!s->replay.enabled || s->phase == ACTIVE);
+	assert(!s->requests.stale || (!s->owned && !s->replay.enabled));
+	if (!depth) {
+		coverage->leaves++;
+		return;
+	}
+	for (op = 0; op < EXPLORATION_OPS; ++op) {
+		struct exploration_state next = *s;
+
+		if (explore_step(&next, (enum exploration_op)op, coverage))
+			coverage->applied[op]++;
+		explore(&next, depth - 1, coverage);
+	}
+}
+
+static void test_bounded_sequences(void)
+{
+	struct exploration_state initial = { .phase = ACTIVE, .owned = true,
+		.fine_verified = true, .accepting = true, .replay = { .enabled = true } };
+	struct exploration_coverage coverage = { 0 };
+	unsigned int op;
+	unsigned long applied = 0;
+	struct nh_state wrap = { .received = UINT64_MAX, .completed = UINT64_MAX };
+
+	nh_receive(&initial.requests, true);
+	explore(&initial, 5, &coverage);
+	assert(coverage.nodes == 579195 && coverage.leaves == 537824);
+	assert(coverage.phases == ((1u << WAITING) | (1u << ACTIVE) | (1u << QUIESCED) |
+		(1u << SUSPENDED) | (1u << GUARD_ONLY) | (1u << UNAVAILABLE) | (1u << DETACHED)));
+	for (op = 0; op < EXPLORATION_OPS; ++op) {
+		assert(coverage.applied[op] > 0);
+		applied += coverage.applied[op];
+	}
+	assert(applied == 160796);
+	assert(coverage.arrival_during_dispatch && coverage.successful_batch &&
+		coverage.missed_batch && coverage.invalid_restore && coverage.recovered &&
+		coverage.acknowledged);
+	printf("PASS: exhaustive 14-operation sequences through depth 5: %lu leaves, "
+		"%lu nodes, %lu applied transitions, all 14 operations and 7 phases covered\n",
+		coverage.leaves, coverage.nodes, applied);
 	/* Sequence subtraction also handles wrap without ordering comparisons. */
-	s = (struct nh_state){ .received = UINT64_MAX, .completed = UINT64_MAX };
-	nh_receive(&s, true);
-	assert(nh_pending(&s) == 1);
-	nh_finish(&s, nh_snapshot(&s), true);
-	assert(!nh_pending(&s) && s.dispatched == 1);
+	nh_receive(&wrap, true);
+	assert(nh_pending(&wrap) == 1);
+	nh_finish(&wrap, nh_snapshot(&wrap), true);
+	assert(!nh_pending(&wrap) && wrap.dispatched == 1);
 }
 
 int main(void)
@@ -862,7 +1058,8 @@ int main(void)
 	test_publication();
 	test_loss();
 	test_text();
-	test_many_interleavings();
-	puts("PASS: batches, failure retention, PM feedback, observer misses, detach, kernel ownership, publication, rollback, loss, parsing and 100000 interleavings");
+	test_readiness_recovery();
+	test_bounded_sequences();
+	puts("PASS: batches, failure retention, PM feedback, observer misses, detach, kernel ownership, publication, rollback, loss and parsing");
 	return 0;
 }

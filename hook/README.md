@@ -99,8 +99,10 @@ sudo ./hook/nvpcf-hookctl acknowledge-loss
 
 A failed final flush retains pending requests and device ownership and attempts
 to restore interception. If restoration also fails, inspect `last_error`, the
-state and the kernel log, then retry detach. New notifications use NVIDIA's
-ordinary path while interception is absent. A hardware failure during an
+state and the kernel log, then retry detach. Restoration keeps `quiesced` and
+the error while effective fine-grained PM is unverified; `resume` then attempts
+revalidation. It reports `active` only when capture and replay are ready. New
+notifications use NVIDIA's ordinary path while interception is absent. A hardware failure during an
 irreversible put can instead leave an error in `unavailable` after ownership
 ended; it is not reported as successful detach.
 
@@ -343,8 +345,15 @@ through PM rollback, kernel put before concurrent list deletion, NULL/non-NULL
 stacks, failed acquisition/attachment cleanup, one-time release, publication
 after setup, publication/rollback failures, NVIDIA LIVE admission, startup
 admission, late ordinary PSR/C0 drain, later empty cleanup, loss acknowledgement,
-field parsing and 100000 state interleavings. CLI tests use ordinary temporary
-files. The portable suite also passes AddressSanitizer and UndefinedBehaviorSanitizer.
+field parsing and exhaustive operation sequences through depth five. CLI tests
+use ordinary temporary files. The state exploration checks all 537824 sequences of length five from
+14 operations, visiting 579195 sequence-prefix nodes and applying 160796 valid
+transitions. It asserts coverage of every operation, seven lifecycle phases,
+arrivals during dispatch, missed/successful batches, invalid restoration,
+revalidation recovery and loss acknowledgement. Duplicate states and
+inapplicable choices are included; these are operation sequences, not counts of
+distinct states. A separate matrix checks 64 readiness/error combinations. The
+portable suite also passes AddressSanitizer and UndefinedBehaviorSanitizer.
 
 These tests execute shared logic and model kernel ordering. They do not execute
 kernel attachment, ACPI, runtime PM or NVIDIA. The source checker reads archives

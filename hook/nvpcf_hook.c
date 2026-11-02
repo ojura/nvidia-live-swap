@@ -44,7 +44,6 @@
 typedef void (*nvpcf_callback)(acpi_handle, u32, void *);
 typedef int (*nv_start_callback)(void *, void *);
 typedef void (*nv_shutdown_callback)(void *, void *, void *);
-enum nh_phase { STARTING, WAITING, ACTIVE, QUIESCED, SUSPENDED, GUARD_ONLY, UNAVAILABLE, DETACHED };
 static const char * const phase_names[] = {
 	"starting", "waiting", "active", "quiesced", "suspended", "guard-only",
 	"unavailable", "detached"
@@ -655,18 +654,22 @@ fail:
 static void activate_capture(void)
 {
 	unsigned long flags;
+	bool active;
 
 	spin_lock_irqsave(&h.lock, flags);
 	h.state.resume_armed = false;
 	h.accepting = nh_capture_ready(h.owner.held, h.observer_registered,
 		h.event_registered && h.guards_registered, READ_ONCE(h.legacy_safe));
-	nh_resume_replay(&h.replay, h.accepting && h.fine_verified);
+	active = nh_activate_replay(&h.replay, h.accepting, h.fine_verified,
+		&h.phase, &h.last_error);
 	if (h.replay.enabled && nh_pending(&h.state))
 		queue_work(h.replay_wq, &h.replay_work);
 	spin_unlock_irqrestore(&h.lock, flags);
-	h.phase = ACTIVE;
-	set_error(0);
-	pr_info("nvpcf_hook: attached to %s, NVIDIA %s\n", pci_name(h.pci), h.nvidia_version);
+	if (active)
+		pr_info("nvpcf_hook: attached to %s, NVIDIA %s\n", pci_name(h.pci), h.nvidia_version);
+	else
+		pr_err("nvpcf_hook: capture restored without replay readiness: state=%s error=%d\n",
+			phase_names[h.phase], READ_ONCE(h.last_error));
 }
 
 static int stop_capture(void)
@@ -1413,7 +1416,8 @@ static ssize_t control_write(struct file *file, const char __user *buf,
 	} else if (!strcmp(command, "resume")) {
 		if (h.state.stale || h.guard_poisoned || h.legacy_blocked) {
 			ret = -EUCLEAN;
-		} else if (h.phase != ACTIVE) {
+		} else if (!nh_monitoring_active(h.phase, &h.replay,
+			READ_ONCE(h.accepting), h.fine_verified)) {
 			if (!h.self_ref) {
 				__module_get(THIS_MODULE);
 				h.self_ref = true;
