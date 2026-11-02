@@ -515,22 +515,27 @@ version has the same source only if its directory holds exactly these files,
 with the same content.
 
 The script builds and installs the version with DKMS for every kernel that
-DKMS lists for the NVIDIA driver, plus the running kernel. After each install,
-and for a kernel that DKMS lists as having the version installed already, it
-checks that the module `modprobe` finds for the kernel has the build ID of
-DKMS's build. A kernel that fails the check gets the version installed again.
-A failed build leaves the kernel's installed module in place, and so do
-missing headers. A failed install can leave the kernel without a module:
-`dkms install` copies the new file over the old one before it runs depmod,
-and removes the new file when depmod fails (`/usr/sbin/dkms`, lines 1345-1380
-in DKMS 3.0.11). After a failed install or check, the script installs the
-kernel's previous version again from DKMS's build of it, checks it in the same
-way, and reports whether that worked. Older versions that no kernel has
-installed are removed only by a run in which every target kernel ends with
-the new version installed and checked. After a failure, their registrations,
-sources and builds stay, also through later runs that find the failed kernel
-without any installed version, so that `dkms install` can still put one of
-their builds back.
+DKMS lists for the NVIDIA driver or for nvpcf-hook, plus the running kernel.
+The kernels listed for nvpcf-hook include those whose NVIDIA build DKMS does
+not list at the moment, for example between a driver update and the
+`dkms install` for the other kernels. After each install, and for a kernel
+that DKMS lists as having the version installed already, it checks that the
+module `modprobe` finds for the kernel has the build ID of DKMS's build. The
+check reads only the installed file and DKMS's build, so a kernel that passes
+it counts as done even without headers. A kernel that fails the check gets
+the version installed again. A failed build leaves the kernel's installed
+module in place, and so do missing headers. A failed install can leave the
+kernel without a module: `dkms install` copies the new file over the old one
+before it runs depmod, and removes the new file when depmod fails
+(`/usr/sbin/dkms`, lines 1345-1380 in DKMS 3.0.11). After a failed install or
+check, the script installs the kernel's previous version again from DKMS's
+build of it, checks it in the same way, and reports whether that worked.
+Older versions that no kernel has installed are removed only by a run in
+which each of these kernels, including the ones whose headers are missing,
+ends with the new version installed and checked. After a failure or a skipped
+kernel, their registrations, sources and builds stay, also through later runs
+that find a kernel without any installed version, so that `dkms install` can
+still put one of their builds back.
 
 It installs `load-hook.sh`, `check_nvidia.py`, `expected_dispatcher.c` and
 `nvpcf-hookctl` as root-owned copies in `/usr/local/lib/nvpcf-hook`.
@@ -660,14 +665,20 @@ the number of deliveries.
     new one is installed everywhere, a second run with the same source, and a
     failed archive download;
   - a build failure on one kernel and on both, and a kernel with missing
-    headers, which keep their working modules;
+    headers, which keep their working modules. A kernel without headers that
+    has the new version installed and passes the check counts as done;
+  - a kernel that DKMS lists only for nvpcf-hook, which gets the new version
+    like the others, or counts as skipped when its headers are missing;
   - an install that fails before the copy, which leaves the old module, and a
     depmod failure after the copy, after which the kernel gets its previous
     version back from DKMS's build. When depmod fails for that reinstall too,
     the previous version's registration, source and builds stay, also through
     a second run under the same fault, which finds the kernel without any
     installed version. A third run without the fault installs the new version
-    everywhere and only then removes the old one;
+    everywhere and only then removes the old one. The old version also stays
+    when the failed kernel loses its headers before the second run, and goes
+    only after a third run with the headers back has installed and checked the
+    new version there;
   - a build ID that cannot be read, which fails the check;
   - an install that DKMS reports as successful but that leaves another file,
     which fails two runs in a row while the fault stays, and is installed

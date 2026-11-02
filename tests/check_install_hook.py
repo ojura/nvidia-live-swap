@@ -57,6 +57,7 @@ SRC = Path(__file__).resolve().parent.parent
 BASE = Path(tempfile.mkdtemp(prefix='install-hook-test-'))
 RUNNING = '7.0.0-38-generic'
 OTHER = '6.8.0-147-generic'
+THIRD = '6.11.0-29-generic'  # a kernel that DKMS lists only for nvpcf-hook
 NVIDIA = (f'nvidia/615.71.09, {OTHER}, x86_64: installed\n'
           f'nvidia/615.71.09, {RUNNING}, x86_64: installed\n')
 OLD = '0.0.1'
@@ -386,10 +387,60 @@ keeps_old(r)
 r = run('persistent-failed-rollback-retry', {'depmod_fails': [RUNNING]}, installed={RUNNING: OLD, OTHER: OLD}, runs=2)
 check(r, r['exits'] == [1, 1] and RUNNING not in r['state']['installed'] and r['state']['installed'].get(OTHER) == NEW,
       f"fails both runs and leaves the failed kernel without a module, got {r['exits']} and {r['state']['installed']}")
-check(r, f'keeping nvpcf-hook/{OLD} until every kernel has nvpcf-hook/{NEW}' in r['out']
+check(r, f'keeping nvpcf-hook/{OLD} until every kernel' in r['out']
       and sorted(r['state']['added']) == sorted([OLD, NEW]),
       f"keeps {OLD} on the second run too, although no kernel has it installed, got {r['state']['added']}")
 keeps_old(r)
+
+def headers_gone(gone_before, back_before=None):
+    """A between function that removes OTHER's headers and the depmod fault
+    before run gone_before, and puts the headers back before run back_before."""
+    def step(scripts, i):
+        root = scripts.parent
+        if i == gone_before:
+            shutil.rmtree(root / 'lib/modules' / OTHER / 'build')
+            conf = root / 'config.json'
+            c = json.loads(conf.read_text())
+            del c['depmod_fails']
+            conf.write_text(json.dumps(c))
+        if i == back_before:
+            (root / 'lib/modules' / OTHER / 'build').mkdir()
+    return step
+
+
+r = run('failed-then-skipped', {'depmod_fails': [OTHER]}, installed={RUNNING: OLD, OTHER: OLD}, runs=2,
+        between=headers_gone(1))
+check(r, r['exits'] == [1, 1] and OTHER not in r['state']['installed'] and r['state']['installed'].get(RUNNING) == NEW,
+      f"fails both runs and leaves the skipped kernel without a module, got {r['exits']} and {r['state']['installed']}")
+check(r, f'headers are missing, not built: {OTHER}' in r['out'] and f'keeping nvpcf-hook/{OLD} until every kernel' in r['out'],
+      f"keeps {OLD} while the kernel that needs it is skipped")
+keeps_old(r)
+
+r = run('failed-skipped-then-repaired', {'depmod_fails': [OTHER]}, installed={RUNNING: OLD, OTHER: OLD}, runs=3,
+        between=headers_gone(1, 2))
+check(r, r['exits'] == [1, 1, 0] and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW},
+      f"installs the new version on the kernel once its headers are back, got {r['exits']} and {r['state']['installed']}")
+c = r['calls']
+check(r, r['installs'] == [(NEW, OTHER)] and r['removed'] == [f'nvpcf-hook/{OLD}']
+      and c.index('dkms remove') > c.index('dkms install') and OLD not in r['state']['added'],
+      f"installs and checks the repaired kernel before it removes {OLD}, got the installs {r['installs']} and the calls {c}")
+
+r = run('hook-only-kernel', {}, headers=(RUNNING, OTHER, THIRD), installed={RUNNING: OLD, OTHER: OLD, THIRD: OLD})
+check(r, r['exit'] == 0 and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW, THIRD: NEW},
+      f"installs the new version also for a kernel that DKMS lists only for nvpcf-hook, got {r['state']['installed']}")
+check(r, r['removed'] == [f'nvpcf-hook/{OLD}'], f"removes {OLD} once all three kernels have the new version, got {r['removed']}")
+
+r = run('hook-only-kernel-without-headers', {}, installed={RUNNING: OLD, OTHER: OLD, THIRD: OLD})
+check(r, r['exit'] == 1 and f'headers are missing, not built: {THIRD}' in r['out']
+      and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW, THIRD: OLD} and r['removed'] == [],
+      f"counts the kernel that DKMS lists only for nvpcf-hook as skipped, and keeps {OLD}, got {r['state']['installed']}")
+
+r = run('installed-kernel-without-headers', {}, headers=(RUNNING,), registered={NEW: None},
+        installed={RUNNING: OLD, OTHER: NEW})
+check(r, r['exit'] == 0 and f'nvpcf-hook/{NEW} is installed for {OTHER} already' in r['out']
+      and 'headers are missing' not in r['out'] and r['installs'] == [(NEW, RUNNING)],
+      f"checks the installed module of a kernel without headers instead of skipping it, got status {r['exit']} and {r['installs']}")
+check(r, r['removed'] == [f'nvpcf-hook/{OLD}'], f"removes {OLD} once both kernels have the new version, got {r['removed']}")
 
 r = run('reinstall-fails-then-recovers', {'depmod_fails': [RUNNING]}, installed={RUNNING: OLD, OTHER: OLD}, runs=3,
         between=clearing('depmod_fails', 2))

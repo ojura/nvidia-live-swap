@@ -21,18 +21,26 @@
 # as nvpcf_hook.mod.c, are not part of the source.
 #
 # It builds and installs that version with DKMS for every kernel that DKMS
-# lists for the NVIDIA driver, plus the running kernel. After each install it
-# checks that the module modprobe finds for the kernel has the build ID of
-# DKMS's build. A failed build leaves the kernel's installed module in place,
-# and so do missing headers. A failed install can leave the kernel without a
-# module, because DKMS replaces the file before it runs depmod, and removes
-# the new file when depmod fails. After a failed install or check, the script
-# installs the kernel's previous version again from DKMS's build of it, checks
-# it in the same way, and reports whether that worked. Older versions that no
-# kernel has installed are removed only by a run in which every target kernel
-# ends with this version installed and checked. After a failure they stay,
-# also through later runs that find the failed kernel without any installed
-# version, so that dkms install can still put one of their builds back.
+# lists for the NVIDIA driver or for nvpcf-hook, plus the running kernel. The
+# kernels listed for nvpcf-hook include those whose NVIDIA build DKMS does not
+# list at the moment, for example between a driver update and the dkms install
+# for the other kernels. After each install, and for a kernel that DKMS lists
+# as having this version installed already, it checks that the module
+# modprobe finds for the kernel has the build ID of DKMS's build. That check
+# needs no headers, so a kernel that passes it counts as done even without
+# them. A kernel that fails it gets this version installed again.
+#
+# A failed build leaves the kernel's installed module in place, and so do
+# missing headers. A failed install can leave the kernel without a module,
+# because DKMS replaces the file before it runs depmod, and removes the new
+# file when depmod fails. After a failed install or check, the script installs
+# the kernel's previous version again from DKMS's build of it, checks it in the
+# same way, and reports whether that worked. Older versions that no kernel has
+# installed are removed only by a run in which each of these kernels,
+# including the ones whose headers are missing, ends with this version
+# installed and checked. After a failure or a skipped kernel they stay, also
+# through later runs that find a kernel without any installed version, so that
+# dkms install can still put one of their builds back.
 #
 # It installs load-hook.sh, check_nvidia.py, expected_dispatcher.c and
 # nvpcf-hookctl as root-owned copies in /usr/local/lib/nvpcf-hook, and enables
@@ -106,15 +114,13 @@ src=/usr/src/nvpcf-hook-$ver
 status=$(dkms status nvidia) || fail "dkms status nvidia failed"
 hook_status=$(dkms status nvpcf-hook) || fail "dkms status nvpcf-hook failed"
 running=$(uname -r)
-mapfile -t kernels < <({ printf '%s\n' "$status" | sed -nE 's#^nvidia/[0-9.]+, ([^,]+),.*#\1#p'; echo "$running"; } | sort -u)
+mapfile -t kernels < <({ printf '%s\n' "$status" | sed -nE 's#^nvidia/[0-9.]+, ([^,]+),.*#\1#p'
+                         printf '%s\n' "$hook_status" | sed -nE 's#^nvpcf-hook/[^,]+, ([^,]+),.*#\1#p'
+                         echo "$running"; } | sort -u)
 mapfile -t versions < <(printf '%s\n' "$status" | sed -nE 's#^nvidia/([0-9.]+)[,:].*#\1#p' | sort -u)
-targets=() skipped=() failed=()
-for k in "${kernels[@]}"; do
-    if [ -d "/lib/modules/$k/build" ]; then targets+=("$k"); else skipped+=("$k"); fi
-done
+skipped=() failed=()
 [ -d "/lib/modules/$running/build" ] || fail "the headers of the running kernel $running are missing"
-echo "== nvpcf-hook/$ver for kernels: ${targets[*]}"
-[ ${#skipped[@]} -eq 0 ] || echo "== skipping kernels whose headers are missing: ${skipped[*]}"
+echo "== nvpcf-hook/$ver for kernels: ${kernels[*]}"
 # The version that each kernel has installed before the run.
 declare -A before=()
 while IFS= read -r line; do
@@ -136,8 +142,10 @@ else
     dkms add -m nvpcf-hook -v "$ver" || fail "dkms add nvpcf-hook/$ver failed"
 fi
 
-for k in "${targets[@]}"; do
+for k in "${kernels[@]}"; do
     prev=${before[$k]:-}
+    # The check reads the installed file and DKMS's build, so a kernel that
+    # passes it needs no headers.
     if [ "$prev" = "$ver" ]; then
         if installed_is "$ver" "$k"; then
             echo "== nvpcf-hook/$ver is installed for $k already"
@@ -146,6 +154,10 @@ for k in "${targets[@]}"; do
         # DKMS lists $ver as installed, but modprobe finds another file. The
         # run installs $ver again, and has no other version to go back to.
         prev=""
+    fi
+    if [ ! -d "/lib/modules/$k/build" ]; then
+        skipped+=("$k")
+        continue
     fi
     echo "== building and installing nvpcf-hook/$ver for $k"
     if ! dkms build -m nvpcf-hook -v "$ver" -k "$k" --force; then
@@ -168,14 +180,16 @@ for k in "${targets[@]}"; do
 done
 
 # Remove the older versions that are not installed for any kernel, but only
-# when every target kernel has $ver installed and checked. A failed kernel can
-# need one of their builds again, also after a later run that finds it
-# without any installed version. The check above made every other registered
-# version rank below $ver.
+# when every kernel of the run has $ver installed and checked: no build,
+# install or check failed, and no kernel was skipped for missing headers. A
+# failed or skipped kernel can need one of their builds again, also after a
+# later run that finds it without any installed version. The check above made
+# every other registered version rank below $ver.
 hook_status=$(dkms status nvpcf-hook) || fail "dkms status nvpcf-hook failed after the install"
 mapfile -t old < <(sed -nE 's#^nvpcf-hook/([^,:]+)[,:].*#\1#p' <<<"$hook_status" | grep -vxF "$ver" | sort -u)
-if [ ${#failed[@]} -gt 0 ]; then
-    [ ${#old[@]} -eq 0 ] || echo "== keeping ${old[*]/#/nvpcf-hook/} until every kernel has nvpcf-hook/$ver"
+if [ ${#failed[@]} -gt 0 ] || [ ${#skipped[@]} -gt 0 ]; then
+    [ ${#old[@]} -eq 0 ] ||
+        echo "== keeping ${old[*]/#/nvpcf-hook/} until every kernel, including the skipped ones, has nvpcf-hook/$ver"
 else
     for v in "${old[@]}"; do
         installed_anywhere "$v" && continue
