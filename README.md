@@ -49,9 +49,11 @@ Run the scripts from the repository directory.
   [Limitations](#limitations) explains.
 - `sudo ./install-hook.sh` installs nvpcf_hook with DKMS for the installed
   kernels, together with its loader and a systemd unit that runs the loader at
-  boot. `sudo /usr/local/lib/nvpcf-hook/load-hook.sh` loads the hook now. The
-  loader checks the loaded NVIDIA driver's code first, and loads the hook only
-  if the checks pass.
+  boot. With `--no-enable`, it installs the unit without enabling it, so the
+  hook loads only when you run the loader. `sudo
+  /usr/local/lib/nvpcf-hook/load-hook.sh` loads the hook now. The loader checks
+  the loaded NVIDIA driver's code first, and loads the hook only if the checks
+  pass.
 - `sudo ./hook/nvpcf-hookctl status` shows nvpcf_hook's state and counts. In the
   state `active`, the hook holds messages while the GPU sleeps, and passes them
   on when the GPU wakes up. In `waiting`, it waits for a program to start the

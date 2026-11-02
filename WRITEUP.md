@@ -577,8 +577,11 @@ copies in `/usr/local/lib/nvpcf-hook`: `load-hook.sh`, `nvpcf-hookctl`,
 directory. The checker compares the dispatcher function in NVIDIA's source
 archive with `expected_dispatcher.c`, and NVIDIA's wrappers for its GPU files
 in `/proc` in the kernel-open source with `expected_procfs_wrappers.h`. The
-script enables `nvpcf-hook.service`, and downloads the source archive for each
-NVIDIA version that DKMS lists. It does not load the hook.
+script installs `nvpcf-hook.service` and enables it. With `--no-enable`, it
+does not enable the unit, and leaves a unit that is enabled already as it is,
+so a first install can be tested before the hook loads at every boot. The
+script downloads the source archive for each NVIDIA version that DKMS lists.
+It does not load the hook.
 
 It reads the DKMS state and works out the kernels before it changes anything.
 It stops there if a `dkms status` fails, or if the running kernel's headers
@@ -758,7 +761,9 @@ the number of deliveries.
   - a failing `dkms status` for `nvidia` and for `nvpcf-hook`, missing headers
     for the running kernel, and an extra argument. A running kernel without
     headers that has the new version installed and passes the check does not
-    stop the script; one whose installed file does not pass it does.
+    stop the script; one whose installed file does not pass it does;
+  - `--no-enable`, which installs the unit without enabling it, and leaves a
+    unit that is enabled already as it is.
 
   Every case that registers the new version checks, with `VER` from
   `/usr/sbin/dkms`, that DKMS would build the new version for the next

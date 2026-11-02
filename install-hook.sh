@@ -1,7 +1,7 @@
 #!/bin/bash
 # Install nvpcf_hook, its loader and its boot unit. Run as root.
 #
-# usage: install-hook.sh
+# usage: install-hook.sh [--no-enable]
 #
 # DKMS builds each version of a module from its own source directory,
 # /usr/src/<package>-<version>. For a new kernel, DKMS builds the greatest
@@ -56,12 +56,13 @@
 # and two references that check_nvidia.py reads from its own directory.
 # check_nvidia.py compares the dispatcher function in NVIDIA's source archive
 # with expected_dispatcher.c, and NVIDIA's proc file wrappers in the
-# kernel-open source with expected_procfs_wrappers.h. The script enables
-# nvpcf-hook.service, which runs load-hook.sh at boot, and downloads NVIDIA's
-# source archive for each NVIDIA version that DKMS lists into
-# /var/cache/nvpcf-hook, so that loading the hook does not need the network.
-# It does not load the hook now; running /usr/local/lib/nvpcf-hook/load-hook.sh
-# does.
+# kernel-open source with expected_procfs_wrappers.h. The script installs
+# nvpcf-hook.service, which runs load-hook.sh at boot, and enables it. With
+# --no-enable, it does not enable the unit, and leaves a unit that is enabled
+# already as it is. It downloads NVIDIA's source archive for each NVIDIA
+# version that DKMS lists into /var/cache/nvpcf-hook, so that loading the hook
+# does not need the network. It does not load the hook now; running
+# /usr/local/lib/nvpcf-hook/load-hook.sh does.
 #
 # It reads the DKMS state and works out the kernels before it changes
 # anything. It stops there if a dkms status fails, or if the running kernel's
@@ -70,8 +71,13 @@
 # kernel, if a build, install or check failed, or if an archive could not be
 # downloaded.
 set -u
-usage() { echo "usage: install-hook.sh" >&2; exit 2; }
-[ $# = 0 ] || usage
+usage() { echo "usage: install-hook.sh [--no-enable]" >&2; exit 2; }
+enable=1
+case "$*" in
+    '') ;;
+    --no-enable) enable=0 ;;
+    *) usage ;;
+esac
 here=$(cd "$(dirname "$0")" && pwd)
 DIR=$here
 . "$here/lib.sh"
@@ -292,7 +298,12 @@ for f in "${HOOK_TOOLS[@]}"; do
     install -D -m $mode "$here/$f" "$HOOK_LIB/${f##*/}" || fail "could not install $f in $HOOK_LIB"
 done
 install -D -m 0644 "$here/nvpcf-hook.service" "$UNIT" || fail "could not install $UNIT"
-systemctl daemon-reload && systemctl enable nvpcf-hook.service || failed+=("enabling nvpcf-hook.service")
+if [ $enable = 1 ]; then
+    systemctl daemon-reload && systemctl enable nvpcf-hook.service || failed+=("enabling nvpcf-hook.service")
+else
+    systemctl daemon-reload || failed+=("systemctl daemon-reload")
+    echo "== installed nvpcf-hook.service without enabling it; it is $(systemctl is-enabled nvpcf-hook.service 2>/dev/null || true)"
+fi
 for v in "${versions[@]}"; do
     "$HOOK_LIB/load-hook.sh" --fetch "$v" || failed+=("NVIDIA $v: source archive not downloaded")
 done
@@ -303,4 +314,8 @@ if [ ${#failed[@]} -gt 0 ]; then
     exit 1
 fi
 [ ${#skipped[@]} -eq 0 ] || exit 1
-echo "== installed nvpcf-hook/$ver. It loads at the next boot, or now with: sudo $HOOK_LIB/load-hook.sh"
+if [ $enable = 1 ]; then
+    echo "== installed nvpcf-hook/$ver. It loads at the next boot, or now with: sudo $HOOK_LIB/load-hook.sh"
+else
+    echo "== installed nvpcf-hook/$ver. It loads now with: sudo $HOOK_LIB/load-hook.sh, and at boot while nvpcf-hook.service is enabled"
+fi

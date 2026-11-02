@@ -33,6 +33,9 @@ anything. Every case that registers the new version checks that the new
 version is the greatest one, with VER taken from /usr/sbin/dkms when it
 exists.
 
+With --no-enable, the script installs the unit without enabling it, and
+leaves a unit that is enabled already as it is; a case covers each.
+
 The source-directory cases cover a directory that matches and one that
 differs, a source file that is a symbolic or hard link to an identical file,
 extra names with a space and with a newline that read like source names, a
@@ -182,6 +185,10 @@ if cmd == 'dkms':
         st['built'] = [b for b in st['built'] if b[0] != v]
         st['added'] = [a for a in st['added'] if a != v]
     save(st)
+elif cmd == 'systemctl':
+    if args[:1] == ['is-enabled']:
+        print('enabled' if cfg.get('unit_enabled') else 'disabled')
+        sys.exit(0 if cfg.get('unit_enabled') else 1)
 elif cmd == 'uname':
     print(cfg['running'])
 elif cmd == 'modinfo':
@@ -346,6 +353,7 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
             'loader': sorted(f.name for f in lib.iterdir()) if lib.exists() else [],
             'unit': (root / 'etc/systemd/system/nvpcf-hook.service').exists(),
             'enabled': ['enable', 'nvpcf-hook.service'] in [a for c, a in calls if c == 'systemctl'],
+            'systemctl': [a for c, a in calls if c == 'systemctl'],
             'archives': sorted(f.name for f in (root / 'cache').iterdir()),
             'sources': sorted(d.name for d in (root / 'usr/src').iterdir()) if (root / 'usr/src').exists() else [],
             'registered_new': sorted(f.name for f in registered_new.iterdir()) if registered_new.is_dir() else None,
@@ -733,6 +741,21 @@ check(r, r['exit'] == 1 and 'source archive not downloaded' in r['out']
 
 r = run('extra-argument', {}, args=('now',))
 check(r, r['exit'] == 2 and r['calls'] == [], f"exits with status 2 before running any command, got {r['exit']}")
+
+r = run('no-enable-extra-argument', {}, args=('--no-enable', 'now'))
+check(r, r['exit'] == 2 and r['calls'] == [], f"exits with status 2 before running any command, got {r['exit']}")
+
+r = run('no-enable', {}, args=('--no-enable',))
+check(r, r['exit'] == 0 and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW} and r['unit'],
+      f"installs the module and the unit, got status {r['exit']} and {r['state']['installed']}")
+check(r, not any(a[:1] in (['enable'], ['disable']) for a in r['systemctl']) and ['daemon-reload'] in r['systemctl']
+      and 'without enabling it; it is disabled' in r['out'],
+      f"reloads systemd but neither enables nor disables the unit, and says that it is disabled, got {r['systemctl']}")
+
+r = run('no-enable-already-enabled', {'unit_enabled': True}, args=('--no-enable',))
+check(r, r['exit'] == 0 and not any(a[:1] in (['enable'], ['disable']) for a in r['systemctl'])
+      and 'without enabling it; it is enabled' in r['out'],
+      f"leaves an enabled unit enabled, and says so, got {r['systemctl']}")
 
 if failures:
     print(f'{len(failures)} failures; the cases are in {BASE}')
