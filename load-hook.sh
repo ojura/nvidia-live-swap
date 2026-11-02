@@ -134,10 +134,13 @@ copy_build_id() {
 copy_version() { modinfo -F version "$1" 2>/dev/null; }
 # Print the GNU build ID in a file of ELF notes in lowercase hex, and exit
 # with status 1 unless the file holds exactly one GNU build ID note, of 1 to
-# 64 bytes, the range that nvpcf_hook accepts. Every note has to be complete.
-# A note that another one follows is padded to four bytes, as the ELF format
-# requires. The last note may end right after its descriptor, as GNU ld
-# writes it, and Linux exports such a section with the same size.
+# 64 bytes, the range that nvpcf_hook accepts. The rules are those of
+# nh_note_build_id in hook/build_id.h, the hook's own parser. Every note's
+# header, name with its padding, and descriptor have to be complete. A note
+# that another one follows is padded to four bytes, as the ELF format
+# requires. The last note may lack some or all of the padding after its
+# descriptor: GNU ld writes it without that padding, and Linux exports such a
+# section with the same size.
 note_build_id() {
     python3 -I -c '
 import struct, sys
@@ -154,11 +157,10 @@ while offset < len(data):
         sys.exit(1)
     if kind == 3 and data[name_at:name_at + namesz] == b"GNU\0":
         ids.append(data[desc_at:desc_end])
-    if desc_end == len(data):
+    padded_end = desc_at + ((descsz + 3) & ~3)
+    if padded_end >= len(data):
         break
-    offset = (desc_end + 3) & ~3
-    if offset > len(data):
-        sys.exit(1)
+    offset = padded_end
 if len(ids) != 1 or not 1 <= len(ids[0]) <= 64:
     sys.exit(1)
 print(ids[0].hex())' "$1"

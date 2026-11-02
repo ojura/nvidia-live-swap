@@ -486,12 +486,12 @@ archive end the run with status 3, which means the check could not run.
 the file, and copies the bytes of its `.note.gnu.build-id` section into a
 temporary file with `objcopy -O binary -j .note.gnu.build-id`.
 `--loaded-build-id MODULE` prints the build ID of a loaded module, from the
-note in `/sys/module/<module>/notes`. Both parse the notes with the same
-rules:
+note in `/sys/module/<module>/notes`. Both parse the notes with the rules of
+`nh_note_build_id` in `hook/build_id.h`, the hook's own parser:
 
-- every note has to be complete;
+- every note's header, name with its padding, and ID have to be complete;
 - a note that another one follows is padded to four bytes;
-- the last note may end right after its ID.
+- the last note may lack some or all of the padding after its ID.
 
 They print the ID in lowercase hex only if the notes hold exactly one GNU
 build ID note, of 1 to 64 bytes, and exit with status 1 otherwise.
@@ -685,7 +685,13 @@ the number of deliveries.
   the ID. It also reads objects without the section, with two build ID notes
   in it, and with a truncated note at the end, and it checks that the objects
   stay unchanged. The same note bytes, with and without final padding, test
-  `--loaded-build-id`. The cases with the mock `objcopy` check IDs
+  `--loaded-build-id`. A differential test compiles `nh_note_build_id` from
+  `hook/build_id.h` into a small program, and checks that the loader accepts
+  the same notes and prints the same IDs: through `--loaded-build-id` for
+  every ID length from 1 to 64 with its final padding absent, partly present
+  or complete, and with the loader's parser code for 4000 seeded random note
+  sequences, some cut short or with a byte changed. The cases with the mock
+  `objcopy` check IDs
   of 16, 20, 32 and 64 bytes, IDs of 0 and 65 bytes, a file without an ID, a
   missing file, a module without a note, and a module name with a path.
 - `tests/check_install_hook.py` runs `install-hook.sh` as an ordinary user,

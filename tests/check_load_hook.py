@@ -21,6 +21,14 @@ build ID section, two build ID notes in the section, or a truncated note at
 the end. The same note bytes, with and without final padding, test
 --loaded-build-id. The objects stay unchanged.
 
+A differential test compiles nh_note_build_id from hook/build_id.h, the
+hook's own parser, into a small program. It compares that program's result
+with the loader's: through --loaded-build-id for every ID length from 1 to 64
+with its final padding absent, partly present or complete, and in-process,
+with the parser code taken from load-hook.sh, for several thousand seeded
+random note sequences, cut short or with bytes changed. The two have to
+accept the same inputs and print the same IDs. This needs a C compiler.
+
 The cases for --build-id and --loaded-build-id read the script's stdout
 apart from its messages on stderr, and check that it prints IDs of 16, 20, 32
 and 64 bytes in lowercase, and refuses an ID of 0 or 65 bytes, a file
@@ -276,7 +284,11 @@ r = run('already-loaded', hook_loaded=True)
 check(r, r['exit'] == 0 and r['modprobe'] == [] and r['checker'] == [],
       f"only reads the state of a loaded hook, got status {r['exit']} and {r['modprobe']}")
 
+import contextlib
 import hashlib
+import io
+import random
+import re
 
 
 def note(desc, pad):
@@ -342,6 +354,104 @@ for name in ('none', 'duplicate', 'truncated'):
 for name, data in (*crafted.items(), ('empty', b'')):
     r = dict(loaded(data), case=f'loaded-note-{name}')
     check(r, r['exit'] == 1 and r['stdout'] == '', f"refuses the loaded note, got {r['exit']} and {r['stdout']!r}")
+# The hook's own parser, nh_note_build_id, compiled for userspace with the
+# hook's host flags. It prints one line per file: the ID, or "error".
+DIFF = BASE / 'differential'
+DIFF.mkdir()
+(DIFF / 'parse.c').write_text(r"""#include <stdio.h>
+#include "build_id.h"
+int main(int argc, char **argv)
+{
+	static unsigned char buf[1 << 16];
+	for (int i = 1; i < argc; i++) {
+		FILE *f = fopen(argv[i], "rb");
+		size_t n = f ? fread(buf, 1, sizeof buf, f) : 0;
+		struct nh_build_id id;
+		char hex[NH_BUILD_ID_HEX_SIZE];
+		if (f)
+			fclose(f);
+		if (!f || nh_note_build_id(buf, n, &id)) {
+			puts("error");
+		} else {
+			nh_build_id_hex(&id, hex);
+			puts(hex);
+		}
+	}
+	return 0;
+}
+""")
+subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-Wconversion', '-pedantic',
+                f'-I{SRC}/hook', str(DIFF / 'parse.c'), '-o', str(DIFF / 'parse')], check=True)
+
+
+def c_results(blobs):
+    paths = []
+    for i, data in enumerate(blobs):
+        paths.append(DIFF / f'{i}.note')
+        paths[-1].write_bytes(data)
+    out = subprocess.run([str(DIFF / 'parse'), *map(str, paths)], capture_output=True, text=True, check=True).stdout
+    for path in paths:
+        path.unlink()
+    return [None if line == 'error' else line for line in out.splitlines()]
+
+
+matrix = {}
+for n in range(1, 65):
+    for pad in range(-n % 4 + 1):
+        matrix[f'{n}-bytes-{pad}-padding'] = note(bytes(range(1, n + 1)), False) + b'\0' * pad
+for (name, data), want in zip(matrix.items(), c_results(list(matrix.values()))):
+    got = loaded(data)
+    r = dict(got, case=f'differential-{name}')
+    check(r, want is not None and got['exit'] == 0 and got['stdout'] == want + '\n',
+          f"accepts the note as nh_note_build_id does, got {got['exit']} and {got['stdout']!r}, the hook got {want!r}")
+
+# The same parser code that load-hook.sh runs, taken from the script.
+parser = re.search(r"note_build_id\(\) \{\n    python3 -I -c '\n(.*?)' \"\$1\"\n\}",
+                   (SRC / 'load-hook.sh').read_text(), re.S).group(1)
+parser_code = compile(parser, 'note_build_id', 'exec')
+
+
+def py_result(data):
+    path = DIFF / 'py.note'
+    path.write_bytes(data)
+    out, saved = io.StringIO(), sys.argv
+    sys.argv = ['note_build_id', str(path)]
+    try:
+        with contextlib.redirect_stdout(out):
+            exec(parser_code, {'__name__': '__main__'})
+    except SystemExit as e:
+        if e.code not in (0, None):
+            return None
+    finally:
+        sys.argv = saved
+    return out.getvalue().strip() or None
+
+
+rng = random.Random(1299)
+blobs = []
+for _ in range(4000):
+    data = b''
+    for k in range(rng.choice((1, 1, 2, 3))):
+        name = rng.choice((b'GNU\0', b'GNU\0', b'GNU\0', b'GNU', b'GN\0\0', b'', b'LINUX\0'))
+        kind = rng.choice((3, 3, 3, 1, 4))
+        desc = bytes(rng.randrange(256) for _ in range(rng.choice((0, 1, 2, 3, 4, 5, 16, 17, 20, 63, 64, 65))))
+        rec = struct.pack('<III', len(name), len(desc), kind) + name + b'\0' * (-len(name) % 4) + desc
+        rec += b'\0' * rng.choice((-len(desc) % 4, -len(desc) % 4, 0, rng.randrange(4)))
+        data += rec
+    if rng.random() < 0.3:
+        data = data[:rng.randrange(len(data) + 1)]
+    if data and rng.random() < 0.3:
+        i = rng.randrange(len(data))
+        data = data[:i] + bytes([rng.randrange(256)]) + data[i + 1:]
+    blobs.append(data)
+mismatches = [(data.hex(), want, got) for data, want, got in zip(blobs, c_results(blobs), map(py_result, blobs))
+              if want != got]
+accepted = sum(1 for want in c_results(blobs) if want is not None)
+r = {'case': 'differential-random', 'out': ''}
+check(r, not mismatches, f"agrees with nh_note_build_id on {len(blobs)} random note sequences, got {len(mismatches)} "
+      f"differences, the first {mismatches[:3]}")
+check(r, 200 < accepted < len(blobs) - 200, f"the random sequences include both accepted and refused notes, got {accepted} accepted")
+
 r = {'case': 'ld-objects-unchanged', 'out': ''}
 check(r, all(hashlib.sha256(a.read_bytes()).hexdigest() == d for a, d in digests.items()),
       'leaves every object it read unchanged')
