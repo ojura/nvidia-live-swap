@@ -46,14 +46,16 @@
 # through later runs that find a kernel without any installed version, so that
 # dkms install can still put one of their builds back.
 #
-# It installs load-hook.sh, check_nvidia.py, expected_dispatcher.c and
-# nvpcf-hookctl as root-owned copies in /usr/local/lib/nvpcf-hook, and enables
-# nvpcf-hook.service, which runs load-hook.sh at boot. check_nvidia.py compares
-# the dispatcher function in NVIDIA's source archive with the copy in
-# expected_dispatcher.c, which it reads from its own directory. The script
-# downloads NVIDIA's source archive for each NVIDIA version that DKMS lists into
-# /var/cache/nvpcf-hook, so that loading the hook does not need the network. It
-# does not load the hook now; running /usr/local/lib/nvpcf-hook/load-hook.sh
+# It installs the files that lib.sh lists in HOOK_TOOLS as root-owned copies
+# in /usr/local/lib/nvpcf-hook: load-hook.sh, nvpcf-hookctl, check_nvidia.py,
+# and two references that check_nvidia.py reads from its own directory.
+# check_nvidia.py compares the dispatcher function in NVIDIA's source archive
+# with expected_dispatcher.c, and NVIDIA's proc file wrappers in the
+# kernel-open source with expected_procfs_wrappers.h. The script enables
+# nvpcf-hook.service, which runs load-hook.sh at boot, and downloads NVIDIA's
+# source archive for each NVIDIA version that DKMS lists into
+# /var/cache/nvpcf-hook, so that loading the hook does not need the network.
+# It does not load the hook now; running /usr/local/lib/nvpcf-hook/load-hook.sh
 # does.
 #
 # It reads the DKMS state and works out the kernels before it changes
@@ -68,7 +70,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 DIR=$here
 . "$here/lib.sh"
 UNIT=/etc/systemd/system/nvpcf-hook.service
-SOURCES=(Kbuild Makefile dkms.conf nvpcf_hook.c lifecycle.h state.h text.h)
+SOURCES=(Kbuild Makefile dkms.conf nvpcf_hook.c build_id.h lifecycle.h state.h text.h)
 fail() { echo "$*"; exit 1; }
 
 # DKMS's VER from /usr/sbin/dkms.

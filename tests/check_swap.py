@@ -37,6 +37,7 @@ one. A hook with retirement_failed set does not guard, whatever its state."""
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -45,6 +46,8 @@ import tempfile
 import time
 
 SRC = Path(__file__).resolve().parent.parent
+# The repository files that install-hook.sh installs, as lib.sh lists them.
+TOOLS = re.search(r'^HOOK_TOOLS=\((.*?)\)$', (SRC / 'lib.sh').read_text(), re.M | re.S).group(1).split()
 BASE = Path(tempfile.mkdtemp(prefix='swap-test-'))
 HIDE = ['/usr/share/glvnd/egl_vendor.d/10_nvidia.json',
         '/usr/share/vulkan/implicit_layer.d/nvidia_layers.json',
@@ -373,9 +376,11 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
         (lib / 'load-hook.sh').chmod(0o644)
     elif not cfg.get('loader_missing'):
         (lib / 'load-hook.sh').symlink_to(mock)
-    for f in ('check_nvidia.py', 'expected_dispatcher.c'):
-        shutil.copy(SRC / 'hook/tests' / f, script_dir / 'hook/tests' / f)
-        shutil.copy(SRC / 'hook/tests' / f, lib / f)
+    for f in TOOLS:
+        if f in ('load-hook.sh', 'hook/nvpcf-hookctl'):
+            continue  # the mock, linked above
+        shutil.copy(SRC / f, script_dir / f)
+        shutil.copy(SRC / f, lib / Path(f).name)
     if cfg.get('installed_tool_differs'):
         (lib / 'check_nvidia.py').write_text('# an older checker\n')
     (root / 'real-load-hook.sh').write_text(rewrite((SRC / 'load-hook.sh').read_text(), root))

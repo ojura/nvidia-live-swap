@@ -200,11 +200,12 @@ and looks for `RmDeferNvpcfNotifyIfIdle` with `nm`.
 
 `swap.sh` runs the installed `load-hook.sh`, which runs the installed checker,
 and the loaded hook comes from the installed DKMS module. So `swap.sh` refuses
-while a copy of `load-hook.sh`, `nvpcf-hookctl`, `check_nvidia.py` or
-`expected_dispatcher.c` in `/usr/local/lib/nvpcf-hook` is missing, differs
-from the repository's file, or lacks the executable bit that the repository's
-file has. It names `install-hook.sh`, which installs this version. `lib.sh`
-lists these files for both scripts.
+while a copy of `load-hook.sh`, `nvpcf-hookctl`, `check_nvidia.py`,
+`expected_dispatcher.c` or `expected_procfs_wrappers.h` in
+`/usr/local/lib/nvpcf-hook` is missing, differs from the repository's file, or
+lacks the executable bit that the repository's file has. It names
+`install-hook.sh`, which installs this version. `lib.sh` lists these files
+for both scripts.
 
 Before the swap changes anything, `swap.sh` runs `load-hook.sh --check-disk`,
 which checks the nvidia module that `modprobe` would load in the same way as the
@@ -366,8 +367,10 @@ the display configuration afterwards matches the configuration before.
 ### lib.sh
 
 `lib.sh` finds the NVIDIA GPU's PCI address. It picks the first PCI device that
-is a display controller and has NVIDIA's vendor ID, 0x10de. `swap.sh` and
-`trace.sh` source it.
+is a display controller and has NVIDIA's vendor ID, 0x10de. It also lists, in
+`HOOK_TOOLS`, the files that `install-hook.sh` installs in
+`/usr/local/lib/nvpcf-hook`. `swap.sh`, `trace.sh` and `install-hook.sh` source
+it.
 
 ### build.sh
 
@@ -449,7 +452,8 @@ checker on three inputs, and does not run or extract any code from them:
 - the nvidia module file with the build's GNU build ID, for its symbols, its
   ftrace instrumentation and its calls;
 - the version's kernel-open source in `/usr/src/nvidia-<version>`, for the C
-  declarations and roles of the functions that the hook uses;
+  declarations and roles of the functions that the hook uses, and for the
+  functions behind NVIDIA's GPU files in `/proc` that the hook reads;
 - NVIDIA's source archive for the version's tag on GitHub, for the source of
   the precompiled driver core, where the dispatcher that the hook observes
   lives.
@@ -542,12 +546,14 @@ kernel, their registrations, sources and builds stay, also through later runs
 that find a kernel without any installed version, so that `dkms install` can
 still put one of their builds back.
 
-It installs `load-hook.sh`, `check_nvidia.py`, `expected_dispatcher.c` and
-`nvpcf-hookctl` as root-owned copies in `/usr/local/lib/nvpcf-hook`.
-`check_nvidia.py` compares the dispatcher function in NVIDIA's source archive
-with the copy in `expected_dispatcher.c`, which it reads from its own
-directory. The script enables `nvpcf-hook.service`, and downloads the source
-archive for each NVIDIA version that DKMS lists. It does not load the hook.
+It installs the files that `lib.sh` lists in `HOOK_TOOLS` as root-owned
+copies in `/usr/local/lib/nvpcf-hook`: `load-hook.sh`, `nvpcf-hookctl`,
+`check_nvidia.py` and two references that `check_nvidia.py` reads from its own
+directory. The checker compares the dispatcher function in NVIDIA's source
+archive with `expected_dispatcher.c`, and NVIDIA's wrappers for its GPU files
+in `/proc` in the kernel-open source with `expected_procfs_wrappers.h`. The
+script enables `nvpcf-hook.service`, and downloads the source archive for each
+NVIDIA version that DKMS lists. It does not load the hook.
 
 It reads the DKMS state and works out the kernels before it changes anything.
 If a `dkms status` fails or the running kernel's headers are missing, it stops
@@ -705,10 +711,14 @@ the number of deliveries.
 
   Every case that registers the new version checks, with `VER` from
   `/usr/sbin/dkms`, that DKMS would build the new version for the next
-  kernel. The fresh install also runs `hook/tests/check_checker.py`,
-  nvpcf_hook's tests of its checker, in a copy of the installed directory, so
-  the installed `check_nvidia.py` has to find `expected_dispatcher.c` where
-  `install-hook.sh` put it.
+  kernel. The fresh install checks that every file in `HOOK_TOOLS` is
+  installed unchanged, with its mode. It also runs
+  `hook/tests/check_checker.py`, nvpcf_hook's tests of its checker, in a copy
+  of the installed directory, and runs that installed `check_nvidia.py` with
+  `--kernel-source` on each NVIDIA kernel-open tree in `/usr/src`. So the
+  installed checker has to find `expected_dispatcher.c` and
+  `expected_procfs_wrappers.h` where `install-hook.sh` put them. This needs at
+  least one `/usr/src/nvidia-<version>` tree.
 - `make -C hook check` runs nvpcf_hook's own tests, which
   [hook/README.md](hook/README.md) describes.
 - `tests/check_build.py` runs `build.sh` as an ordinary user, against mock

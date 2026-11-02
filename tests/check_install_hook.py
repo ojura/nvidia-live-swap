@@ -38,11 +38,15 @@ nvpcf_hook.mod.c. The second run has to find the registered source unchanged,
 and a Kbuild build of the registered source has to succeed. This case needs
 the running kernel's headers and a compiler.
 
-The fresh install also runs hook/tests/check_checker.py, nvpcf_hook's tests of
-its checker, in a copy of the installed /usr/local/lib/nvpcf-hook, with -I and
--B as load-hook.sh runs the checker. So the installed check_nvidia.py has to
-find its data file, expected_dispatcher.c, in the directory that
-install-hook.sh filled."""
+The fresh install checks that every file that lib.sh lists in HOOK_TOOLS is
+installed unchanged, with its mode. It also runs hook/tests/check_checker.py,
+nvpcf_hook's tests of its checker, in a copy of the installed
+/usr/local/lib/nvpcf-hook, with -I and -B as load-hook.sh runs the checker,
+and runs that installed check_nvidia.py with --kernel-source on each NVIDIA
+kernel-open tree in /usr/src. So the installed checker has to find its
+references, expected_dispatcher.c and expected_procfs_wrappers.h, in the
+directory that install-hook.sh filled. This needs at least one
+/usr/src/nvidia-<version> tree."""
 import hashlib
 import json
 import os
@@ -63,6 +67,8 @@ NVIDIA = (f'nvidia/615.71.09, {OTHER}, x86_64: installed\n'
 OLD = '0.0.1'
 NEW = re.search(r'^PACKAGE_VERSION="(.*)"$', (SRC / 'hook/dkms.conf').read_text(), re.M).group(1)
 SOURCES = re.search(r'^SOURCES=\((.*)\)$', (SRC / 'install-hook.sh').read_text(), re.M).group(1).split()
+# The repository files that install-hook.sh installs, as lib.sh lists them.
+TOOLS = re.search(r'^HOOK_TOOLS=\((.*?)\)$', (SRC / 'lib.sh').read_text(), re.M | re.S).group(1).split()
 # NEW with every number padded to three digits: another version string with
 # the same DKMS rank.
 ALIAS = '.'.join(c.zfill(3) for c in NEW.split('.'))
@@ -335,21 +341,29 @@ check(r, r['state']['installed'] == {RUNNING: r['new'], OTHER: r['new']},
       f"installs the new version for both kernels, got {r['state']['installed']}")
 check(r, r['registered_new'] == sorted(SOURCES),
       f"registers exactly the source files that DKMS's build reads, got {r['registered_new']}")
-check(r, r['loader'] == ['check_nvidia.py', 'expected_dispatcher.c', 'load-hook.sh', 'nvpcf-hookctl']
-      and r['unit'] and r['enabled'],
-      f"installs the loader, its checker with the checker's data file and the control client, and enables the boot unit, got {r['loader']}")
+check(r, r['loader'] == sorted(Path(f).name for f in TOOLS) and r['unit'] and r['enabled'],
+      f"installs the files that lib.sh lists in HOOK_TOOLS, and enables the boot unit, got {r['loader']}")
 lib = r['root'] / 'usr/local/lib/nvpcf-hook'
-data = lib / 'expected_dispatcher.c'
-check(r, data.is_file() and data.read_bytes() == (SRC / 'hook/tests/expected_dispatcher.c').read_bytes()
-      and data.stat().st_mode & 0o777 == 0o644,
-      'installs an unchanged copy of hook/tests/expected_dispatcher.c with mode 0644')
+for f in TOOLS:
+    # The copied scripts are what install-hook.sh installs from; only their
+    # paths differ from the repository's files.
+    copy, source = lib / Path(f).name, r['scripts'] / f
+    mode = 0o755 if os.access(source, os.X_OK) else 0o644
+    check(r, copy.is_file() and copy.read_bytes() == source.read_bytes() and copy.stat().st_mode & 0o777 == mode,
+          f'installs an unchanged copy of {f} with mode {mode:o}')
 layout = BASE / 'installed-checker'
 shutil.copytree(lib, layout)
 shutil.copy(SRC / 'hook/tests/check_checker.py', layout)
 p = subprocess.run(['python3', '-I', '-B', str(layout / 'check_checker.py')],
                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
 check(r, p.returncode == 0,
-      f"the installed checker passes nvpcf_hook's checker tests with its installed data file, got status {p.returncode}:\n{p.stdout}")
+      f"the installed checker passes nvpcf_hook's checker tests with its installed references, got status {p.returncode}:\n{p.stdout}")
+trees = sorted(d for d in Path('/usr/src').glob('nvidia-*') if (d / 'nvidia/nv-procfs.c').is_file())
+check(r, trees != [], 'finds an NVIDIA kernel-open tree in /usr/src, which this case needs')
+for tree in trees:
+    p = subprocess.run(['python3', '-I', '-B', str(layout / 'check_nvidia.py'), '--kernel-source', str(tree)],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+    check(r, p.returncode == 0, f"the installed checker passes {tree} with its installed references, got status {p.returncode}:\n{p.stdout}")
 check(r, r['archives'] == ['open-gpu-kernel-modules-615.71.09.tar.gz'],
       f"downloads NVIDIA's source archive for the installed version, got {r['archives']}")
 check(r, r['new'] == NEW, f"registers PACKAGE_VERSION from hook/dkms.conf, {NEW}, got {r['state']['added']}")
