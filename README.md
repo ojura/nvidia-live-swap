@@ -40,14 +40,13 @@ Run the scripts from the repository directory.
 - `sudo ./build.sh [version]` builds the patched driver for the installed
   kernels. Without a version, it builds the newest NVIDIA driver version that
   DKMS lists. DKMS is the system that rebuilds drivers for each installed
-  kernel. The patched driver loads at the next boot, or right away with
-  `swap.sh`.
+  kernel. The patched driver loads at the next boot.
 - `sudo ./swap.sh --check` lists the programs that have the NVIDIA GPU open, and
   says whether a swap can go ahead now. It only reads the state of the system.
 - `sudo ./swap.sh` unloads the NVIDIA kernel modules and loads the modules
   installed on disk. Then it checks that the loaded modules match the files on
-  disk, and that the fix is in place: the loaded driver contains the patch, or
-  nvpcf_hook is active.
+  disk, and that nvpcf_hook is active. Every swap needs nvpcf_hook, as
+  [Limitations](#limitations) explains.
 - `sudo ./install-hook.sh` installs nvpcf_hook with DKMS for the installed
   kernels, and makes it load at boot. `sudo modprobe nvpcf_hook` loads it now.
 - `sudo ./hook/nvpcf-hookctl status` shows nvpcf_hook's state and counts. The
@@ -66,8 +65,8 @@ To install the fix without logging out:
 - With nvpcf_hook, run `sudo ./install-hook.sh` and `sudo modprobe nvpcf_hook`,
   and check that `sudo ./hook/nvpcf-hookctl status` reports the state `active`.
   The hook attaches to the running driver, so the fix works without a swap.
-- With `build.sh`, run `sudo ./build.sh`, then `sudo ./swap.sh --check`, and
-  then `sudo ./swap.sh`.
+- With `build.sh`, run `sudo ./build.sh`. The patched driver loads at the next
+  boot.
 
 `swap.sh` needs gdb, the GNU debugger, which it uses to take the GPU away from
 running programs. It also runs `reapply-layout.py`, which needs Ubuntu's
@@ -111,10 +110,10 @@ away from the programs that have it open.
   do not find NVIDIA's libraries. A program that opens the GPU's device files
   directly, such as `nvidia-smi`, can still open the GPU during the swap, and
   can make the swap fail if it holds them open when the driver is unloaded.
-- If nvpcf_hook is loaded, `swap.sh` prepares it before it changes anything,
-  and detaches it once the other programs have let go of the GPU. It unloads the
-  hook after NVIDIA's driver, and loads it again after the new driver. The swap
-  succeeds only if the hook is active afterwards.
+- `swap.sh` prepares nvpcf_hook before it changes anything, and detaches it
+  once the other programs have let go of the GPU. It unloads the hook after
+  NVIDIA's driver, and loads it again after the new driver. The swap succeeds
+  only if the hook is active afterwards.
 
 ## Limitations
 
@@ -134,21 +133,23 @@ before it renames files, stops services or takes the GPU away from any program.
 - A registration file is still renamed from an interrupted earlier swap.
   `swap.sh --check` names the file. Remove its `.hotswap` suffix before the next
   swap.
-- The NVIDIA driver on disk lacks the patch, and nvpcf_hook is not loaded, not
-  installed for the running kernel, or in a state that does not allow a swap.
-  `swap.sh --check` says which. If the hook lost messages it held, for example
-  because the GPU disappeared, it stays `unavailable` until a person runs
-  `sudo ./hook/nvpcf-hookctl acknowledge-loss` after reading its status and the
-  kernel log. `swap.sh` never runs that command.
+- nvpcf_hook is not loaded, not installed for the running kernel, or in a state
+  that does not allow a swap. `swap.sh --check` says which. If the hook lost
+  messages it held, for example because the GPU disappeared, it stays
+  `unavailable` until a person runs `sudo ./hook/nvpcf-hookctl acknowledge-loss`
+  after reading its status and the kernel log. `swap.sh` never runs that
+  command.
 
-Without nvpcf_hook, a swap can hang. When the last program closes the GPU,
+A swap without nvpcf_hook could hang. When the last program closes the GPU,
 NVIDIA shuts down its state for the GPU, and holds a lock while it does. If a
 firmware message about the power limits or the AC adapter arrives just then,
 its handler waits for that lock, and the shutdown waits for the handler. The
 program that closed the GPU last then hangs. During a swap that is often
 gnome-shell, which freezes the desktop. nvpcf_hook removes NVIDIA's firmware
-message handlers before the shutdown takes the lock. The hang is inferred from
-NVIDIA's source and has not been reproduced.
+message handlers before the shutdown takes the lock. Patch 0001 does not help
+here, because the patched driver takes the same lock before it holds a
+message. So `swap.sh` refuses to swap without the hook. The hang is inferred
+from NVIDIA's source and has not been reproduced.
 [WRITEUP.md](WRITEUP.md#the-hang-in-nvidias-shutdown) has the details.
 
 Swaps have to be at least 20 seconds apart. During a swap, GNOME asks
@@ -205,14 +206,12 @@ diversion is in place.
 ## Switching from build.sh to nvpcf_hook
 
 1. Run `sudo ./install-hook.sh`.
-2. Run `sudo modprobe nvpcf_hook`, then `sudo ./hook/nvpcf-hookctl status`, and
-   check that the state is `active`. The hook also attaches to the patched
-   driver that is loaded now.
-3. Put Ubuntu's driver core back, and rebuild the driver for each kernel, with
+2. Put Ubuntu's driver core back, and rebuild the driver for each kernel, with
    the commands in [Restoring Ubuntu's driver
    core](#restoring-ubuntus-driver-core).
-4. Run `sudo ./swap.sh --check`, then `sudo ./swap.sh`. The swap loads
-   Ubuntu's unchanged driver, and then the hook again.
+3. Reboot. Ubuntu's unchanged driver and the hook load at boot.
+4. Run `sudo ./hook/nvpcf-hookctl status`, and check that the state is
+   `active`.
 
 ## Changing the driver version
 

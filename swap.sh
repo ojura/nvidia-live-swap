@@ -45,19 +45,17 @@
 # therefore records when each swap ends, and starts the next swap only
 # after GAP seconds have passed since then.
 #
-# The fix for the wake-ups is patch 0001 in the nvidia module on disk, or
-# nvpcf_hook (hook/README.md) next to a driver without the patch. swap.sh
-# reads which one applies from the nvidia module that modprobe would load.
-# Without the patch, swap.sh refuses unless nvpcf_hook is loaded in a state
-# that allows a swap. A loaded nvpcf_hook always takes part, because it
-# holds the GPU, and NVIDIA cannot unload while it does. The hook also
-# guards NVIDIA's adapter shutdown. Without that guard, a firmware
-# notification that arrives while NVIDIA shuts the adapter down after the
-# last close can make the shutdown and the notification's handler wait for
-# each other. With the hook, a swap runs the hook's prepare before any
-# change, and its detach once the other holders are gone. It unloads NVIDIA
-# while the hook's guard remains, then unloads the hook, and loads it again
-# after the new driver.
+# Every swap needs nvpcf_hook (hook/README.md), whichever fix for the
+# wake-ups the driver on disk has. The hook guards NVIDIA's adapter
+# shutdown. Without that guard, a firmware notification that arrives while
+# NVIDIA shuts the adapter down after the last close can make the shutdown
+# and the notification's handler wait for each other. Patch 0001 does not
+# prevent that, because the patched driver takes the same lock before it
+# defers a notification. swap.sh therefore refuses unless nvpcf_hook is
+# loaded, installed for the running kernel, and in a state that allows a
+# swap. A swap runs the hook's prepare before any change, and its detach
+# once the other holders are gone. It unloads NVIDIA while the hook's guard
+# remains, then unloads the hook, and loads it again after the new driver.
 #
 # Once the display device is free, a swap hides the files that register
 # NVIDIA's EGL and Vulkan libraries with their loaders (HIDE), so that these
@@ -72,11 +70,11 @@
 # It loads from disk every NVIDIA module that was loaded at the start and is
 # now missing, so a module it loads again can be a different build from the
 # one it unloaded. Revoked handles stay revoked. It logs END only when every
-# module it loaded has the same build ID as its file on disk, and the fix is
-# in place. If the nvidia module on disk has patch 0001, the loaded driver
-# must contain RmDeferNvpcfNotifyIfIdle and RmReplayNvpcfNotify, two of the
-# functions that the patch adds. If the swap used nvpcf_hook, the hook must
-# report the state active.
+# module it loaded, nvpcf_hook included, has the same build ID as its file
+# on disk, and nvpcf_hook reports the state active. If the nvidia module on
+# disk has patch 0001, the loaded driver must also contain
+# RmDeferNvpcfNotifyIfIdle and RmReplayNvpcfNotify, two of the functions
+# that the patch adds.
 set -u
 usage() { echo "usage: swap.sh [--check]" >&2; exit 2; }
 check_only=0
@@ -238,28 +236,24 @@ disk_has_patch
 patch_rc=$?
 case $patch_rc in
     0) log "the nvidia module on disk contains patch 0001" ;;
-    1) log "the nvidia module on disk lacks patch 0001, so the swap needs nvpcf_hook" ;;
+    1) log "the nvidia module on disk lacks patch 0001" ;;
     *) hook_problems+=("cannot read the nvidia module that modprobe would load") ;;
 esac
-use_hook=0
-if hook_loaded || [ $patch_rc = 1 ]; then use_hook=1; fi
-if [ $use_hook = 1 ]; then
-    modinfo -n nvpcf_hook >/dev/null 2>&1 ||
-        hook_problems+=("nvpcf_hook is not installed for kernel $(uname -r), so swap.sh could not load it after the swap")
-    if ! hook_loaded; then
-        hook_problems+=("nvpcf_hook is not loaded; load it with modprobe nvpcf_hook, and check that $DIR/hook/nvpcf-hookctl status reports the state active")
-    elif ! hook_status=$(hookctl status 2>&1); then
-        hook_problems+=("cannot read the status of nvpcf_hook: $hook_status")
-    else
-        log "$(hook_summary)"
-        hook_state=$(sed -n 's/^state: //p' <<<"$hook_status")
-        case "$hook_state" in
-            active|waiting|guard-only|quiesced) ;;
-            starting|suspended) hook_problems+=("nvpcf_hook is $hook_state; check again in a few seconds") ;;
-            unavailable) hook_problems+=("nvpcf_hook is unavailable with last_error $(sed -n 's/^last_error: //p' <<<"$hook_status"); its status and the kernel log say why, and swap.sh does not acknowledge a loss") ;;
-            *) hook_problems+=("nvpcf_hook is ${hook_state:-in an unknown state}, so it does not guard a swap; run $DIR/hook/nvpcf-hookctl resume, or unload it and load it again") ;;
-        esac
-    fi
+modinfo -n nvpcf_hook >/dev/null 2>&1 ||
+    hook_problems+=("nvpcf_hook is not installed for kernel $(uname -r), so swap.sh could not load it after the swap")
+if ! hook_loaded; then
+    hook_problems+=("nvpcf_hook is not loaded; load it with modprobe nvpcf_hook, and check that $DIR/hook/nvpcf-hookctl status reports the state active")
+elif ! hook_status=$(hookctl status 2>&1); then
+    hook_problems+=("cannot read the status of nvpcf_hook: $hook_status")
+else
+    log "$(hook_summary)"
+    hook_state=$(sed -n 's/^state: //p' <<<"$hook_status")
+    case "$hook_state" in
+        active|waiting|guard-only|quiesced) ;;
+        starting|suspended) hook_problems+=("nvpcf_hook is $hook_state; check again in a few seconds") ;;
+        unavailable) hook_problems+=("nvpcf_hook is unavailable with last_error $(sed -n 's/^last_error: //p' <<<"$hook_status"); its status and the kernel log say why, and swap.sh does not acknowledge a loss") ;;
+        *) hook_problems+=("nvpcf_hook is ${hook_state:-in an unknown state}, so it does not guard a swap; run $DIR/hook/nvpcf-hookctl resume, or unload it and load it again") ;;
+    esac
 fi
 for x in "${hook_problems[@]}"; do log "$x"; done
 
@@ -329,7 +323,7 @@ cleanup() {
             if modprobe "$m"; then log "loaded $m again"; else log "could not load $m again"; fi
         fi
     done
-    if [ $use_hook = 1 ] && is_loaded nvidia; then
+    if is_loaded nvidia; then
         if ! hook_loaded; then
             if modprobe nvpcf_hook; then log "loaded nvpcf_hook again"; else log "could not load nvpcf_hook again"; fi
         elif [ $hook_detached = 1 ] && [ $hook_resumed = 0 ]; then
@@ -337,7 +331,7 @@ cleanup() {
         fi
     fi
     restore
-    if [ $use_hook = 1 ]; then log "$(hook_summary)"; fi
+    log "$(hook_summary)"
     log "END (failed)"
     [ $status = 0 ] && status=1
     exit $status
@@ -376,10 +370,8 @@ if [ $wait_s -gt 0 ]; then
     log "waiting $wait_s s after the previous swap"
     sleep "$wait_s"
 fi
-if [ $use_hook = 1 ]; then
-    hookctl prepare 2>&1 || fail "nvpcf_hook's prepare failed, so the swap stops before it changes anything: $(hook_summary)"
-    log "prepared $(hook_summary)"
-fi
+hookctl prepare 2>&1 || fail "nvpcf_hook's prepare failed, so the swap stops before it changes anything: $(hook_summary)"
+log "prepared $(hook_summary)"
 if [ -n "$kms_holders" ]; then
     release_kms || fail "mutter did not release the display device"
 fi
@@ -411,11 +403,9 @@ for p in $(holders "${nodes[@]}"); do
 done
 left=$(holders "${kms[@]}" "${nodes[@]}")
 [ -z "$left" ] || fail "still held by: $(for p in $left; do echo -n "$(describe "$p"); "; done)"
-if [ $use_hook = 1 ]; then
-    hook_detached=1
-    hookctl detach 2>&1 || fail "nvpcf_hook's detach failed: $(hook_summary)"
-    log "detached $(hook_summary)"
-fi
+hook_detached=1
+hookctl detach 2>&1 || fail "nvpcf_hook's detach failed: $(hook_summary)"
+log "detached $(hook_summary)"
 lsmod | grep -E '^nvidia'
 
 for m in nvidia_drm nvidia_modeset nvidia_uvm nvidia; do
@@ -423,28 +413,22 @@ for m in nvidia_drm nvidia_modeset nvidia_uvm nvidia; do
     rmmod "$m" || fail "could not unload $m"
     log "unloaded $m"
 done
-if [ $use_hook = 1 ]; then
-    rmmod nvpcf_hook || fail "could not unload nvpcf_hook after NVIDIA: $(hook_summary)"
-    hook_detached=0  # the detached instance is gone; the trap loads a new one
-    log "unloaded nvpcf_hook"
-fi
+rmmod nvpcf_hook || fail "could not unload nvpcf_hook after NVIDIA: $(hook_summary)"
+hook_detached=0  # the detached instance is gone; the trap loads a new one
+log "unloaded nvpcf_hook"
 for m in "${MODULES[@]}"; do
     contains "$m" "${initial[@]}" || continue
     modprobe "$m" || fail "could not load $m"
     log "loaded $m"
 done
-if [ $use_hook = 1 ]; then
-    modprobe nvpcf_hook || fail "could not load nvpcf_hook"
-    log "loaded $(hook_summary)"
-fi
+modprobe nvpcf_hook || fail "could not load nvpcf_hook"
+log "loaded $(hook_summary)"
 
 restore || fail "the modules were replaced, but restoring the files or services failed"
 head -1 /proc/driver/nvidia/version
 lsmod | grep -E '^nvidia'
 log "GPU runtime status: $(cat "/sys/bus/pci/devices/$gpu/power/runtime_status")"
-checked=("${initial[@]}")
-if [ $use_hook = 1 ]; then checked+=(nvpcf_hook); fi
-for m in "${checked[@]}"; do
+for m in "${initial[@]}" nvpcf_hook; do
     a=$(loaded_build_id "$m")
     b=$(disk_build_id "$m")
     [ -n "$a" ] && [ "$a" = "$b" ] || fail "the loaded $m (build ID ${a:-unknown}) is not the file on disk (${b:-unknown})"
@@ -455,17 +439,15 @@ if [ $patch_rc = 0 ]; then
     [ "$patched" = 2 ] || fail "the loaded driver lacks the patch ($patched of 2 symbols found)"
     log "the loaded driver contains the patch"
 fi
-if [ $use_hook = 1 ]; then
-    # The hook attaches once something initializes the GPU, here usually a
-    # restarted service or gnome-shell opening the new display device.
-    for _ in $(seq $((HOOK_WAIT * 2))); do
-        [ "$(hookctl status 2>/dev/null | sed -n 's/^state: //p')" = active ] && break
-        sleep 0.5
-    done
-    hook_status=$(hookctl status 2>&1) || fail "cannot read the status of nvpcf_hook after the swap: $hook_status"
-    [ "$(sed -n 's/^state: //p' <<<"$hook_status")" = active ] ||
-        fail "nvpcf_hook is not active $HOOK_WAIT s after the swap: $(hook_summary)"
-    log "$(hook_summary)"
-fi
+# The hook attaches once something initializes the GPU, usually gnome-shell
+# opening the new display device or a restarted service.
+for _ in $(seq $((HOOK_WAIT * 2))); do
+    [ "$(hookctl status 2>/dev/null | sed -n 's/^state: //p')" = active ] && break
+    sleep 0.5
+done
+hook_status=$(hookctl status 2>&1) || fail "cannot read the status of nvpcf_hook after the swap: $hook_status"
+[ "$(sed -n 's/^state: //p' <<<"$hook_status")" = active ] ||
+    fail "nvpcf_hook is not active $HOOK_WAIT s after the swap: $(hook_summary)"
+log "$(hook_summary)"
 succeeded=1
 log "END"

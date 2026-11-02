@@ -121,8 +121,10 @@ in `rm_power_source_change_event` when the power source changes
 (`osapi.c:4590-4640`). If one of them starts just before the shutdown takes the
 lock, it waits for the lock, and the shutdown waits for it. The program whose
 close started the shutdown then hangs in the kernel. In the Balanced profile
-the NVPCF handler runs every 7 seconds. This sequence is read from NVIDIA's
-615.71.09 source and has not been reproduced.
+the NVPCF handler runs every 7 seconds. Patch 0001 does not change this,
+because `rm_acpi_nvpcf_notify` takes the RM API lock before the patch's
+`RmDeferNvpcfNotifyIfIdle` runs. This sequence is read from NVIDIA's 615.71.09
+source and has not been reproduced.
 
 nvpcf_hook intercepts `nv_shutdown_adapter` at its entry, before those locks,
 and calls NVIDIA's own `nv_acpi_methods_uninit` there. That removes both
@@ -184,24 +186,22 @@ process. It runs `revoke.py` in its own session, so that a signal to `swap.sh`'s
 process group cannot stop gdb in the middle of a call that gdb injected into the
 target process.
 
-Whether a swap uses nvpcf_hook depends on the nvidia module that `modprobe`
-would load. `swap.sh` decompresses it and looks for `RmDeferNvpcfNotifyIfIdle`
-with `nm`. Without that symbol the swap needs the hook. `swap.sh` then refuses
-unless the hook is loaded, installed for the running kernel, and in the state
-`active`, `waiting`, `guard-only` or `quiesced`. A loaded hook always takes part
-in a swap, because it holds a reference to the GPU, and NVIDIA cannot unload
-while it does. `swap.sh` reads the hook's state with `nvpcf-hookctl status`,
-which does not change the hook. [hook/README.md](hook/README.md) describes the
-states.
+Every swap needs nvpcf_hook, for its guard of NVIDIA's shutdown, which [The
+hang in NVIDIA's shutdown](#the-hang-in-nvidias-shutdown) describes.
+`swap.sh` refuses unless the hook is loaded, installed for the running kernel,
+and in the state `active`, `waiting`, `guard-only` or `quiesced`. It reads the
+hook's state with `nvpcf-hookctl status`, which does not change the hook.
+[hook/README.md](hook/README.md) describes the states. For the check after the
+swap, `swap.sh` also decompresses the nvidia module that `modprobe` would load
+and looks for `RmDeferNvpcfNotifyIfIdle` with `nm`.
 
-A swap runs these steps in order. The steps marked "hook" run when the swap
-uses nvpcf_hook.
+A swap runs these steps in order:
 
 1. If the previous swap ended less than 20 seconds earlier, `swap.sh` waits for
    the rest of the 20 seconds.
-2. Hook: it runs the hook's `prepare`, which delivers any held message and
-   checks that the hook can detach later. If `prepare` fails, `swap.sh` stops
-   before it changes anything.
+2. It runs the hook's `prepare`, which delivers any held message and checks
+   that the hook can detach later. If `prepare` fails, `swap.sh` stops before
+   it changes anything.
 3. If mutter holds the display device, `swap.sh` makes mutter release it, as
    described above.
 4. It renames the registration files
@@ -218,19 +218,19 @@ uses nvpcf_hook.
 5. It stops the services.
 6. It revokes the handles, and checks that every process has closed the device
    files.
-7. Hook: it runs the hook's `detach`. The hook delivers any held message,
-   releases its reference to the GPU if it holds one, and keeps only its
-   shutdown guard, in the state `guard-only`. When the hook held a reference,
-   that release is the last close of the GPU. Otherwise the last close came
-   earlier, during the revocations. The guard is in place in both cases,
-   because the hook registers it when it loads, also when it then waits.
+7. It runs the hook's `detach`. The hook delivers any held message, releases
+   its reference to the GPU if it holds one, and keeps only its shutdown guard,
+   in the state `guard-only`. When the hook held a reference, that release is
+   the last close of the GPU. Otherwise the last close came earlier, during the
+   revocations. The guard is in place in both cases, because the hook
+   registers it when it loads, also when it then waits.
 8. It unloads `nvidia_drm`, `nvidia_modeset`, `nvidia_uvm` and `nvidia`, in that
    order.
-9. Hook: it unloads `nvpcf_hook`. The hook keeps itself loaded until NVIDIA's
+9. It unloads `nvpcf_hook`. The hook keeps itself loaded until NVIDIA's
    unload has finished, and then moves to `detached`.
 10. It loads from disk each module that was loaded at the start, in the order
     `nvidia`, `nvidia_modeset`, `nvidia_drm`, `nvidia_uvm`.
-11. Hook: it loads `nvpcf_hook` again.
+11. It loads `nvpcf_hook` again.
 12. It renames the registration files back and starts the services.
 13. It checks the build IDs and the fix, as described below.
 
@@ -277,10 +277,9 @@ that the linker stores in each module. `swap.sh` compares the build ID in
 `/sys/module/<module>/notes` with the build ID in the file that `modprobe` would
 load. If the nvidia module on disk has patch 0001, `swap.sh` looks for
 `RmDeferNvpcfNotifyIfIdle` and `RmReplayNvpcfNotify` in `/proc/kallsyms`, the
-kernel's list of symbols. If the swap uses the hook, `swap.sh` waits up to 15
-seconds for the hook's state to become `active`. The hook attaches once
-something initializes the GPU, usually a restarted service or gnome-shell
-opening the new display device.
+kernel's list of symbols. `swap.sh` waits up to 15 seconds for the hook's state
+to become `active`. The hook attaches once something initializes the GPU,
+usually gnome-shell opening the new display device or a restarted service.
 
 ### revoke.py
 
@@ -475,15 +474,14 @@ durations then cover both.
   - With nvpcf_hook, a mock `nvpcf-hookctl` keeps the hook's state. A full swap
     prepares, detaches, unloads and loads the hook in the order described
     above, and ends with the hook active. `swap.sh` refuses, without changing
-    anything, when the hook is needed but not loaded, not installed, unreadable,
-    unavailable, detached or starting. A failed `prepare` stops the swap
-    before any change. After a failed `detach`, a failed NVIDIA unload or a
-    SIGTERM after the detach, `swap.sh` resumes the hook before it loads a
-    module again or starts a service. When NVIDIA's unload leaves the hook
-    unavailable, `swap.sh` reports it and never acknowledges the loss. A hook
-    that cannot load again, or does not become active, ends the swap with
-    `END (failed)`. A loaded hook also takes part when the driver on disk has
-    the patch.
+    anything, when the hook is not loaded, also with a patched driver on disk,
+    and when it is not installed, unreadable, unavailable, detached or
+    starting. A failed `prepare` stops the swap before any change. After a
+    failed `detach`, a failed NVIDIA unload or a SIGTERM after the detach,
+    `swap.sh` resumes the hook before it loads a module again or starts a
+    service. When NVIDIA's unload leaves the hook unavailable, `swap.sh` reports
+    it and never acknowledges the loss. A hook that cannot load again, or does
+    not become active, ends the swap with `END (failed)`.
 - `tests/check_install_hook.py` runs `install-hook.sh` as an ordinary user,
   against a mock `dkms`, `uname` and `modinfo` and a throwaway directory in
   place of `/usr/src`, `/lib/modules` and `/etc/modules-load.d`. Its cases are

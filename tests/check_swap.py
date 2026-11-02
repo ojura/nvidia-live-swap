@@ -16,8 +16,10 @@ The mock nvpcf-hookctl keeps the hook's state in the throwaway directory. Its
 detach moves the state to guard-only. The mock rmmod of nvidia then plays
 NVIDIA's unload notification, which moves a guard-only hook to detached. The
 mock rmmod of nvpcf_hook refuses unless the hook is detached, as the pinned
-module does. A started lactd.service initializes the GPU, which makes a
-waiting hook active."""
+module does. Every case starts with the hook loaded and active, unless it
+says otherwise. A newly loaded hook is active at once, as when gnome-shell
+opens the new display device, unless a case makes it wait. A waiting hook
+becomes active when lactd.service starts and initializes the GPU."""
 import json
 import os
 from pathlib import Path
@@ -175,7 +177,10 @@ elif cmd == 'modprobe':
         set_build_id(m, 'cc' * 20 if cfg.get('stale_module') == m else 'bb' * 20)
         if m == 'nvpcf_hook':
             st = load()
-            st['hook_state'], st['hook_error'] = 'waiting', -11
+            if cfg.get('hook_waits_for_init') or cfg.get('hook_stays_waiting'):
+                st['hook_state'], st['hook_error'] = 'waiting', -11
+            else:
+                st['hook_state'], st['hook_error'] = 'active', 0
             save(st)
 elif cmd == 'modinfo':
     if args[-1] in cfg.get('modinfo_missing', []):
@@ -263,7 +268,7 @@ def rewrite(text, root):
 
 def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
         nvidia_drm=('card0', 'renderD129'), patched=True, leftover=False, connected=False,
-        last_swap_age=None, hook=None):
+        last_swap_age=None, hook='active'):
     """hook is None when nvpcf_hook is not loaded, else its starting state."""
     cfg = cfg or {}
     root = Path(tempfile.mkdtemp(prefix=name + '-', dir=BASE))
@@ -364,15 +369,17 @@ ru = r['runuser_args']
 check(r, len(ru) == 1 and ru[0][:3] == ['-u', 'desktop', '--'], f'calls runuser once with -u desktop, got {ru}')
 check(r, any(a == 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus' for a in ru[0]) and ru[0][-1].endswith('reapply-layout.py'),
       'runs reapply-layout.py on gnome-shell\'s session bus')
-check(r, r['order'][0] == 'runuser', f"runs reapply-layout.py before any other change, got the order {r['order']}")
+check(r, r['order'][:2] == ['hookctl prepare', 'runuser'],
+      f"runs reapply-layout.py right after the hook's prepare, before any other change, got the order {r['order']}")
 
 r = run('kms-not-released', {'reapply_releases': False}, kms_holders=[1, 2045, 4525])
 check(r, r['exit'] == 1 and 'still held' in r['out'],
       f"exits with status 1 and says the KMS node is still held, got status {r['exit']}")
-check(r, r['modifying'] == ['runuser'], f"stops after running reapply-layout.py, got the commands {r['modifying']}")
+check(r, r['modifying'] == ['hookctl prepare', 'runuser'],
+      f"stops after running reapply-layout.py, got the commands {r['modifying']}")
 
 r = run('reapply-fails', {'reapply_rc': 1}, kms_holders=[1, 2045, 4525])
-check(r, r['exit'] == 1 and r['modifying'] == ['runuser'],
+check(r, r['exit'] == 1 and r['modifying'] == ['hookctl prepare', 'runuser'],
       f"stops with status 1 after reapply-layout.py fails, got status {r['exit']} and the commands {r['modifying']}")
 
 r = run('nvidia-monitor-connected', kms_holders=[1, 2045, 4525], connected=True)
@@ -409,12 +416,14 @@ check(r, 'left hidden by an earlier swap' in r['out'], 'reports the file an earl
 r = run('success', SVC, holders=[777, 4525, 5019])
 check(r, r['exit'] == 0, 'exits with status 0')
 check(r, r['revoked'] == [4525, 5019], f"revokes the handles of 4525 and 5019, got {r['revoked']}")
-check(r, r['rmmod'] == ['nvidia_drm', 'nvidia_modeset', 'nvidia_uvm', 'nvidia'],
-      f"unloads nvidia_drm, nvidia_modeset, nvidia_uvm and nvidia in that order, got {r['rmmod']}")
-check(r, r['modprobe'] == MODULES,
-      f"loads nvidia, nvidia_modeset, nvidia_drm and nvidia_uvm in that order, got {r['modprobe']}")
+check(r, r['rmmod'] == ['nvidia_drm', 'nvidia_modeset', 'nvidia_uvm', 'nvidia', 'nvpcf_hook'],
+      f"unloads nvidia_drm, nvidia_modeset, nvidia_uvm, nvidia and nvpcf_hook in that order, got {r['rmmod']}")
+check(r, r['modprobe'] == MODULES + ['nvpcf_hook'],
+      f"loads nvidia, nvidia_modeset, nvidia_drm, nvidia_uvm and nvpcf_hook in that order, got {r['modprobe']}")
 check(r, r['hidden'] == [] and r['lactd_active'] is True, 'moves the files back and starts lactd.service again')
-check(r, sorted(r['loaded']) == sorted(MODULES), f"ends with all four modules loaded, got {r['loaded']}")
+check(r, sorted(r['loaded']) == sorted(MODULES + ['nvpcf_hook']), f"ends with all five modules loaded, got {r['loaded']}")
+check(r, 'the loaded driver contains the patch' in r['out'] and r['hookctl'] == ['prepare', 'detach'],
+      f"checks the patch and prepares and detaches the hook, got {r['hookctl']}")
 check(r, r['out'].rstrip().endswith('END'), 'ends with END')
 check(r, 'every loaded module has the build ID of its file on disk' in r['out'],
       'reports that the build IDs match the files on disk')
@@ -447,21 +456,22 @@ check(r, r['hidden'] == [] and r['lactd_active'] is True, 'moves the files back 
 r = run('failed-unload', {'rmmod_fail': 'nvidia_modeset'})
 check(r, r['exit'] == 1, 'exits with status 1')
 check(r, r['modprobe'] == ['nvidia_drm'], f"loads only nvidia_drm again, got {r['modprobe']}")
-check(r, sorted(r['loaded']) == sorted(MODULES), f"ends with all four modules loaded, got {r['loaded']}")
+check(r, sorted(r['loaded']) == sorted(MODULES + ['nvpcf_hook']), f"ends with all five modules loaded, got {r['loaded']}")
 check(r, r['hidden'] == [], 'moves the files back')
 
 r = run('failed-load', {'modprobe_fail': 'nvidia_modeset'})
 check(r, r['exit'] == 1, 'exits with status 1')
-check(r, r['modprobe'] == ['nvidia', 'nvidia_modeset', 'nvidia_modeset', 'nvidia_drm', 'nvidia_uvm'],
-      f"after nvidia_modeset fails to load, tries it again and loads nvidia_drm and nvidia_uvm, got {r['modprobe']}")
+check(r, r['modprobe'] == ['nvidia', 'nvidia_modeset', 'nvidia_modeset', 'nvidia_drm', 'nvidia_uvm', 'nvpcf_hook'],
+      'after nvidia_modeset fails to load, tries it again, loads nvidia_drm and nvidia_uvm, '
+      f"and loads nvpcf_hook again, got {r['modprobe']}")
 check(r, r['hidden'] == [] and 'END (failed)' in r['out'], 'moves the files back and ends with END (failed)')
 
 r = run('missing-patch', SVC, holders=[777], patched=False)
 check(r, r['exit'] == 1, 'exits with status 1')
 check(r, 'lacks the patch' in r['out'] and 'END (failed)' in r['out'],
       'reports the missing patch and ends with END (failed)')
-check(r, r['modprobe'] == MODULES,
-      f"loads nvidia, nvidia_modeset, nvidia_drm and nvidia_uvm in that order, got {r['modprobe']}")
+check(r, r['modprobe'] == MODULES + ['nvpcf_hook'],
+      f"loads nvidia, nvidia_modeset, nvidia_drm, nvidia_uvm and nvpcf_hook in that order, got {r['modprobe']}")
 check(r, r['hidden'] == [] and r['lactd_active'] is True, 'moves the files back and starts lactd.service again')
 
 r = run('interrupted-after-stop', dict(SVC, pause_after_stop=True), holders=[777], interrupt=True)
@@ -472,15 +482,15 @@ check(r, r['rmmod'] == [] and r['hidden'] == [] and r['lactd_active'] is True,
 r = run('interrupted-in-rmmod', {'pause_in_rmmod': 'nvidia_modeset'}, interrupt=True)
 check(r, r['exit'] == 1, f"exits with status 1, got {r['exit']}")
 check(r, r['modprobe'] == ['nvidia_drm'], f"loads only nvidia_drm again, got {r['modprobe']}")
-check(r, sorted(r['loaded']) == sorted(MODULES) and r['hidden'] == [],
-      'ends with all four modules loaded and the files moved back')
+check(r, sorted(r['loaded']) == sorted(MODULES + ['nvpcf_hook']) and r['hidden'] == [],
+      'ends with all five modules loaded and the files moved back')
 
 r = run('interrupted-after-rmmod', {'pause_after_rmmod': 'nvidia_modeset'}, interrupt=True)
 check(r, r['exit'] == 1, f"exits with status 1, got {r['exit']}")
 check(r, r['modprobe'] == ['nvidia_modeset', 'nvidia_drm'],
       f"loads nvidia_modeset and nvidia_drm again, got {r['modprobe']}")
-check(r, sorted(r['loaded']) == sorted(MODULES) and r['hidden'] == [],
-      'ends with all four modules loaded and the files moved back')
+check(r, sorted(r['loaded']) == sorted(MODULES + ['nvpcf_hook']) and r['hidden'] == [],
+      'ends with all five modules loaded and the files moved back')
 
 r = run('recent-swap-waits', last_swap_age=5)
 check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'),
@@ -507,7 +517,7 @@ check(r, r['exit'] == 1 and r['stamp'] is not None,
 # needs the hook.
 UNPATCHED = dict(SVC, disk_patched=False)
 
-r = run('hook-success', UNPATCHED, holders=[777, 4525], patched=False, hook='active')
+r = run('hook-success', dict(UNPATCHED, hook_waits_for_init=True), holders=[777, 4525], patched=False)
 check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'),
       f"exits with status 0 and ends with END, got status {r['exit']}")
 check(r, r['order'] == ['hookctl prepare', 'mv', 'mv', 'mv', 'systemctl', 'setsid', 'python3', 'hookctl detach',
@@ -522,24 +532,27 @@ check(r, 'nvpcf_hook: state active' in r['out'].splitlines()[-2], 'reports the a
 check(r, 'lacks the patch' not in r['out'], 'does not ask the loaded driver for patch 0001')
 check(r, r['hook_state'] == 'active', f"leaves the hook active, got {r['hook_state']}")
 
-r = run('hook-check', UNPATCHED, holders=[777, 4525], args=['--check'], patched=False, hook='active')
+r = run('hook-check', UNPATCHED, holders=[777, 4525], args=['--check'], patched=False)
 check(r, r['exit'] == 0 and 'a swap can go ahead now' in r['out'],
       f"exits with status 0 and says a swap can go ahead, got status {r['exit']}"); expect_untouched(r)
-check(r, 'lacks patch 0001, so the swap needs nvpcf_hook' in r['out'] and 'nvpcf_hook: state active' in r['out'],
-      'reports that the swap needs the hook, and the hook\'s state')
+check(r, 'the nvidia module on disk lacks patch 0001' in r['out'] and 'nvpcf_hook: state active' in r['out'],
+      'reports that the driver on disk lacks the patch, and the hook\'s state')
 
-r = run('hook-not-loaded', UNPATCHED, holders=[777], patched=False)
+r = run('hook-not-loaded', UNPATCHED, holders=[777], patched=False, hook=None)
 check(r, r['exit'] == 1 and 'nvpcf_hook is not loaded; load it with modprobe nvpcf_hook' in r['out'],
       f"exits with status 1 and says how to load the hook, got status {r['exit']}"); expect_untouched(r)
 
-r = run('hook-not-installed', dict(UNPATCHED, modinfo_missing=['nvpcf_hook']), holders=[777], patched=False,
-        hook='active')
+r = run('patched-without-hook', SVC, holders=[777], hook=None)
+check(r, r['exit'] == 1 and 'nvpcf_hook is not loaded' in r['out'],
+      f"refuses with a patched driver on disk too, because the hook guards the shutdown, got status {r['exit']}")
+expect_untouched(r)
+
+r = run('hook-not-installed', dict(UNPATCHED, modinfo_missing=['nvpcf_hook']), holders=[777], patched=False)
 check(r, r['exit'] == 1 and 'nvpcf_hook is not installed for kernel' in r['out'],
       f"exits with status 1 and says the hook is not installed for the kernel, got status {r['exit']}")
 expect_untouched(r)
 
-r = run('hook-status-unreadable', dict(UNPATCHED, hook_status_fail=True), holders=[777], patched=False,
-        hook='active')
+r = run('hook-status-unreadable', dict(UNPATCHED, hook_status_fail=True), holders=[777], patched=False)
 check(r, r['exit'] == 1 and 'cannot read the status of nvpcf_hook: nvpcf-hookctl: status failed' in r['out'],
       f"exits with status 1 and reports why the status cannot be read, got status {r['exit']}"); expect_untouched(r)
 
@@ -556,14 +569,13 @@ check(r, r['exit'] == 1 and 'check again in a few seconds' in r['out'],
       f"exits with status 1 and asks to check again, got status {r['exit']}"); expect_untouched(r)
 
 r = run('hook-prepare-fails', dict(UNPATCHED, hook_prepare_fails=True), kms_holders=[1, 2045, 4525],
-        holders=[777, 4525], patched=False, hook='active')
+        holders=[777, 4525], patched=False)
 check(r, r['exit'] == 1 and 'stops before it changes anything' in r['out'] and 'END (failed)' in r['out'],
       f"exits with status 1 and ends with END (failed), got status {r['exit']}")
 check(r, r['modifying'] == ['hookctl prepare'],
       f"changes nothing after the failed prepare, not even the display layout, got the commands {r['modifying']}")
 
-r = run('hook-detach-fails', dict(UNPATCHED, hook_detach_fails=True), holders=[777, 4525], patched=False,
-        hook='active')
+r = run('hook-detach-fails', dict(UNPATCHED, hook_detach_fails=True), holders=[777, 4525], patched=False)
 check(r, r['exit'] == 1 and r['rmmod'] == [], f"exits with status 1 without unloading anything, got {r['rmmod']}")
 check(r, r['hookctl'] == ['prepare', 'detach', 'resume'], f"resumes the hook after the failed detach, got {r['hookctl']}")
 check(r, r['order'].index('hookctl resume') < len(r['order']) - 1 - r['order'][::-1].index('systemctl'),
@@ -571,8 +583,7 @@ check(r, r['order'].index('hookctl resume') < len(r['order']) - 1 - r['order'][:
 check(r, r['hidden'] == [] and r['lactd_active'] is True and r['hook_state'] == 'active',
       'moves the files back, starts lactd.service again and leaves the hook active')
 
-r = run('hook-nvidia-unload-fails', dict(UNPATCHED, rmmod_fail='nvidia_modeset'), holders=[777], patched=False,
-        hook='active')
+r = run('hook-nvidia-unload-fails', dict(UNPATCHED, rmmod_fail='nvidia_modeset'), holders=[777], patched=False)
 check(r, r['exit'] == 1 and r['modprobe'] == ['nvidia_drm'],
       f"exits with status 1 and loads only nvidia_drm again, got status {r['exit']} and {r['modprobe']}")
 o = r['order']
@@ -581,8 +592,7 @@ check(r, 'hookctl resume' in o and o.index('hookctl resume') < o.index('modprobe
 check(r, r['hook_state'] == 'active' and r['lactd_active'] is True,
       f"leaves the hook active and lactd.service running, got {r['hook_state']}")
 
-r = run('hook-unavailable-after-nvidia', dict(UNPATCHED, going_unavailable=True), holders=[777], patched=False,
-        hook='active')
+r = run('hook-unavailable-after-nvidia', dict(UNPATCHED, going_unavailable=True), holders=[777], patched=False)
 check(r, r['exit'] == 1 and 'could not unload nvpcf_hook after NVIDIA' in r['out'],
       f"exits with status 1 when the hook stays pinned, got status {r['exit']}")
 check(r, r['modprobe'] == MODULES, f"loads the NVIDIA modules again, got {r['modprobe']}")
@@ -591,30 +601,23 @@ check(r, 'could not resume nvpcf_hook' in r['out'] and 'acknowledge-loss' not in
 check(r, 'nvpcf_hook: state unavailable' in r['out'] and r['out'].rstrip().endswith('END (failed)'),
       'reports the unavailable hook and ends with END (failed)')
 
-r = run('hook-load-fails', dict(UNPATCHED, modprobe_fail='nvpcf_hook'), holders=[777], patched=False,
-        hook='active')
+r = run('hook-load-fails', dict(UNPATCHED, modprobe_fail='nvpcf_hook'), holders=[777], patched=False)
 check(r, r['exit'] == 1 and r['modprobe'] == MODULES + ['nvpcf_hook', 'nvpcf_hook'],
       f"exits with status 1 after trying to load the hook again, got status {r['exit']} and {r['modprobe']}")
 check(r, 'could not load nvpcf_hook again' in r['out'] and 'nvpcf_hook is not loaded' in r['out'],
       'reports that the hook could not be loaded again')
 
-r = run('hook-stays-waiting', dict(UNPATCHED, hook_stays_waiting=True), holders=[777], patched=False, hook='active')
+r = run('hook-stays-waiting', dict(UNPATCHED, hook_stays_waiting=True), holders=[777], patched=False)
 check(r, r['exit'] == 1 and f'nvpcf_hook is not active 15 s after the swap: nvpcf_hook: state waiting' in r['out'],
       f"exits with status 1 and reports the state of the hook that did not become active, got status {r['exit']}")
 check(r, r['modprobe'] == MODULES + ['nvpcf_hook'], f"does not load any module again, got {r['modprobe']}")
 check(r, r['hookctl'] == ['prepare', 'detach'], f"does not resume the newly loaded hook, got {r['hookctl']}")
 
-r = run('hook-interrupted-after-detach', dict(UNPATCHED, pause_after_detach=True), holders=[777], patched=False,
-        hook='active', interrupt=True)
+r = run('hook-interrupted-after-detach', dict(UNPATCHED, pause_after_detach=True), holders=[777], patched=False, interrupt=True)
 check(r, r['exit'] == 1 and r['rmmod'] == [], f"exits with status 1 without unloading anything, got {r['rmmod']}")
 check(r, r['hookctl'] == ['prepare', 'detach', 'resume'] and r['hook_state'] == 'active' and r['lactd_active'] is True,
       f"resumes the hook and starts lactd.service again, got {r['hookctl']} and {r['hook_state']}")
 
-r = run('patched-with-hook', SVC, holders=[777], hook='active')
-check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'),
-      f"exits with status 0 and ends with END, got status {r['exit']}")
-check(r, 'the loaded driver contains the patch' in r['out'] and r['hookctl'] == ['prepare', 'detach'],
-      f"checks the patch and still prepares and detaches the loaded hook, got {r['hookctl']}")
 
 if failures:
     print(f"{len(failures)} failures; the cases are in {BASE}")
