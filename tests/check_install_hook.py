@@ -124,7 +124,7 @@ if cmd == 'dkms':
     elif op == 'add':
         v = opt('-v')
         conf = root / f'usr/src/nvpcf-hook-{v}/dkms.conf'
-        if not conf.exists() or f'PACKAGE_VERSION="{v}"' not in conf.read_text():
+        if not conf.exists() or f'PACKAGE_VERSION="{v}"' not in conf.read_text() or cfg.get('add_fails'):
             sys.exit(1)
         st['added'].append(v)
     elif op == 'build':
@@ -200,13 +200,16 @@ def kbuild(directory):
 
 
 def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, registered=None,
-        package_version=None, between=None):
+        package_version=None, between=None, unregistered=None):
     """installed maps kernels to an old version that is built and installed
     for them before the run. registered maps versions that are only added to
     the text of their nvpcf_hook.c, or to None for hook/'s text.
     package_version replaces PACKAGE_VERSION in the copied hook/dkms.conf.
     between(scripts, i) runs before every run i after the first, with the
-    copied scripts directory."""
+    copied scripts directory. unregistered maps a version to the files that
+    its /usr/src directory gets without a DKMS registration: hook/'s source
+    with the given files replaced, or deleted for None, or to 'file' for a
+    regular file in place of the directory."""
     root = BASE / name
     (root / 'bin').mkdir(parents=True)
     mock = root / 'mock'
@@ -227,6 +230,20 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
                   root / 'lib/modules' / k / 'updates/dkms/nvpcf_hook.ko'):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(f'BUILDID={hashlib.sha1((v + k).encode()).hexdigest()} {v}\n')
+    for v, files in (unregistered or {}).items():
+        d = root / f'usr/src/nvpcf-hook-{v}'
+        d.parent.mkdir(parents=True, exist_ok=True)
+        if files == 'file':
+            d.write_text('not a directory\n')
+            continue
+        d.mkdir()
+        for f in SOURCES:
+            shutil.copy(SRC / 'hook' / f, d / f)
+        for f, text in files.items():
+            if text is None:
+                (d / f).unlink()
+            else:
+                (d / f).write_text(text)
     for v, text in (registered or {}).items():
         if v not in st['added']:
             st['added'].append(v)
@@ -282,7 +299,7 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
             'enabled': ['enable', 'nvpcf-hook.service'] in [a for c, a in calls if c == 'systemctl'],
             'archives': sorted(f.name for f in (root / 'cache').iterdir()),
             'sources': sorted(d.name for d in (root / 'usr/src').iterdir()) if (root / 'usr/src').exists() else [],
-            'registered_new': sorted(f.name for f in registered_new.iterdir()) if registered_new.exists() else None,
+            'registered_new': sorted(f.name for f in registered_new.iterdir()) if registered_new.is_dir() else None,
             'root': root, 'scripts': scripts}
 
 
@@ -479,6 +496,41 @@ check(r, r['exit'] == 1 and 'without leading zeros' in r['out'] and r['calls'] =
 r = run('same-version-other-source', {}, registered={NEW: '/* other source */\n'})
 check(r, r['exit'] == 1 and 'registered with source that differs' in r['out'] and r['changing'] == [],
       f"refuses before changing anything when its version is registered with other source, got {r['changing']}")
+
+def source_files(r, v=NEW):
+    d = r['root'] / f'usr/src/nvpcf-hook-{v}'
+    return {f.name: f.read_text() for f in d.iterdir()} if d.is_dir() else None
+
+
+r = run('unregistered-matching-source', {}, unregistered={NEW: {}})
+check(r, r['exit'] == 0 and 'holds hook/\'s source already' in r['out'] and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW},
+      f"registers and installs the existing copy of hook/'s source, got status {r['exit']} and {r['state']['installed']}")
+check(r, r['registered_new'] == sorted(SOURCES), f"leaves the matching directory as it was, got {r['registered_new']}")
+
+r = run('unregistered-conflicting-source', {},
+        unregistered={NEW: {'nvpcf_hook.c': '/* local work */\n', 'notes.txt': 'keep me\n', 'text.h': None}})
+check(r, r['exit'] == 1 and r['changing'] == [] and 'leaves it as it is' in r['out']
+      and 'nvpcf_hook.c differs' in r['out'] and 'text.h is missing' in r['out'] and 'notes.txt is not part of the source' in r['out'],
+      f"refuses, names every difference and changes nothing, got status {r['exit']} and {r['changing']}")
+files = source_files(r)
+check(r, files is not None and files.get('nvpcf_hook.c') == '/* local work */\n' and files.get('notes.txt') == 'keep me\n'
+      and 'text.h' not in files, f"leaves the conflicting directory as it was, got {sorted(files or [])}")
+
+r = run('unregistered-source-is-a-file', {}, unregistered={NEW: 'file'})
+check(r, r['exit'] == 1 and r['changing'] == [] and 'is not a directory' in r['out']
+      and (r['root'] / f'usr/src/nvpcf-hook-{NEW}').read_text() == 'not a directory\n',
+      f"refuses and leaves a file in the source directory's place, got status {r['exit']}")
+
+r = run('add-fails-then-retry', {'add_fails': True}, runs=2, between=clearing('add_fails', 1))
+check(r, r['exits'] == [1, 0] and 'holds hook/\'s source already' in r['out']
+      and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW} and r['registered_new'] == sorted(SOURCES),
+      f"reuses the copy that the failed dkms add left, got {r['exits']} and {r['state']['installed']}")
+
+r = run('add-fails', {'add_fails': True})
+check(r, r['exit'] == 1 and 'before any module was built or installed' in r['out'] and 'keeps hook/\'s source' in r['out']
+      and r['registered_new'] == sorted(SOURCES) and r['state']['installed'] == {}
+      and [c for c in r['changing'] if c != 'dkms add'] == [],
+      f"stops after the failed dkms add and reports the source it kept, got status {r['exit']} and {r['changing']}")
 
 r = run('again', {}, runs=2)
 check(r, r['exit'] == 0 and r['changing'] == [],

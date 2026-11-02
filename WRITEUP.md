@@ -512,7 +512,12 @@ The source is the files of `hook/` that DKMS's build reads: `Kbuild`,
 them to `/usr/src/nvpcf-hook-<version>`. A build in `hook/` generates files
 such as `nvpcf_hook.mod.c`, which are not part of the source. A registered
 version has the same source only if its directory holds exactly these files,
-with the same content.
+with the same content. For a version that DKMS does not have registered, an
+existing directory, such as the copy from a run whose `dkms add` failed, is
+reused only if it holds exactly the source. Otherwise the script refuses,
+names the files that differ, and leaves the directory as it is, because it
+can hold someone's work. A failed `dkms add` stops the run before any module
+is built or installed, and leaves the copied source for the next run.
 
 The script builds and installs the version with DKMS for every kernel that
 DKMS lists for the NVIDIA driver or for nvpcf-hook, plus the running kernel.
@@ -686,6 +691,12 @@ the number of deliveries.
   - a registered version that DKMS ranks above the new one or equal to it, a
     `PACKAGE_VERSION` with leading zeros, and the same version with other
     source, which stop the script before it changes anything;
+  - an unregistered source directory that holds exactly the source, which the
+    script registers and installs, and one with a changed, a missing and an
+    extra file, or a file in the directory's place, which stop the script with
+    every difference named and stay as they were;
+  - a failed `dkms add`, which keeps the copied source, and a retry that
+    registers that copy;
   - a real Kbuild build in `hook/` between two runs, after which the second
     run finds the registered source unchanged, and the registered source
     builds with Kbuild. This case needs the running kernel's headers;

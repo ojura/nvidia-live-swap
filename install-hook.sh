@@ -16,9 +16,13 @@
 # version for the next kernel.
 #
 # The source is the files of hook/ that DKMS's build reads: Kbuild, Makefile,
-# dkms.conf, nvpcf_hook.c and its headers. The script copies them to
-# /usr/src/nvpcf-hook-<version>. Files that a build in hook/ generates, such
-# as nvpcf_hook.mod.c, are not part of the source.
+# dkms.conf, nvpcf_hook.c and its headers. Files that a build in hook/
+# generates, such as nvpcf_hook.mod.c, are not part of it. For a version that
+# DKMS does not have registered, the script copies the source to
+# /usr/src/nvpcf-hook-<version> and registers it with dkms add. An existing
+# directory there, such as the copy from a run whose dkms add failed, is
+# reused only if it holds exactly that source. Otherwise the script refuses,
+# names the files that differ, and leaves the directory as it is.
 #
 # It builds and installs that version with DKMS for every kernel that DKMS
 # lists for the NVIDIA driver or for nvpcf-hook, plus the running kernel. The
@@ -87,12 +91,26 @@ installed_is() {
     b=$(ls /var/lib/dkms/nvpcf-hook/"$1"/"$2"/*/module/nvpcf_hook.ko* 2>/dev/null | head -1)
     [ -n "$b" ] && x=$(build_id "$f") && y=$(build_id "$b") && [ "$x" = "$y" ]
 }
-# Exit status 0 if $src holds exactly the files in SOURCES, with hook/'s
-# content.
-same_source() {
+# Print each way in which the directory $src differs from hook/'s source, one
+# per line: a file of SOURCES that is missing or has other content, and any
+# other entry.
+source_differences() {
     local f
-    [ "$(ls -A "$src" 2>/dev/null | sort)" = "$(printf '%s\n' "${SOURCES[@]}" | sort)" ] || return 1
-    for f in "${SOURCES[@]}"; do cmp -s "$here/hook/$f" "$src/$f" || return 1; done
+    for f in "${SOURCES[@]}"; do
+        if [ ! -f "$src/$f" ]; then
+            echo "$f is missing"
+        elif ! cmp -s "$here/hook/$f" "$src/$f"; then
+            echo "$f differs"
+        fi
+    done
+    while IFS= read -r f; do
+        [[ " ${SOURCES[*]} " == *" $f "* ]] || echo "$f is not part of the source"
+    done < <(ls -A "$src")
+}
+# Exit status 0 if $src is a directory that holds exactly the files in
+# SOURCES, with hook/'s content.
+same_source() {
+    [ -d "$src" ] && [ ! -L "$src" ] && [ -z "$(source_differences)" ]
 }
 # Exit status 0 if version $1 is installed for some kernel.
 installed_anywhere() {
@@ -133,13 +151,25 @@ for v in "${registered[@]}"; do
     [[ "$(VER "$v")" < "$(VER "$ver")" ]] ||
         fail "nvpcf-hook/$v is registered, and DKMS ranks it equal to or above hook/'s $ver, so DKMS could build $v for the next kernel. Raise PACKAGE_VERSION in hook/dkms.conf, or remove $v with: dkms remove nvpcf-hook/$v --all"
 done
+# An existing $src of an unregistered version can hold the copy from a run
+# whose dkms add failed, or someone's work. The script reuses it only if it
+# holds exactly hook/'s source, and otherwise leaves it as it is.
 if [[ " ${registered[*]} " == *" $ver "* ]]; then
     same_source ||
-        fail "nvpcf-hook/$ver is registered with source that differs from hook/. A changed hook needs a greater PACKAGE_VERSION in hook/dkms.conf"
+        fail "nvpcf-hook/$ver is registered with source that differs from hook/: $(source_differences | paste -sd ';' | sed 's/;/; /g'). A changed hook needs a greater PACKAGE_VERSION in hook/dkms.conf"
 else
-    rm -rf "$src"
-    mkdir -p "$src" && (cd "$here/hook" && cp "${SOURCES[@]}" "$src/") || fail "could not copy the hook's source to $src"
-    dkms add -m nvpcf-hook -v "$ver" || fail "dkms add nvpcf-hook/$ver failed"
+    if [ -L "$src" ] || { [ -e "$src" ] && [ ! -d "$src" ]; }; then
+        fail "$src exists and is not a directory. DKMS does not have nvpcf-hook/$ver registered, and the script leaves $src as it is; move it away to install"
+    elif [ -d "$src" ]; then
+        same_source ||
+            fail "$src exists, but DKMS does not have nvpcf-hook/$ver registered, and it differs from hook/'s source: $(source_differences | paste -sd ';' | sed 's/;/; /g'). The script leaves it as it is; move it away to install"
+        echo "== $src holds hook/'s source already, and the script registers it"
+    elif ! { mkdir -p "$src" && (cd "$here/hook" && cp "${SOURCES[@]}" "$src/"); }; then
+        rm -rf "$src"  # the partial copy that this run made
+        fail "could not copy the hook's source to $src"
+    fi
+    dkms add -m nvpcf-hook -v "$ver" ||
+        fail "dkms add nvpcf-hook/$ver failed, before any module was built or installed. $src keeps hook/'s source, and the next run registers it while it still matches"
 fi
 
 for k in "${kernels[@]}"; do
