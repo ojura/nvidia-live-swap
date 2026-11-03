@@ -29,8 +29,17 @@ There are two ways to install the fix:
   the messages before Ubuntu's unchanged driver handles them. When Ubuntu
   installs a new driver version, for example through automatic updates, the
   hook's loader checks the new driver's code before the hook attaches to it, so
-  the fix carries over without a rebuild. The hook also guards NVIDIA's
-  shutdown of the GPU against a hang described in [Limitations](#limitations).
+  the fix works after the update without rebuilding the driver core. The hook
+  also guards NVIDIA's shutdown of the GPU against a hang described in
+  [Limitations](#limitations).
+
+nvpcf_hook is experimental. Version 0.1.1 passes the automated tests and builds
+for kernels 6.8.0-147, 7.0.0-34 and 7.0.0-38, but has not been loaded into a
+running kernel. Live tests of idle deferral, delivery after a wake, detach and
+resume, system suspend and recovery, and operation with Ubuntu's unpatched
+driver core remain incomplete. During testing, install with `--no-enable` and
+load the hook by hand. Leave the existing driver-core patch in place for the
+initial tests.
 
 nvpcf_hook supports only the Legion 7 16IRX9 configuration that
 [hook/README.md](hook/README.md#supported-pci-configuration) specifies: DMI
@@ -58,8 +67,8 @@ Run the scripts from the repository directory.
   [Limitations](#limitations) explains.
 - `sudo ./install-hook.sh` installs nvpcf_hook with DKMS for the installed
   kernels, together with its loader and a systemd unit that runs the loader at
-  boot. With `--no-enable`, it installs the unit without enabling it, so the
-  hook loads only when you run the loader. `sudo
+  boot. With `--no-enable`, it installs the unit without enabling it; a unit
+  that is already enabled stays enabled. `sudo
   /usr/local/lib/nvpcf-hook/load-hook.sh` loads the hook now. The loader checks
   the loaded NVIDIA driver's code first, and loads the hook only if the checks
   pass.
@@ -77,9 +86,9 @@ Run the scripts from the repository directory.
   prints the hook's counts before and after the trace, which tell the two
   apart.
 
-Loading nvpcf_hook applies the fix to the running driver without a swap. Run
-`sudo ./install-hook.sh`, then `sudo /usr/local/lib/nvpcf-hook/load-hook.sh`,
-which reports the hook's state.
+Loading nvpcf_hook applies the fix to the running driver without a swap. For a
+live test, run `sudo ./install-hook.sh --no-enable`, then
+`sudo /usr/local/lib/nvpcf-hook/load-hook.sh`, which reports the hook's state.
 
 `swap.sh` needs gdb, the GNU debugger, which it uses to take the GPU away from
 running programs. It also runs `reapply-layout.py`, which needs Ubuntu's
