@@ -179,6 +179,14 @@ before a dependent module initializes the GPU. Treat a missing control device as
 an I/O error, not a successful detach. Recovery must distinguish an unloaded hook
 from a loaded hook whose command failed.
 
+`swap.sh` refuses every swap while `nvidia_drm` is loaded, because fences that
+`nvidia_drm` created can outlive the module, as
+[WRITEUP.md](../WRITEUP.md#fences-that-outlive-nvidia_drm) explains. Step 4
+therefore does not run on a system with `nvidia_drm` loaded, and a loaded hook
+is replaced by installing the new version and rebooting. With boot loading
+disabled, the new version loads only when the loader runs by hand after the
+reboot. With boot loading enabled, the unit loads it at boot.
+
 ## Device and power references
 
 The kernel-client device reference uses `nvidia_dev_get_uuid` and

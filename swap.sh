@@ -7,7 +7,9 @@
 #            ahead now
 #
 # A swap needs nvpcf_hook, whose guard keeps NVIDIA's shutdown of the GPU from
-# deadlocking with the handler of a firmware notification. WRITEUP.md
+# deadlocking with the handler of a firmware notification. swap.sh refuses
+# every swap that would unload nvidia_drm, as nvidia_drm_absent below
+# explains. WRITEUP.md
 # describes how swap.sh deals with the processes that hold the GPU, the order
 # of a swap, the wait between swaps, what it restores after a failure, and
 # when it logs END.
@@ -33,6 +35,26 @@ HOOK_WAIT=15                      # seconds for nvpcf_hook to become active
 LOADER=$HOOK_LIB/load-hook.sh     # installed by install-hook.sh
 
 log() { echo "$(date +%T.%N | cut -c1-12) $*"; }
+
+# swap.sh does not unload nvidia_drm. Its dma fences point to functions in the
+# module, the kernel requires such a module to stay loaded while any of its
+# fences exists, and nvidia_drm does not take module references for them. A
+# fence that a program or another driver still holds after the unload crashes
+# the kernel when it is released. Checking open files cannot establish that
+# every fence was released, because kernel objects keep references too. So
+# swap.sh refuses while nvidia_drm is loaded, and also when /proc/modules
+# cannot be read. README.md's Limitations describe this.
+DRM_REFUSAL="nvidia_drm is loaded, and swap.sh does not unload it: a dma fence that nvidia_drm created can outlive the module and crash the kernel when it is released"
+# Exit status 0 only if /proc/modules shows that nvidia_drm is not loaded.
+# Otherwise print why swap.sh does not go ahead.
+nvidia_drm_absent() {
+    grep -q '^nvidia_drm ' /proc/modules
+    case $? in
+        0) echo "$DRM_REFUSAL"; return 1 ;;
+        1) return 0 ;;
+        *) echo "cannot read /proc/modules, so swap.sh cannot tell whether nvidia_drm is loaded"; return 1 ;;
+    esac
+}
 
 holders() {
     [ $# -gt 0 ] || return 0
@@ -85,6 +107,11 @@ for n in /dev/nvidia* /dev/nvidia-caps/*; do
 done
 nodes+=("${render[@]}")
 log "NVIDIA GPU $gpu: display device ${kms[*]:-missing}, other devices ${nodes[*]}"
+drm_refused=0
+if ! drm_problem=$(nvidia_drm_absent); then
+    drm_refused=1
+    log "${drm_problem:-swap.sh cannot tell whether nvidia_drm is loaded}"
+fi
 
 # Find the holders of the display device. Group the holders of the other
 # devices into processes not owned by root, services to stop, and root
@@ -182,9 +209,10 @@ for f in "${HOOK_TOOLS[@]}"; do
 done
 if [ -x "$LOADER" ]; then
     # Check the driver that the swap would load before changing anything, so
-    # that a driver which the hook cannot use is refused here. --check does
-    # not download NVIDIA's source archive; a swap downloads it first.
-    if [ $check_only = 1 ]; then
+    # that a driver which the hook cannot use is refused here. --check, and a
+    # swap that is refused already, do not download NVIDIA's source archive;
+    # a swap downloads it first.
+    if [ $check_only = 1 ] || [ $drm_refused = 1 ]; then
         disk_check=$("$LOADER" --check-disk --no-download 2>&1)
     else
         disk_check=$("$LOADER" --check-disk 2>&1)
@@ -216,8 +244,8 @@ else
 fi
 for x in "${hook_problems[@]}"; do log "$x"; done
 
-if [ $kms_blocked = 1 ] || [ ${#connected[@]} -gt 0 ] || [ ${#blockers[@]} -gt 0 ] || [ ${#leftovers[@]} -gt 0 ] ||
-   [ ${#hook_problems[@]} -gt 0 ]; then
+if [ $drm_refused = 1 ] || [ $kms_blocked = 1 ] || [ ${#connected[@]} -gt 0 ] || [ ${#blockers[@]} -gt 0 ] ||
+   [ ${#leftovers[@]} -gt 0 ] || [ ${#hook_problems[@]} -gt 0 ]; then
     log "a swap cannot go ahead now"
     exit 1
 fi
@@ -392,6 +420,9 @@ lsmod | grep -E '^nvidia'
 
 for m in nvidia_drm nvidia_modeset nvidia_uvm nvidia; do
     is_loaded "$m" || continue
+    # Something can load nvidia_drm after the checks above. Every module is
+    # still loaded when this stops, because nvidia_drm comes first.
+    if [ "$m" = nvidia_drm ]; then fail "$DRM_REFUSAL"; fi
     rmmod "$m" || fail "could not unload $m"
     log "unloaded $m"
 done

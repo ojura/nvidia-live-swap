@@ -4,7 +4,10 @@
 disk, while the GNOME session keeps running. So a new or patched driver can be
 loaded without a logout or a reboot. A program that had the NVIDIA GPU open
 loses its access to the GPU, and gets it back when it restarts. gnome-shell, the
-program that runs the GNOME desktop, gets it back at the next login.
+program that runs the GNOME desktop, gets it back at the next login. `swap.sh`
+refuses every swap while nvidia_drm, the NVIDIA module behind the GPU's display
+and render devices, is loaded. On the Legion it is always loaded, so `swap.sh`
+refuses every swap there. [Limitations](#limitations) explains why.
 
 The repository also has a fix for the Lenovo Legion 7 16IRX9 laptop. In GNOME's
 Balanced power mode, the laptop's firmware sends its power limits to the NVIDIA
@@ -50,7 +53,8 @@ Run the scripts from the repository directory.
   says whether a swap can go ahead now. It only reads the state of the system.
 - `sudo ./swap.sh` unloads the NVIDIA kernel modules and loads the modules
   installed on disk. Then it checks that the loaded modules match the files on
-  disk, and that nvpcf_hook is active. Every swap needs nvpcf_hook, as
+  disk, and that nvpcf_hook is active. Every swap needs nvpcf_hook, and
+  `swap.sh` refuses every swap while nvidia_drm is loaded, as
   [Limitations](#limitations) explains.
 - `sudo ./install-hook.sh` installs nvpcf_hook with DKMS for the installed
   kernels, together with its loader and a systemd unit that runs the loader at
@@ -84,6 +88,10 @@ GitHub. `install-hook.sh` needs the kernel headers of each kernel it builds
 the hook for.
 
 ## Side effects of a swap
+
+`swap.sh` refuses every swap while nvidia_drm is loaded, and on the Legion it is
+always loaded, so these effects do not occur there now. They describe the swap
+code, which the tests check with the refusal removed.
 
 A swap takes 5 to 7 seconds. The kernel unloads the driver only after every
 program has closed the driver's device files. So `swap.sh` first takes the GPU
@@ -131,6 +139,8 @@ away from the programs that have it open.
 `swap.sh` refuses to swap in the following cases. It checks for each of them
 before it renames files, stops services or takes the GPU away from any program.
 
+- nvidia_drm is loaded. The paragraphs after this list explain why `swap.sh`
+  does not unload it.
 - A monitor is connected to the NVIDIA GPU. This includes the built-in screen
   when the laptop is set to drive it from the NVIDIA GPU.
 - A program other than gnome-shell has the display device open. systemd and
@@ -157,6 +167,28 @@ before it renames files, stops services or takes the GPU away from any program.
 - A file that `install-hook.sh` installs in `/usr/local/lib/nvpcf-hook` is
   missing there, or differs from the repository's file, for example after a
   `git pull`. Run `sudo ./install-hook.sh` first.
+
+`swap.sh` does not unload nvidia_drm. nvidia_drm creates dma fences, the kernel
+objects through which drivers and programs wait for GPU work, and each fence
+points to functions in nvidia_drm's module. The kernel requires a module whose
+fences have a release function to stay loaded as long as any of its fences
+exists, but nvidia_drm does not take module references for its fences. A program
+or another driver can still hold one after the unload, in a sync file, a DRM
+sync object or another driver's buffer. Releasing it then makes the kernel use
+memory that was freed with the module. On the Legion, gnome-shell crashed in the
+kernel at a logout on 2026-11-02, a day after the swaps of 2026-11-01, while it
+released a fence whose functions pointed into unmapped module memory. Which
+module that fence came from is not known. Its function table does not sit at the
+page offset of either fence table of the 615.71.09 nvidia_drm, so if it came
+from nvidia_drm, it came from one of the two 595.99.02 builds unloaded that day,
+which were removed from disk with their packages. Checking the programs' open
+files cannot establish that every fence was released, because kernel objects
+such as other drivers' buffers keep references too, and inspecting a stale fence
+can run its functions. Swaps need a fix in nvidia_drm or in the kernel that
+keeps the module's code available as long as its fences can call it. Until then,
+a reboot loads a new NVIDIA driver or a new version of nvpcf_hook. After a swap,
+stale fences can remain until the next reboot.
+[WRITEUP.md](WRITEUP.md#fences-that-outlive-nvidia_drm) has the details.
 
 A swap without nvpcf_hook could hang. When the last program closes the GPU,
 NVIDIA shuts down its state for the GPU, and holds a lock while it does. If a
@@ -243,30 +275,30 @@ diversion is in place.
 
 ## Changing the driver version
 
-These steps change the driver version of the running session, for example from
-595.99.02 to 615.71.09.
+These steps change the driver version, for example from 595.99.02 to
+615.71.09. They end with a reboot, because `swap.sh` refuses while nvidia_drm is
+loaded.
 
-1. Run `sudo ./swap.sh --check` and check that a swap can go ahead.
-2. If the installed version has the patched core from `build.sh`, put Ubuntu's
+1. If the installed version has the patched core from `build.sh`, put Ubuntu's
    driver core back and remove its diversion, with the two commands in
    [Restoring Ubuntu's driver core](#restoring-ubuntus-driver-core). apt can
    then remove the old package cleanly.
-3. Run `sudo apt-get install nvidia-driver-<branch>-open`, where `<branch>` is
+2. Run `sudo apt-get install nvidia-driver-<branch>-open`, where `<branch>` is
    the first number of the version, such as 615. apt replaces the old packages,
    but it keeps the old firmware package and marks it for removal by
-   `apt-get autoremove`. Leave that package installed until after the swap. The
-   old driver keeps running until the swap, and it reads its firmware from that
-   package whenever a program opens the GPU after all other programs have closed
-   it.
-4. The package installation builds the new version through DKMS only for the
+   `apt-get autoremove`. Leave that package installed until after the reboot.
+   The old driver keeps running until the reboot, and it reads its firmware from
+   that package whenever a program opens the GPU after all other programs have
+   closed it.
+3. The package installation builds the new version through DKMS only for the
    running kernel. For each other kernel that should keep an NVIDIA driver, run
    `sudo dkms install -m nvidia -v <version> -k <kernel>`.
-5. With `build.sh`, run `sudo ./build.sh <version>`. With nvpcf_hook, skip this
+4. With `build.sh`, run `sudo ./build.sh <version>`. With nvpcf_hook, skip this
    step.
-6. Run `sudo ./swap.sh`.
-7. Remove the old firmware package with
+5. Reboot.
+6. Remove the old firmware package with
    `sudo apt-get remove nvidia-firmware-<old branch>-<old version>`.
-8. As the desktop user, check that a newly started program can render with the
+7. As the desktop user, check that a newly started program can render with the
    new driver:
 
    ```

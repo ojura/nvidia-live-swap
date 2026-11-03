@@ -95,10 +95,10 @@ The driver loads its GSP firmware from disk whenever it initializes the GPU. GSP
 is the GPU System Processor, a processor on the GPU that runs this firmware. The
 driver initializes the GPU when a program opens it after the last program has
 closed it. In the driver's source, `nv_open_device` calls `rm_init_adapter`
-while the device is uninitialized. The old driver keeps running until the swap,
-so it needs the old firmware package until then. Step 3 of [Changing the driver
-version](README.md#changing-the-driver-version) in README.md keeps that package
-installed.
+while the device is uninitialized. The old driver keeps running until the
+reboot, so it needs the old firmware package until then. Step 2 of [Changing
+the driver version](README.md#changing-the-driver-version) in README.md keeps
+that package installed.
 
 ## The hang in NVIDIA's shutdown
 
@@ -131,6 +131,74 @@ and calls NVIDIA's own `nv_acpi_methods_uninit` there. That removes both
 handlers and waits for running handlers before the shutdown takes the RM API
 lock. NVIDIA's later cleanup finds the handlers already removed and skips
 them.
+
+## Fences that outlive nvidia_drm
+
+nvidia_drm creates dma fences, the kernel objects through which drivers and
+programs wait for GPU work. Each fence points to a table of functions in the
+module. nvidia_drm's two tables, `nv_drm_gem_prime_fence_ops` and
+`nv_drm_semsurf_fence_ops` (`nvidia-drm/nvidia-drm-fence.c:141-147,1373-1382` in
+615.71.09), both implement `release` and `wait`. The 7.0.0-38 kernel's
+`include/linux/dma-fence.h` (lines 222-224 and 237-242) says that such a fence
+cannot detach from its module after it is signaled, so the module has to stay
+loaded as long as the fence exists. The 6.8.0-147 and 7.0.0-34 headers do not
+have this rule; there, a fence can use its module's functions until it is
+freed.
+
+nvidia_drm does not take module references for its fences. `nvidia-drm/` calls
+neither `try_module_get` nor `module_put`, and its only `THIS_MODULE` is the
+owner of its DRM device's file operations (`nvidia-drm-drv.c:1815`), which keeps
+the module loaded only while a DRM device file is open. Unloading it does not
+wait for fences that others hold. Module exit unregisters and destroys the
+devices (`nvidia-drm-linux.c:69-73`, `nvidia-drm-drv.c:2290-2296`), and
+destroying a prime fence context signals its pending fences
+(`nvidia-drm-fence.c:157` and 212-228), but the references that other holders
+have stay.
+
+The fences reach other holders in several ways. nvidia_drm adds them to the
+reservation objects of buffers, including buffers that another driver exported
+(`nvidia-drm-fence.c:506-508`). It turns them into sync files (lines 1532 and
+1977) and adds them to DRM sync objects (line 1913). Other drivers and programs
+can copy them from there. When one of them releases a fence after nvidia_drm
+was unloaded, the kernel reads the fence's functions from memory that was freed
+with the module.
+
+The kernel log of this laptop shows such a crash. At 2026-11-02 08:17:43, a day
+after the swaps at 13:53, 15:28 and 15:59 on 2026-11-01, gnome-shell closed a
+sync file during a logout. `dma_fence_release` read the fence's `release`
+function from an unmapped page in the module area (`BUG: unable to handle page
+fault for address: ffffffffc2124008`, with the call trace `__x64_sys_close`,
+`sync_file_release`, `dma_fence_release`), and gnome-shell died in the kernel.
+Which module the fence came from is not known. nvidia_drm had been unloaded
+four times since boot, and it is the only NVIDIA module that creates fences,
+but the old modules' addresses were not recorded. A module's layout within its
+pages is the same at every load of the same file. The function table's page
+offset, 0xfe0, matches neither fence table of the 615.71.09 nvidia_drm, which
+`/proc/kallsyms` shows at page offsets 0x80 (`nv_drm_semsurf_fence_ops`) and
+0x100 (`nv_drm_gem_prime_fence_ops`), so the fence did not come from the two
+615.71.09 instances. If it came from nvidia_drm, it came from one of the two
+595.99.02 builds, unloaded at 13:53:49 and 15:28:55, which were removed from
+disk with their packages.
+
+Both release functions also free the fence at once, with `nv_drm_free`, which
+is a plain `kfree` (`nvidia-drm-os-interface.c:63-70`), while
+`dma-fence.h:241-242` requires RCU-safe freeing when `release` is implemented.
+The crash evidence does not establish this second problem as its cause.
+
+Checking the programs' open files cannot establish that every fence was
+released. Kernel objects, such as other drivers' buffers, keep references that
+the processes' files do not show, and inspecting a fence that may be stale can
+run its functions or drop its last reference. So `swap.sh` refuses every swap
+that would unload nvidia_drm. After a swap, stale fences can remain until the
+next reboot.
+
+Making such swaps safe needs a change in nvidia_drm or in the kernel. It has to
+keep the module's code available until the last call into it from a fence has
+returned, and free fence memory as the kernel's RCU rules require. It also has
+to cover fences that exist before the unload begins or are created while it
+runs, and signaled fences, which keep their references. It has to work on the
+6.8 and 7.0.0-34 kernels as well, whose headers lack 7.0.0-38's rules for
+detaching fences. Such a change has not been written or tested.
 
 ## Scripts
 
@@ -186,6 +254,14 @@ process. It runs `revoke.py` in its own session, so that a signal to `swap.sh`'s
 process group cannot stop gdb in the middle of a call that gdb injected into the
 target process.
 
+`swap.sh` refuses every swap while nvidia_drm is loaded, for the reasons in
+[Fences that outlive nvidia_drm](#fences-that-outlive-nvidia_drm). It checks
+`/proc/modules` before it changes anything, also with `--check`, and it
+refuses in the same way when `/proc/modules` cannot be read. A refused run
+checks the driver on disk with `--no-download`, so it does not download
+anything either. If nvidia_drm is loaded after those checks, the unload step
+stops when it reaches nvidia_drm, before any module is unloaded.
+
 Every swap needs nvpcf_hook to prevent the shutdown deadlock described in [The
 hang in NVIDIA's shutdown](#the-hang-in-nvidias-shutdown). The hook supports
 only one board configuration, which [nvpcf_hook](#nvpcf_hook) names, so
@@ -218,7 +294,11 @@ With `--check`, `swap.sh` adds `--no-download`. If NVIDIA's source archive for
 that version is not in the cache yet, `--check` then reports that the check
 could not run, and a swap downloads the archive before its first change.
 
-A swap runs these steps in order:
+A swap runs these steps in order. With nvidia_drm loaded, `swap.sh` refuses
+before step 1. In a swap that goes ahead, nvidia_drm is not loaded, so the GPU
+does not have a display device, and the swap skips step 3 and the reload of
+`nvidia_drm` in step 12. The tests run every step with nvidia_drm loaded, on a
+copy of `swap.sh` without the refusal.
 
 1. If the previous swap ended less than 20 seconds earlier, `swap.sh` waits for
    the rest of the 20 seconds.
@@ -247,7 +327,8 @@ A swap runs these steps in order:
    revocations. The guard is in place in both cases, because the hook
    registers it when it loads, also when it then waits.
 8. It unloads `nvidia_drm`, `nvidia_modeset`, `nvidia_uvm` and `nvidia`, in that
-   order.
+   order. If `nvidia_drm` was loaded after the checks, `swap.sh` refuses to
+   unload it and stops before the first unload.
 9. It unloads `nvpcf_hook`. The hook keeps itself loaded until NVIDIA's
    unload has finished, and then moves to `detached`.
 10. It loads `nvidia` from disk.
@@ -645,7 +726,24 @@ the number of deliveries.
 
 - `tests/check_swap.py` runs `swap.sh` as an ordinary user, against mock
   commands and a throwaway directory that stands in for sysfs, `/proc` and the
-  registration files. Its cases cover these situations:
+  registration files. The throwaway `/proc/modules` lists nvidia_drm unless a
+  case says otherwise. Every case except the refusal cases runs a copy of
+  `swap.sh` in which `nvidia_drm_absent` always succeeds and the unload step
+  does not stop at nvidia_drm, so that these cases keep testing the checks, the
+  order and the recovery of a swap. The test stops if either piece of text that
+  the copy replaces is missing from `swap.sh`. The refusal cases run
+  `swap.sh` as it is:
+  - With nvidia_drm loaded, `swap.sh` and `swap.sh --check` refuse, name the
+    reason, leave the system unchanged, check the driver on disk with
+    `--no-download` and do not record a swap. An unreadable `/proc/modules` is
+    refused in the same way.
+  - Without nvidia_drm, a swap goes ahead, unloads and loads every other
+    NVIDIA module and the hook, and leaves nvidia_drm unloaded.
+  - When nvidia_drm appears during a swap, `swap.sh` stops before it unloads
+    any module, resumes the hook, moves the registration files back, starts
+    lactd again and logs `END (failed)`.
+
+  The other cases cover these situations:
   - Another process holds the display device, or systemd and systemd-logind hold
     it without gnome-shell. A monitor is connected to the NVIDIA GPU. A root
     process outside a service holds the GPU. A root process in another service
@@ -837,7 +935,7 @@ the number of deliveries.
 - `tests/check_egl.c` runs as the desktop user. It renders a shader into an
   off-screen pbuffer through NVIDIA's EGL device platform, with NVIDIA's EGL
   vendor library selected and `DISPLAY` and `WAYLAND_DISPLAY` unset. Then it
-  checks the pixel it reads back. Step 8 of [Changing the driver
+  checks the pixel it reads back. Step 7 of [Changing the driver
   version](README.md#changing-the-driver-version) in README.md has the build and
   run commands. On 615.71.09, it prints EGL 1.5 NVIDIA, the RTX 4070 Laptop GPU
   and OpenGL ES 3.2 NVIDIA 615.71.09, and it reads back 64 127 191 255. The

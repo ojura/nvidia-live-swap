@@ -33,7 +33,20 @@ Loading nvidia_modeset, nvidia_drm or nvidia_uvm, or starting a service, can
 make NVIDIA initialize the GPU. The mock records each such step taken while
 the hook does not guard NVIDIA's shutdown, and every case fails if it finds
 one. The mock counts a hook with retirement_failed set as one that does not
-guard, whatever its state."""
+guard, whatever its state.
+
+swap.sh refuses every swap while nvidia_drm is loaded, and the throwaway
+/proc/modules lists nvidia_drm unless a case says otherwise. Every case except
+the refusal cases at the end therefore runs a copy of swap.sh in which
+nvidia_drm_absent always succeeds and the unload step does not stop at
+nvidia_drm, so that these cases keep testing the checks, the order and the
+recovery of a swap. The test stops if either piece of text that the copy
+replaces is missing from swap.sh. The refusal cases run swap.sh as it is. With
+nvidia_drm loaded, swap.sh and swap.sh --check refuse before any change and
+without a download, and an unreadable /proc/modules is refused in the same way.
+Without nvidia_drm, a swap goes ahead and leaves nvidia_drm unloaded. When
+nvidia_drm appears during a swap, swap.sh stops before it unloads any module
+and restores what it changed."""
 import json
 import os
 from pathlib import Path
@@ -279,17 +292,20 @@ elif cmd == 'getent':
     else:
         sys.exit(2)
 elif cmd == 'lsmod':
+    if cfg.get('nvidia_drm_appears') and 'nvidia_drm' not in loaded():
+        set_loaded(loaded() + ['nvidia_drm'])
     print(mods.read_text(), end='')
 '''
 
 
-def build_tree(root, nvidia_drm, patched, leftover, connected=False, hook=False):
+def build_tree(root, nvidia_drm, patched, leftover, connected=False, hook=False, modules=MODULES):
     sysd = root / 'sys/bus/pci/devices'
     intel = sysd / '0000:00:02.0'
     (intel / 'drm').mkdir(parents=True)
     (intel / 'vendor').write_text('0x8086\n')
     (intel / 'class').write_text('0x030000\n')
     nv = sysd / '0000:01:00.0'
+    nv.mkdir(parents=True)
     for node in nvidia_drm:
         (nv / 'drm' / node).mkdir(parents=True)
         if node.startswith('card'):
@@ -309,7 +325,7 @@ def build_tree(root, nvidia_drm, patched, leftover, connected=False, hook=False)
         (d / 'status').write_text(f'Name:\t{comm}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n')
         (d / 'cgroup').write_text(f'0::{cgroup}\n')
         (d / 'environ').write_bytes(b'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\0XDG_RUNTIME_DIR=/run/user/1000\0')
-    present = MODULES + (['nvpcf_hook'] if hook else [])
+    present = list(modules) + (['nvpcf_hook'] if hook else [])
     (proc / 'modules').write_text(''.join(f'{m} 1 0 - Live 0x0\n' for m in present))
     for m in MODULES + ['nvpcf_hook']:
         (root / 'modules').mkdir(exist_ok=True)
@@ -340,13 +356,44 @@ def rewrite(text, root):
     return text.replace('/proc/', f'{root}/proc/').replace('/sys/', f'{root}/sys/')
 
 
+# The two parts of swap.sh's refusal that every case but the refusal cases
+# replaces.
+DRM_REFUSAL_PARTS = (
+    ('''nvidia_drm_absent() {
+    grep -q '^nvidia_drm ' /proc/modules
+    case $? in
+        0) echo "$DRM_REFUSAL"; return 1 ;;
+        1) return 0 ;;
+        *) echo "cannot read /proc/modules, so swap.sh cannot tell whether nvidia_drm is loaded"; return 1 ;;
+    esac
+}
+''', 'nvidia_drm_absent() { return 0; }\n'),
+    ('''    if [ "$m" = nvidia_drm ]; then fail "$DRM_REFUSAL"; fi\n''', ''),
+)
+DRM_REFUSAL_TEXT = re.search(r'^DRM_REFUSAL="(.*)"$', (SRC / 'swap.sh').read_text(), re.M).group(1)
+# The copy of swap.sh reads the throwaway /proc, so its message names that path.
+UNREADABLE_TEXT = '/proc/modules, so swap.sh cannot tell whether nvidia_drm is loaded'
+
+
+def without_drm_refusal(text):
+    for old, new in DRM_REFUSAL_PARTS:
+        if text.count(old) != 1:
+            sys.exit(f'swap.sh does not contain this part of the nvidia_drm refusal once, as this test expects:\n{old}')
+        text = text.replace(old, new)
+    return text
+
+
 def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
         nvidia_drm=('card0', 'renderD129'), patched=True, leftover=False, connected=False,
-        last_swap_age=None, hook='active'):
-    """hook is None when nvpcf_hook is not loaded, else its starting state."""
+        last_swap_age=None, hook='active', modules=MODULES, drm_refusal=False):
+    """hook is None when nvpcf_hook is not loaded, else its starting state.
+    modules are the NVIDIA modules loaded at the start. drm_refusal runs
+    swap.sh with its nvidia_drm refusal."""
     cfg = cfg or {}
     root = Path(tempfile.mkdtemp(prefix=name + '-', dir=BASE))
-    build_tree(root, nvidia_drm, patched, leftover, connected, hook is not None)
+    build_tree(root, nvidia_drm, patched, leftover, connected, hook is not None, modules)
+    if cfg.get('modules_unreadable'):
+        (root / 'proc/modules').chmod(0)
     if last_swap_age is not None:
         (root / 'last-swap').write_text(f'{int(time.time()) - last_swap_age}\n')
     (root / 'bin').mkdir()
@@ -365,7 +412,10 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
     script_dir = root / 'scripts'
     script_dir.mkdir()
     for f in ('swap.sh', 'lib.sh'):
-        (script_dir / f).write_text(rewrite((SRC / f).read_text(), root))
+        text = (SRC / f).read_text()
+        if f == 'swap.sh' and not drm_refusal:
+            text = without_drm_refusal(text)
+        (script_dir / f).write_text(rewrite(text, root))
     (script_dir / 'hook/tests').mkdir(parents=True)
     (script_dir / 'hook' / 'nvpcf-hookctl').symlink_to(mock)
     (script_dir / 'load-hook.sh').symlink_to(mock)
@@ -401,6 +451,8 @@ def run(name, cfg=None, kms_holders=(), holders=(), args=(), interrupt=False,
         # so this signals swap.sh and the paused mock command.
         os.killpg(p.pid, signal.SIGTERM)
     out, _ = p.communicate(timeout=30)
+    if cfg.get('modules_unreadable'):
+        (root / 'proc/modules').chmod(0o644)
     calls = [json.loads(l) for l in (root / 'calls.jsonl').read_text().splitlines()]
     st = json.loads((root / 'state.json').read_text())
     # Reading the hook's status does not change anything; its other commands do.
@@ -804,6 +856,43 @@ r = run('hook-interrupted-after-detach', dict(UNPATCHED, pause_after_detach=True
 check(r, r['exit'] == 1 and r['rmmod'] == [], f"exits with status 1 without unloading anything, got {r['rmmod']}")
 check(r, r['hookctl'] == ['prepare', 'detach', 'resume'] and r['hook_state'] == 'active' and r['lactd_active'] is True,
       f"resumes the hook and starts lactd.service again, got {r['hookctl']} and {r['hook_state']}")
+
+# The refusal cases run swap.sh as it is.
+r = run('nvidia-drm-refused', SVC, holders=[777], drm_refusal=True)
+check(r, r['exit'] == 1 and DRM_REFUSAL_TEXT in r['out'] and 'a swap cannot go ahead now' in r['out'],
+      f"refuses while nvidia_drm is loaded and says why, got status {r['exit']}")
+expect_untouched(r)
+check(r, r['disk_checks'] == [['--check-disk', '--no-download']] and r['stamp'] is None,
+      f"checks the driver on disk without a download and does not record a swap, got {r['disk_checks']} and {r['stamp']}")
+
+r = run('nvidia-drm-refused-check', SVC, holders=[777], args=('--check',), drm_refusal=True)
+check(r, r['exit'] == 1 and DRM_REFUSAL_TEXT in r['out'] and 'a swap cannot go ahead now' in r['out'],
+      f"--check reports the refusal, got status {r['exit']}")
+expect_untouched(r)
+
+r = run('proc-modules-unreadable', dict(SVC, modules_unreadable=True), holders=[777], drm_refusal=True)
+check(r, r['exit'] == 1 and UNREADABLE_TEXT in r['out'] and 'a swap cannot go ahead now' in r['out'],
+      f"refuses when /proc/modules cannot be read, and says why, got status {r['exit']}")
+expect_untouched(r)
+check(r, r['disk_checks'] == [['--check-disk', '--no-download']],
+      f"checks the driver on disk without a download, got {r['disk_checks']}")
+
+NO_DRM = [m for m in MODULES if m != 'nvidia_drm']
+r = run('swap-without-nvidia-drm', SVC, holders=[777], modules=NO_DRM, nvidia_drm=(), drm_refusal=True)
+check(r, r['exit'] == 0 and r['out'].rstrip().endswith('END'),
+      f"swaps when nvidia_drm is not loaded, got status {r['exit']}")
+check(r, r['rmmod'] == ['nvidia_modeset', 'nvidia_uvm', 'nvidia', 'nvpcf_hook']
+      and r['modprobe'] == ['nvidia', 'nvpcf_hook', 'nvidia_modeset', 'nvidia_uvm'],
+      f"unloads and loads every module but nvidia_drm, got {r['rmmod']} and {r['modprobe']}")
+check(r, sorted(r['loaded']) == sorted(NO_DRM + ['nvpcf_hook']), f"ends without nvidia_drm, got {r['loaded']}")
+
+r = run('nvidia-drm-loaded-during-swap', dict(SVC, nvidia_drm_appears=True), holders=[777], modules=NO_DRM,
+        nvidia_drm=(), drm_refusal=True)
+check(r, r['exit'] == 1 and DRM_REFUSAL_TEXT in r['out'] and r['out'].rstrip().endswith('END (failed)'),
+      f"stops when nvidia_drm appears during the swap, and ends with END (failed), got status {r['exit']}")
+check(r, r['rmmod'] == [] and r['hookctl'] == ['prepare', 'detach', 'resume'] and r['hook_state'] == 'active',
+      f"does not unload any module and resumes the hook, got {r['rmmod']}, {r['hookctl']} and {r['hook_state']}")
+check(r, r['hidden'] == [] and r['lactd_active'] is True, 'moves the files back and starts lactd.service again')
 
 
 if failures:
