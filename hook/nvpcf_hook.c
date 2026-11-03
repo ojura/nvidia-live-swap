@@ -3,6 +3,7 @@
 #include <linux/acpi.h>
 #include <linux/capability.h>
 #include <linux/device.h>
+#include <linux/dmi.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/ftrace.h>
@@ -1151,6 +1152,81 @@ static int check_configuration(void)
 	return ret == -EAGAIN ? -EOPNOTSUPP : ret;
 }
 
+/* This is a supported platform/path check, not a generic removable classifier.
+ * Legion firmware exposes logical eject methods and a hotplug-capable PEG port.
+ * Those facts alone do not make its on-board GPU an external enclosure.
+ */
+static int supported_internal_path(struct pci_dev *gpu)
+{
+	struct pci_dev *port;
+	struct pci_dev *node;
+	struct acpi_device *gpu_adev, *port_adev;
+
+	if (!device_is_registered(&gpu->dev) || pci_dev_is_disconnected(gpu)) {
+		pr_err("nvpcf_hook: GPU %s unavailable: registered=%u disconnected=%u state=%u\n",
+			pci_name(gpu), device_is_registered(&gpu->dev),
+			pci_dev_is_disconnected(gpu), (unsigned int)gpu->current_state);
+		return -ENODEV;
+	}
+	port = pci_upstream_bridge(gpu);
+	if (!dmi_match(DMI_SYS_VENDOR, "LENOVO") ||
+	    !dmi_match(DMI_PRODUCT_NAME, "83FD") ||
+	    !dmi_match(DMI_PRODUCT_VERSION, "Legion 7 16IRX9")) {
+		pr_err("nvpcf_hook: unsupported platform: vendor=\"%s\" product=\"%s\" version=\"%s\"\n",
+			dmi_get_system_info(DMI_SYS_VENDOR) ?: "unavailable",
+			dmi_get_system_info(DMI_PRODUCT_NAME) ?: "unavailable",
+			dmi_get_system_info(DMI_PRODUCT_VERSION) ?: "unavailable");
+		return -EOPNOTSUPP;
+	}
+	if (!port || pci_upstream_bridge(port)) {
+		pr_err("nvpcf_hook: GPU %s has unsupported parent topology: parent=%s parent_has_upstream=%u\n",
+			pci_name(gpu), port ? pci_name(port) : "absent",
+			port && pci_upstream_bridge(port) != NULL);
+		return -EOPNOTSUPP;
+	}
+	if (gpu->vendor != PCI_VENDOR_ID_NVIDIA || gpu->device != 0x2860 ||
+	    port->vendor != PCI_VENDOR_ID_INTEL || port->device != 0xa70d) {
+		pr_err("nvpcf_hook: unsupported GPU/PEG IDs: %s %04x:%04x -> %s %04x:%04x\n",
+			pci_name(gpu), gpu->vendor, gpu->device,
+			pci_name(port), port->vendor, port->device);
+		return -EOPNOTSUPP;
+	}
+	if (!pci_is_pcie(gpu) || !pci_is_pcie(port) ||
+	    (pci_pcie_type(gpu) != PCI_EXP_TYPE_ENDPOINT &&
+	     pci_pcie_type(gpu) != PCI_EXP_TYPE_LEG_END) ||
+	    pci_pcie_type(port) != PCI_EXP_TYPE_ROOT_PORT) {
+		pr_err("nvpcf_hook: unsupported PCIe types: GPU %s pcie=%u type=%d, parent %s pcie=%u type=%d\n",
+			pci_name(gpu), pci_is_pcie(gpu), pci_pcie_type(gpu),
+			pci_name(port), pci_is_pcie(port), pci_pcie_type(port));
+		return -EOPNOTSUPP;
+	}
+	for (node = gpu; node; node = pci_upstream_bridge(node)) {
+		if (!device_is_registered(&node->dev) || pci_dev_is_disconnected(node)) {
+			pr_err("nvpcf_hook: PCI path %s unavailable: registered=%u disconnected=%u state=%u\n",
+				pci_name(node), device_is_registered(&node->dev),
+				pci_dev_is_disconnected(node), (unsigned int)node->current_state);
+			return -ENODEV;
+		}
+		if ((node->dev.removable != DEVICE_REMOVABLE_NOT_SUPPORTED &&
+		     node->dev.removable != DEVICE_FIXED) ||
+		    node->is_thunderbolt || node->external_facing || node->untrusted) {
+			pr_err("nvpcf_hook: unsupported PCI classification at %s: removable=%u thunderbolt=%u external_facing=%u untrusted=%u\n",
+				pci_name(node), (unsigned int)node->dev.removable,
+				node->is_thunderbolt, node->external_facing, node->untrusted);
+			return -EOPNOTSUPP;
+		}
+	}
+	gpu_adev = ACPI_COMPANION(&gpu->dev);
+	port_adev = ACPI_COMPANION(&port->dev);
+	if (!gpu_adev || !port_adev || acpi_dev_parent(gpu_adev) != port_adev) {
+		pr_err("nvpcf_hook: unsupported firmware association: GPU_companion=%u parent_companion=%u matching_parent=%u\n",
+			gpu_adev != NULL, port_adev != NULL,
+			gpu_adev && port_adev && acpi_dev_parent(gpu_adev) == port_adev);
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
 static bool inventory_matches(void)
 {
 	struct pci_dev *pci = NULL;
@@ -1164,6 +1240,9 @@ static bool inventory_matches(void)
 			target |= pci == h.pci;
 		}
 	}
+	if (count != 1 || !target)
+		pr_err("nvpcf_hook: unsupported selected-target inventory: NVIDIA_displays=%u selected_present=%u\n",
+			count, target);
 	return count == 1 && target;
 }
 
@@ -1174,17 +1253,21 @@ static bool inventory_matches(void)
 static int check_target_scope_locked(u64 *epoch)
 {
 	struct module *owner;
+	int ret = -ENODEV;
 	unsigned long flags;
 
 	spin_lock_irqsave(&h.lock, flags);
 	*epoch = h.scope_epoch;
 	spin_unlock_irqrestore(&h.lock, flags);
-	if (!inventory_matches() || !pci_device_is_present(h.pci) ||
-	    !h.pci->dev.driver || strcmp(h.pci->dev.driver->name, "nvidia"))
+	if (!inventory_matches() || !device_is_registered(&h.pci->dev) ||
+	    pci_dev_is_disconnected(h.pci) || !h.pci->dev.driver || strcmp(h.pci->dev.driver->name, "nvidia"))
 		goto refused;
 	owner = h.pci->dev.driver->owner;
 	if (!owner || READ_ONCE(owner->state) != MODULE_STATE_LIVE ||
 	    strcmp(module_name(owner), "nvidia"))
+		goto refused;
+	ret = supported_internal_path(h.pci);
+	if (ret)
 		goto refused;
 	return 0;
 refused:
@@ -1192,7 +1275,7 @@ refused:
 	h.target_unavailable = true;
 	h.block_initialization = true;
 	spin_unlock_irqrestore(&h.lock, flags);
-	return -ENODEV;
+	return ret;
 }
 
 static int admit_target_scope(u64 epoch)
@@ -2024,6 +2107,7 @@ static int find_gpu(void)
 {
 	struct pci_dev *pci = NULL, *found = NULL;
 	unsigned int count = 0;
+	int ret;
 
 	for_each_pci_dev(pci) {
 		if (pci->vendor == PCI_VENDOR_ID_NVIDIA &&
@@ -2033,11 +2117,17 @@ static int find_gpu(void)
 				found = pci_dev_get(pci);
 		}
 	}
-	if (count != 1 || pci_is_thunderbolt_attached(found) ||
-	    found->dev.removable != DEVICE_FIXED) {
+	if (count != 1) {
 		pci_dev_put(found);
-		pr_err("nvpcf_hook: requires exactly one fixed internal NVIDIA PCI GPU\n");
+		pr_err("nvpcf_hook: requires exactly one NVIDIA PCI display device; found=%u\n", count);
 		return -EOPNOTSUPP;
+	}
+	device_lock(&found->dev);
+	ret = supported_internal_path(found);
+	device_unlock(&found->dev);
+	if (ret) {
+		pci_dev_put(found);
+		return ret;
 	}
 	h.pci = found;
 	return 0;

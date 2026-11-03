@@ -23,9 +23,9 @@ The hook attaches only when these conditions hold:
   checked by the loader, as 2 through 128 unseparated hex characters (1 through
   64 bytes). Both hex cases are accepted. Missing or malformed input fails
   module initialization.
-- Exactly one NVIDIA display-class PCI device is present, reported as fixed and
-  not attached through Thunderbolt. A second NVIDIA GPU appearing stops capture
-  before its driver probe can replace NVIDIA's global ACPI context.
+- Exactly one NVIDIA display-class PCI device is present on the supported
+  Lenovo Legion configuration described below. A second NVIDIA GPU appearing
+  stops capture before its driver probe can replace NVIDIA's global ACPI context.
 - The selected device is bound to a fully loaded `nvidia` module, with a readable
   `GPU UUID` in `/proc/driver/nvidia/gpus/<PCI address>/information`.
 - Its power entry reports `Runtime D3 status: Enabled (fine-grained)`. The
@@ -50,6 +50,48 @@ successfully initializes the GPU, the hook queues an attachment attempt. If that
 client closes the GPU before the hook obtains its kernel-client device
 reference, the hook continues waiting. Acquiring the reference can temporarily
 wake the GPU.
+
+## Supported PCI configuration
+
+This hook supports the Legion 7 16IRX9 with DMI vendor `LENOVO`, product `83FD`
+and product version `Legion 7 16IRX9`. Its NVIDIA `10de:2860` GPU must connect
+directly to Intel `8086:a70d`, the CPU PEG root port on the root bus. Both devices
+must have ACPI companions, and the GPU's firmware device must be a child of the
+port's firmware device. PCIe endpoint and legacy-endpoint types are accepted;
+the observed GPU is a legacy endpoint. Intermediate bridges, other hardware
+identities, Thunderbolt, external-facing and untrusted paths are refused.
+
+Linux normally leaves these PCI devices at `DEVICE_REMOVABLE_NOT_SUPPORTED`.
+The absent `removable` sysfs file therefore does not mean fixed or removable.
+That default is accepted only with the complete supported platform/path check.
+An explicit `DEVICE_REMOVABLE_UNKNOWN` or `DEVICE_REMOVABLE` is refused even on
+that platform; `DEVICE_FIXED` still needs the same hardware/path checks. The
+hook does not modify Linux's classification.
+
+On this Legion, the GPU has `_RMV` and eject-method presence flags, and its CPU
+PEG port has the hotplug-capable flag. Those facts describe available firmware
+methods and port capabilities, not an external enclosure. The hook does not
+execute those methods or treat their presence as a removal permission. It uses
+the positively identified on-board GPU/CPU-PEG configuration instead.
+
+NVIDIA 615.71.09 `osinit.c:435-539` walks upstream bridges and marks a GPU
+external only after finding both an approved Intel TB3 bridge and a slot with
+hotplug and surprise-hotplug capability, possibly on different bridges.
+`RmInitNvDevice` sets `nv->is_external_gpu` when that test succeeds
+(`osinit.c:1288-1293`). This direct CPU PEG path has no intermediate Thunderbolt
+bridge. The private approval response is not reproduced as a table in the hook.
+A bounded read of the installed driver's cached state confirmed
+`is_external_gpu=0` for GNU build ID
+`b90b27f7877e92d38d7b045e3df6c91e381a42b1`; GPU and root port remained in D3cold.
+The diagnostic's private offsets are not used by the implementation. NVIDIA's
+`nv-pci.c:2822-2859` uses that flag to decide whether removal waits for internal
+GPU references to reach zero.
+
+Classification reads cached DMI, PCI and ACPI metadata. It checks registration
+and disconnection without a configuration-space read. `pci_device_is_present`
+reads Vendor/Device ID, so it is used only after power acquisition, not to reject
+a sleeping endpoint during early admission. Refusal logs identify the failed
+condition and relevant cached values without printing private kernel addresses.
 
 ## Loading and control commands
 

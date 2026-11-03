@@ -21,6 +21,7 @@ PREFIX = r'''
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <sys/types.h>
 #ifdef NEGATIVE_ORDER_TEST
 #undef assert
@@ -45,8 +46,32 @@ static void guard_hook(unsigned long, unsigned long, struct ftrace_ops *, struct
 static void event_hook(unsigned long, unsigned long, struct ftrace_ops *, struct ftrace_regs *);
 typedef unsigned int u32;
 struct driver { const char *name; struct module *owner; };
-struct device { struct driver *driver; struct { int lock, runtime_error; } power; };
-struct pci_dev { struct device dev; unsigned int vendor, class; };
+struct acpi_device { struct { bool removable, ejectable, is_dock_station; } flags; struct acpi_device *parent; };
+struct device { struct driver *driver; struct { int lock, runtime_error; } power;
+    int removable; bool registered; struct acpi_device *companion; };
+struct pci_dev { struct device dev; unsigned int vendor, device, class;
+    bool pcie, disconnected, is_thunderbolt, external_facing, untrusted, is_hotplug_bridge;
+    unsigned int current_state;
+    int pcie_type, config_error; unsigned int pcie_flags, slot_caps;
+    struct pci_dev *upstream; };
+#define DEVICE_REMOVABLE_NOT_SUPPORTED 0
+#define DEVICE_REMOVABLE_UNKNOWN 1
+#define DEVICE_FIXED 2
+#define DEVICE_REMOVABLE 3
+#define PCI_EXP_TYPE_ENDPOINT 0
+#define PCI_EXP_TYPE_LEG_END 1
+#define PCI_VENDOR_ID_INTEL 0x8086
+#define DMI_SYS_VENDOR 1
+#define DMI_PRODUCT_NAME 2
+#define DMI_PRODUCT_VERSION 3
+#define PCI_EXP_TYPE_ROOT_PORT 4
+#define PCI_EXP_TYPE_UPSTREAM 5
+#define PCI_EXP_TYPE_DOWNSTREAM 6
+#define PCI_EXP_FLAGS_SLOT 0x100
+#define PCI_EXP_SLTCAP 0x14
+#define PCI_EXP_SLTCAP_HPC 0x40
+#define PCI_EXP_SLTCAP_HPS 0x20
+#define ACPI_COMPANION(dev) ((dev)->companion)
 #define to_pci_dev(dev) ((struct pci_dev *)(dev))
 #define PCI_VENDOR_ID_NVIDIA 0x10de
 #define PCI_BASE_CLASS_DISPLAY 3
@@ -68,7 +93,7 @@ struct pci_dev { struct device dev; unsigned int vendor, class; };
 #define spin_lock_irqsave(lock, flags) ((void)(lock), (flags) = 0)
 #define spin_unlock_irqrestore(lock, flags) ((void)(lock), (void)(flags))
 #define pr_info(...) ((void)0)
-#define pr_err(...) ((void)0)
+#define pr_err(...) record_error(__VA_ARGS__)
 #define pr_crit(...) ((void)0)
 #define pr_err_ratelimited(...) ((void)0)
 #define NVPCF_CHANGE 0xc0
@@ -82,7 +107,12 @@ typedef void *acpi_handle;
 #define kfree(ptr) free(ptr)
 static struct module helper, old_module, new_module;
 static struct driver driver;
-static struct pci_dev pci;
+static struct pci_dev pci, root_port;
+static struct acpi_device endpoint_acpi, root_acpi;
+static struct pci_dev *first_pci, *second_pci;
+static int pci_refs, bridge_config_reads, endpoint_config_reads;
+static const char *dmi_vendor, *dmi_product, *dmi_version;
+#define for_each_pci_dev(p) for ((p) = first_pci; (p); (p) = (p) == first_pci ? second_pci : NULL)
 static int queued, capture_error, guard_error, rollback_error, drains, self_puts;
 static int old_calls, new_calls, resolutions;
 static int config_error, config_checks, system_barriers, resume_queued, work_joins;
@@ -141,6 +171,14 @@ static int old_get(const unsigned char *uuid, void *stack)
 { (void)uuid; (void)stack; old_calls++; return 0; }
 static int new_get(const unsigned char *uuid, void *stack)
 { (void)uuid; (void)stack; new_calls++; return 0; }
+static char last_error_message[768];
+static const char *phase_names[] = { "starting", "waiting", "active", "quiesced", "suspended", "guard-only", "unavailable", "detached" };
+static void record_error(const char *format, ...)
+{
+    va_list args; va_start(args, format);
+    vsnprintf(last_error_message, sizeof(last_error_message), format, args);
+    va_end(args);
+}
 static void dummy(void) { }
 static bool within_module(unsigned long ip, struct module *module)
 { (void)ip; within_calls++; assert(module); return true; }
@@ -238,7 +276,8 @@ static int pm_runtime_resume_and_get(struct device *dev)
 { (void)dev; linux_active = true; linux_refs++; return 0; }
 static void pm_runtime_put(struct device *dev)
 { (void)dev; assert(linux_refs > 0); linux_refs--; }
-static bool pci_device_is_present(struct pci_dev *dev) { (void)dev; return present; }
+static bool pci_device_is_present(struct pci_dev *dev)
+{ assert(dev == &pci); endpoint_config_reads++; return present && linux_active; }
 static int block_fine(const unsigned char *uuid, void *stack)
 {
     (void)uuid; (void)stack;
@@ -292,6 +331,18 @@ static ssize_t read_blob(const char *name, void *data, size_t size)
     memcpy(data, note_bytes, note_size);
     return (ssize_t)note_size;
 }
+static bool device_is_registered(struct device *dev) { return dev->registered; }
+static bool pci_dev_is_disconnected(struct pci_dev *dev) { return dev->disconnected; }
+static bool pci_is_pcie(struct pci_dev *dev) { return dev->pcie; }
+static int pci_pcie_type(struct pci_dev *dev) { return dev->pcie_type; }
+static struct pci_dev *pci_upstream_bridge(struct pci_dev *dev) { return dev->upstream; }
+static struct acpi_device *acpi_dev_parent(struct acpi_device *adev) { return adev->parent; }
+static const char *dmi_get_system_info(int field)
+{ return field == DMI_SYS_VENDOR ? dmi_vendor : field == DMI_PRODUCT_NAME ? dmi_product : dmi_version; }
+static bool dmi_match(int field, const char *value)
+{ return dmi_get_system_info(field) && !strcmp(dmi_get_system_info(field), value); }
+static struct pci_dev *pci_dev_get(struct pci_dev *dev) { if (dev) pci_refs++; return dev; }
+static void pci_dev_put(struct pci_dev *dev) { if (dev) pci_refs--; }
 static bool inventory_matches(void) { return inventory_ok; }
 static const char *pci_name(struct pci_dev *dev) { (void)dev; return "0000:01:00.0"; }
 static int read_gpu_text(const char *name, int (*show)(struct seq_file *, void *), char *buf, size_t size)
@@ -336,6 +387,8 @@ FUNCTIONS = (
     ('int', 'cleanup_fine_reference_if_active', 'void'),
     ('int', 'deliver_one', 'bool force'),
     ('int', 'put_gpu', 'void'),
+    ('int', 'supported_internal_path', 'struct pci_dev *gpu'),
+    ('int', 'find_gpu', 'void'),
     ('int', 'check_target_scope_locked', 'u64 *epoch'),
     ('int', 'admit_target_scope', 'u64 epoch'),
     ('int', 'get_gpu_locked', 'void'),
@@ -379,7 +432,22 @@ static void reset(void)
     old_module = (struct module){ MODULE_STATE_GOING, "old", "nvidia" };
     new_module = (struct module){ MODULE_STATE_LIVE, "replacement", "nvidia" };
     driver = (struct driver){ "nvidia", &new_module };
+    memset(&pci, 0, sizeof(pci)); memset(&root_port, 0, sizeof(root_port));
+    memset(&endpoint_acpi, 0, sizeof(endpoint_acpi)); memset(&root_acpi, 0, sizeof(root_acpi));
+    last_error_message[0] = 0;
+    pci.current_state = root_port.current_state = 4;
     pci.dev.driver = &driver;
+    pci.dev.registered = root_port.dev.registered = true;
+    pci.dev.companion = &endpoint_acpi; root_port.dev.companion = &root_acpi;
+    pci.pcie = root_port.pcie = true;
+    pci.pcie_type = PCI_EXP_TYPE_LEG_END; root_port.pcie_type = PCI_EXP_TYPE_ROOT_PORT;
+    pci.device = 0x2860; root_port.vendor = PCI_VENDOR_ID_INTEL; root_port.device = 0xa70d;
+    endpoint_acpi.parent = &root_acpi;
+    endpoint_acpi.flags.removable = endpoint_acpi.flags.ejectable = true;
+    root_port.is_hotplug_bridge = true;
+    dmi_vendor = "LENOVO"; dmi_product = "83FD"; dmi_version = "Legion 7 16IRX9";
+    pci.upstream = &root_port; root_port.pcie_flags = PCI_EXP_FLAGS_SLOT;
+    first_pci = &pci; second_pci = NULL; pci_refs = bridge_config_reads = endpoint_config_reads = 0;
     pci.vendor = PCI_VENDOR_ID_NVIDIA; pci.class = PCI_BASE_CLASS_DISPLAY << 16;
     inventory_ok = true; effective_error = ordinary_starts = 0;
     h.pci = &pci;
@@ -774,6 +842,83 @@ static void test_actual_scope_resume(void)
         assert(guarded_start(NULL, NULL) == -EBUSY && !ordinary_starts);
     }
 }
+static void test_actual_internal_classification(void)
+{
+    unsigned int node_index, reason;
+    reset();
+    linux_active = false; present = true; /* Config is inaccessible until deliberate acquisition. */
+    assert(pci.dev.removable == DEVICE_REMOVABLE_NOT_SUPPORTED);
+    assert(endpoint_acpi.flags.removable && endpoint_acpi.flags.ejectable && root_port.is_hotplug_bridge);
+    assert(pci.pcie_type == PCI_EXP_TYPE_LEG_END);
+    assert(!supported_internal_path(&pci) && !bridge_config_reads);
+    assert(!find_gpu() && pci_refs == 1 && h.pci == &pci);
+    pci_dev_put(h.pci);
+    {
+        u64 epoch;
+        assert(!check_target_scope_locked(&epoch) && !endpoint_config_reads);
+    }
+    reset();
+    gpu_info_text = "GPU UUID: GPU-00112233-4455-6677-8899-aabbccddeeff\n";
+    assert(!linux_active && !endpoint_config_reads);
+    assert(!prepare_open_locked() && h.owner.held && linux_active && endpoint_config_reads == 1);
+    assert(!put_gpu());
+    release_active(false);
+    for (node_index = 0; node_index < 2; ++node_index)
+    for (reason = 0; reason < 9; ++reason) {
+        struct pci_dev *node;
+        reset();
+        node = node_index ? &root_port : &pci;
+        switch (reason) {
+        case 0: node->dev.removable = DEVICE_REMOVABLE; break;
+        case 1: node->dev.removable = DEVICE_REMOVABLE_UNKNOWN; break;
+        case 2: node->dev.companion = NULL; break;
+        case 3: node->is_thunderbolt = true; break;
+        case 4: node->external_facing = true; break;
+        case 5: node->untrusted = true; break;
+        case 6: node->pcie = false; break;
+        case 7: node->dev.registered = false; break;
+        case 8: node->disconnected = true; break;
+        }
+        assert(supported_internal_path(&pci) == (reason >= 7 ? -ENODEV : -EOPNOTSUPP));
+        assert(find_gpu() < 0 && !pci_refs);
+    }
+    reset(); dmi_vendor = "other";
+    assert(supported_internal_path(&pci) == -EOPNOTSUPP);
+    assert(strstr(last_error_message, "vendor=\"other\"") && strstr(last_error_message, "product=\"83FD\""));
+    reset(); dmi_vendor = NULL;
+    assert(supported_internal_path(&pci) == -EOPNOTSUPP && strstr(last_error_message, "unavailable"));
+    reset(); dmi_product = "different Lenovo model";
+    assert(supported_internal_path(&pci) == -EOPNOTSUPP);
+    reset(); dmi_version = "another Legion";
+    assert(supported_internal_path(&pci) == -EOPNOTSUPP);
+    reset(); root_port.device = 0x15d3; /* A TB bridge cannot stand in for CPU PEG. */
+    assert(supported_internal_path(&pci) == -EOPNOTSUPP);
+    assert(strstr(last_error_message, "10de:2860") && strstr(last_error_message, "8086:15d3"));
+    reset(); root_port.vendor = 0x1022;
+    assert(supported_internal_path(&pci) == -EOPNOTSUPP);
+    reset(); pci.device = 0x2684;
+    assert(supported_internal_path(&pci) == -EOPNOTSUPP);
+    reset(); root_port.pcie_type = PCI_EXP_TYPE_DOWNSTREAM;
+    assert(supported_internal_path(&pci) == -EOPNOTSUPP);
+    reset(); endpoint_acpi.parent = NULL;
+    assert(supported_internal_path(&pci) == -EOPNOTSUPP);
+    reset(); pci.upstream = NULL;
+    assert(supported_internal_path(&pci) == -EOPNOTSUPP);
+    reset(); pci.dev.removable = root_port.dev.removable = DEVICE_FIXED;
+    assert(!supported_internal_path(&pci));
+    reset(); pci.pcie_type = PCI_EXP_TYPE_ENDPOINT;
+    assert(!supported_internal_path(&pci));
+    reset();
+    {
+        struct pci_dev middle = root_port;
+        middle.pcie_type = PCI_EXP_TYPE_UPSTREAM;
+        middle.upstream = &root_port;
+        pci.upstream = &middle;
+        assert(supported_internal_path(&pci) == -EOPNOTSUPP);
+    }
+    puts("PASS: actual Legion default/legacy-endpoint/logical-eject/hotplug-PEG profile passes without config reads; other platforms, external paths and removable/unknown classifications refuse");
+}
+
 int main(void)
 {
     test_actual_drain();
@@ -785,6 +930,7 @@ int main(void)
     test_actual_build_id_admission();
     test_actual_waiting_for_uuid();
     test_actual_scope_resume();
+    test_actual_internal_classification();
     puts("PASS: target loss blocks resume; an eligible uninitialized GPU waits; recovery rechecks concurrent loss");
     puts("PASS: lifecycle functions handle restoration, failed unregistration, driver replacement, power-reference recovery, system PM and build-ID checks");
     return 0;
