@@ -100,6 +100,11 @@ ID as `expected_nvidia_build_id`. The loader must check the linked module,
 kernel-open source and upstream dispatcher source as described below. A plain
 module load without the checked build ID is rejected.
 
+An installed-source correction must use a new DKMS/module version rather than
+overwriting the registered source of an installed version. Building or installing
+new source does not replace an already loaded helper; its device references and
+guards still require the explicit detach/NVIDIA-exit sequence below.
+
 The control device, `/dev/nvpcf-hook`, is accessible only to root. A successful
 load can leave the hook `waiting`, and attachment attempted later can fail with
 `unavailable`. Use `status` to check whether the hook is `active`. Status only
@@ -626,6 +631,15 @@ package. These commands do not install DKMS configuration or load modules.
 
 The userspace tests run shared logic and mocked kernel operations. They do not
 load the hook or exercise ACPI, runtime PM or NVIDIA on a GPU.
+
+The control-open test compiles the production `control_open` body with the
+non-NULL miscdevice pointer that `misc_open` supplies. It checks that the unused
+pointer is cleared before `single_open`, both allocation-failure paths leave
+`private_data` NULL without leaks, and a successful open releases its seq-file
+allocations exactly once. Removing the clear must fail the regression. The test
+also keeps DKMS and module version metadata consistent. Kernel references are
+`drivers/char/misc.c:153-163` and `fs/seq_file.c:58-89,573-590` at Ubuntu commit
+`102c85de1d6726aa44823e8f9740eea74216c7a5`.
 
 Before deployment, test both Ubuntu's unpatched driver core and the patched core
 on the GPU. A patched core can hide an interception defect. Verify idle

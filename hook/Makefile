@@ -14,6 +14,7 @@ check: tests/state_test tests/build_id_test
 	./tests/build_id_test
 	python3 -I -B tests/check_build_id.py
 	python3 -I -B tests/check_control.py
+	python3 -I -B tests/check_control_open.py
 	python3 -I -B tests/check_checker.py
 	python3 -I -B tests/check_transitions.py
 	python3 -I -B tests/check_io.py

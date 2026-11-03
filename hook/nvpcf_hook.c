@@ -1880,6 +1880,10 @@ static int status_show(struct seq_file *seq, void *unused)
 
 static int control_open(struct inode *inode, struct file *file)
 {
+	/* misc_open left its miscdevice pointer here; this controller does not
+	 * use it. single_open needs NULL before installing the seq_file pointer.
+	 */
+	file->private_data = NULL;
 	return single_open(file, status_show, NULL);
 }
 
@@ -2325,6 +2329,6 @@ static void __exit hook_exit(void)
 module_init(hook_init);
 module_exit(hook_exit);
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.1");
+MODULE_VERSION("0.1.1");
 MODULE_DESCRIPTION("Defer NVPCF changes with a kernel-client reference and explicit detach");
 MODULE_SOFTDEP("pre: nvidia");
