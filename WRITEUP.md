@@ -187,7 +187,9 @@ process group cannot stop gdb in the middle of a call that gdb injected into the
 target process.
 
 Every swap needs nvpcf_hook to prevent the shutdown deadlock described in [The
-hang in NVIDIA's shutdown](#the-hang-in-nvidias-shutdown).
+hang in NVIDIA's shutdown](#the-hang-in-nvidias-shutdown). The hook supports
+only one board configuration, which [nvpcf_hook](#nvpcf_hook) names, so
+`swap.sh` works only on that configuration.
 `swap.sh` refuses unless the hook is loaded, installed for the running kernel,
 and in the state `active`, `waiting`, `guard-only` or `quiesced`. It reads the
 hook's state with `nvpcf-hookctl status`, which does not change the hook.
@@ -431,11 +433,15 @@ in detail. In short:
   powered.
 - It intercepts `nv_shutdown_adapter`, as described in [The hang in NVIDIA's
   shutdown](#the-hang-in-nvidias-shutdown).
-- It attaches only to the configuration it was checked for. That is exactly one
-  internal NVIDIA GPU in fine-grained power mode, NVIDIA's kernel suspend
-  notifiers, and firmware without NVIDIA's legacy `NVIF` and `WMMX` methods. It
-  uses functions of NVIDIA's open layer and one symbol of NVIDIA's core. A new
-  NVIDIA version that changes them can need a change to the hook.
+- It attaches only to the configuration it was checked for: the Legion 7
+  16IRX9, DMI vendor `LENOVO` and product `83FD`, whose one NVIDIA GPU,
+  `10de:2860`, sits directly on the CPU's PCIe root port, Intel `8086:a70d`, as
+  [hook/README.md](hook/README.md#supported-pci-configuration) specifies. The
+  GPU has to be in fine-grained power mode, NVIDIA has to use its kernel suspend
+  notifiers, and the firmware must not have NVIDIA's legacy `NVIF` and `WMMX`
+  methods. The hook uses functions of NVIDIA's open layer and one symbol of
+  NVIDIA's core. A new NVIDIA version that changes them can need a change to the
+  hook.
 
 Its control client, `hook/nvpcf-hookctl`, has the commands `status`, `prepare`,
 `detach`, `resume` and `acknowledge-loss`. `swap.sh` uses the first four.

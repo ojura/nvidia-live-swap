@@ -29,9 +29,14 @@ There are two ways to install the fix:
   the fix carries over without a rebuild. The hook also guards NVIDIA's
   shutdown of the GPU against a hang described in [Limitations](#limitations).
 
-The scripts are tested on a Legion 7 16IRX9 (RTX 4070 Laptop GPU) with Ubuntu
-24.04, kernel 7.0, GNOME 46 on Wayland, and Ubuntu's packages of NVIDIA's open
-kernel modules.
+nvpcf_hook supports only the Legion 7 16IRX9 configuration that
+[hook/README.md](hook/README.md#supported-pci-configuration) specifies: DMI
+vendor `LENOVO` and product `83FD`, with the NVIDIA GPU `10de:2860` (RTX 4070
+Laptop GPU) directly on the CPU's PCIe root port, Intel `8086:a70d`. It refuses
+to load on other hardware. Every swap needs the hook, so `swap.sh` also works
+only on that configuration. `build.sh` does not depend on the hook. The scripts
+are tested on that laptop with Ubuntu 24.04, kernel 7.0, GNOME 46 on Wayland,
+and Ubuntu's packages of NVIDIA's open kernel modules.
 
 ## Usage
 
@@ -161,8 +166,9 @@ program that closed the GPU last then hangs. During a swap that is often
 gnome-shell, which freezes the desktop. nvpcf_hook removes NVIDIA's firmware
 message handlers before the shutdown takes the lock. Patch 0001 does not help
 here, because the patched driver takes the same lock before it holds a
-message. So `swap.sh` refuses to swap without the hook. The hang is inferred
-from NVIDIA's source and has not been reproduced.
+message. So `swap.sh` refuses to swap without the hook, which means that it
+refuses every swap on hardware that the hook does not support. The hang is
+inferred from NVIDIA's source and has not been reproduced.
 [WRITEUP.md](WRITEUP.md#the-hang-in-nvidias-shutdown) has the details.
 
 Swaps have to be at least 20 seconds apart. During a swap, GNOME asks
