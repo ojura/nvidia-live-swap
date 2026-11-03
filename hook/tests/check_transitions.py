@@ -916,7 +916,7 @@ static void test_actual_internal_classification(void)
         pci.upstream = &middle;
         assert(supported_internal_path(&pci) == -EOPNOTSUPP);
     }
-    puts("PASS: actual Legion default/legacy-endpoint/logical-eject/hotplug-PEG profile passes without config reads; other platforms, external paths and removable/unknown classifications refuse");
+    puts("PASS: the supported Legion path, with its legacy endpoint, ACPI eject methods and hotplug-capable port, is accepted without a config read; other platforms, external paths and removable or unknown classifications are refused");
 }
 
 int main(void)

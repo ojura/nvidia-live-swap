@@ -1152,9 +1152,9 @@ static int check_configuration(void)
 	return ret == -EAGAIN ? -EOPNOTSUPP : ret;
 }
 
-/* This is a supported platform/path check, not a generic removable classifier.
- * Legion firmware exposes logical eject methods and a hotplug-capable PEG port.
- * Those facts alone do not make its on-board GPU an external enclosure.
+/* Accept only the supported Legion platform and its direct PEG path. Legion
+ * firmware exposes ACPI eject methods for the GPU and a hotplug-capable PEG
+ * port; neither makes its on-board GPU an external enclosure.
  */
 static int supported_internal_path(struct pci_dev *gpu)
 {

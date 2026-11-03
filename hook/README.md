@@ -68,24 +68,22 @@ An explicit `DEVICE_REMOVABLE_UNKNOWN` or `DEVICE_REMOVABLE` is refused even on
 that platform; `DEVICE_FIXED` still needs the same hardware/path checks. The
 hook does not modify Linux's classification.
 
-On this Legion, the GPU has `_RMV` and eject-method presence flags, and its CPU
-PEG port has the hotplug-capable flag. Those facts describe available firmware
-methods and port capabilities, not an external enclosure. The hook does not
-execute those methods or treat their presence as a removal permission. It uses
-the positively identified on-board GPU/CPU-PEG configuration instead.
+On this Legion, the GPU's ACPI node has `_RMV` and ACPI eject methods, and its
+CPU PEG port is hotplug-capable. These describe firmware methods and port
+capabilities, not an external enclosure. The hook does not run those methods,
+and it does not treat them as a sign that the GPU can be removed. It accepts
+only the board configuration above.
 
-NVIDIA 615.71.09 `osinit.c:435-539` walks upstream bridges and marks a GPU
-external only after finding both an approved Intel TB3 bridge and a slot with
-hotplug and surprise-hotplug capability, possibly on different bridges.
-`RmInitNvDevice` sets `nv->is_external_gpu` when that test succeeds
+In NVIDIA 615.71.09, `osinit.c:435-539` walks the upstream bridges and marks a
+GPU external only when it finds an Intel Thunderbolt 3 bridge that NVIDIA's code
+approves and a slot with hotplug and surprise-hotplug capability, possibly on
+different bridges. NVIDIA's bridge-approval response is outside the available C
+sources. `RmInitNvDevice` sets `nv->is_external_gpu` when the test succeeds
 (`osinit.c:1288-1293`). This direct CPU PEG path has no intermediate Thunderbolt
-bridge. The private approval response is not reproduced as a table in the hook.
-A bounded read of the installed driver's cached state confirmed
-`is_external_gpu=0` for GNU build ID
-`b90b27f7877e92d38d7b045e3df6c91e381a42b1`; GPU and root port remained in D3cold.
-The diagnostic's private offsets are not used by the implementation. NVIDIA's
-`nv-pci.c:2822-2859` uses that flag to decide whether removal waits for internal
-GPU references to reach zero.
+bridge, and the tested 615.71.09 driver, GNU build ID
+`b90b27f7877e92d38d7b045e3df6c91e381a42b1`, reports `is_external_gpu=0` for it.
+NVIDIA's `nv-pci.c:2822-2859` uses the flag during removal: for a GPU that is
+not external, removal waits until the GPU's usage count reaches zero.
 
 Classification reads cached DMI, PCI and ACPI metadata. It checks registration
 and disconnection without a configuration-space read. `pci_device_is_present`
