@@ -252,9 +252,10 @@ from it failed, because the boot kernel's initramfs held NVIDIA's modules.
 Since a rebuild later that day it does not hold them, and a resume has not run
 since then.
 
-UPower's `CriticalPowerAction` is `HybridSleep`, its default, so at 2% battery
-systemd starts a hybrid sleep: the kernel writes a hibernation image and then
-suspends to RAM. If the battery runs out during the suspend, the next boot
+UPower's `CriticalPowerAction` is `HybridSleep`, its default, so at UPower's
+`PercentageAction` systemd starts a hybrid sleep: the kernel writes a
+hibernation image and then suspends to RAM. `PercentageAction` is 2% by
+default, and 4% on the Legion since 2026-11-10. If the battery runs out during the suspend, the next boot
 finds the image and tries to resume from it.
 
 On 2026-11-10 that resume failed. The boot kernel loaded the image and then
@@ -338,7 +339,8 @@ write finishes and the battery runs out before the charger is connected. A
 failed restore then loses only the session that the empty battery would end
 anyway. With the charger connected in time, the laptop resumes from RAM, and
 the restore does not run. At UPower's `PercentageAction` of 2%, two of the
-three image writes above did not finish.
+three image writes above did not finish. 4% gives the write about four minutes
+at 50 W.
 
 ## Scripts
 
