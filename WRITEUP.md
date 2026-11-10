@@ -483,13 +483,61 @@ diversion makes dpkg put the package's own version of that file under
 place.
 
 Next, it rebuilds and installs the DKMS modules for every kernel that DKMS lists
-for that driver version, and for the running kernel, which is the kernel that
-`swap.sh` loads the modules into. It checks that each installed `nvidia.ko`
-contains `RmDeferNvpcfNotifyIfIdle`. `build.sh` works out the list of kernels
-before it changes anything. If `dkms status` fails, or the headers of the
-running kernel are missing, it stops before it downloads NVIDIA's source or adds
-the diversion. If the headers of another kernel are missing, it skips that
-kernel and exits with status 1 at the end.
+for that driver version, and for the running kernel. It checks that each
+installed `nvidia.ko` contains `RmDeferNvpcfNotifyIfIdle`. `build.sh` works out
+the list of kernels before it changes anything. If `dkms status` fails, or the
+headers of the running kernel are missing, it stops before it downloads
+NVIDIA's source or adds the diversion. If the headers of another kernel are
+missing, it skips that kernel and exits with status 1 at the end.
+
+A kernel that DKMS lists, but that has neither headers nor modules of its own in
+`/lib/modules/<kernel>/kernel`, was removed. DKMS builds the modules for a
+kernel when the kernel's headers are installed
+(`/etc/kernel/header_postinst.d/dkms`), and removes them only when the kernel
+image is removed (`/etc/kernel/prerm.d/dkms`). When the headers go after the
+image, DKMS keeps listing the modules it had installed for that kernel. On the
+Legion, apt replaced the 6.8.0-147 headers with the 6.8.0-149 headers on
+2026-11-09, when the only 6.8 packages installed were headers, and DKMS still
+lists nvidia and nvpcf-hook for 6.8.0-147. `build.sh` leaves such a kernel out
+and names it, without counting it as skipped. `sudo dkms remove -m nvidia -v
+<version> -k <kernel>` removes the leftover. The running kernel never counts as
+removed.
+
+After it installs the modules for a kernel, `build.sh` updates that kernel's
+initramfs, the image that the boot loader loads with the kernel and that the
+kernel runs before it mounts the root filesystem. Ubuntu's
+`nvidia-kernel-common-<branch>` package installs
+`/usr/share/initramfs-tools/hooks/framebuffer-nvidia`, which copies each
+uncompressed `nvidia*.ko` file in `/lib/modules/<kernel>/updates/dkms` into the
+initramfs when the initramfs gets a framebuffer. The `cryptsetup` and `plymouth`
+packages ask for one with `FRAMEBUFFER=y` in
+`/usr/share/initramfs-tools/conf-hooks.d`. With the modules in the initramfs,
+the kernel loads nvidia from there: in the boot of 2026-11-10 at 03:55, nvidia
+loaded 2.5 seconds after the kernel started, and the encrypted root filesystem
+was mounted at 33.7 seconds. The driver that runs is then the initramfs's copy,
+not the file on the root filesystem. `dkms install` does not rebuild the
+initramfs; DKMS 3.0.11 only warns that `REMAKE_INITRD` is deprecated
+(`/usr/sbin/dkms`, line 440). So without the update, the next boot loads the
+modules from before the rebuild.
+
+DKMS compresses a kernel's modules with zstd when that kernel's `modules.dep`
+lists compressed modules at build time (`/usr/sbin/dkms`, lines 218-227), and
+the hook skips compressed files. On the Legion, the 7.0.0-42 initramfs holds
+the five nvidia modules, which DKMS built uncompressed, and the 7.0.0-38
+initramfs holds none, because DKMS compressed them. `build.sh` updates every
+image either way, so that each matches the installed files.
+
+`build.sh` runs `update-initramfs -u -k <kernel>` for each kernel whose
+`/boot/initrd.img-<kernel>` exists, right after that kernel's `dkms install`.
+`update-initramfs` writes the new image under another name and renames it over
+the old one, and keeps the old image when it fails. It exits with status 0
+without writing when `/boot` is mounted read-only or `update_initramfs=no` is
+set. So `build.sh` compares the image's inode and modification time before
+and after, and stops with status 1 when `update-initramfs` fails or does not
+write a new image, naming the kernel whose next boot would load the previous
+modules. A kernel update does not need this step: the kernel package runs
+`/etc/kernel/postinst.d/dkms` before `/etc/kernel/postinst.d/initramfs-tools`,
+so the new kernel's initramfs gets the modules that DKMS has just built.
 
 ### nvpcf_hook
 
@@ -553,15 +601,17 @@ By default, the loader loads `nvidia` if needed, and reads the loaded build ID
 from `/sys/module/nvidia/notes`. It checks the module file with that build ID,
 which is the file `modprobe` would load, or DKMS's copy for the loaded version
 and the running kernel. It stops when it cannot find a file with the loaded
-build ID, because a check of a different file does not cover the loaded
-driver. The version comes from the matched file itself, and has to equal the
-loaded module's. After the checks pass, it loads `nvpcf_hook` with
-`expected_nvidia_build_id` set to the checked build ID, and the hook refuses to
-attach to any other build. The loader exits with status 0 only if the hook then
-reports `active` or `waiting`, with its guards registered, GPU initialization
-allowed and `retirement_failed` 0. `swap.sh` relies on that status: it loads
-the modules and starts the services that make NVIDIA initialize the GPU only
-after the loader succeeds.
+build ID, because a check of a different file does not cover the loaded driver.
+One cause is an initramfs that holds an older copy of the driver than the
+installed files, as the [build.sh](#buildsh) section explains, so the message
+names `update-initramfs -u -k <kernel>` and a reboot. The version comes from the
+matched file itself, and has to equal the loaded module's. After the checks
+pass, it loads `nvpcf_hook` with `expected_nvidia_build_id` set to the checked
+build ID, and the hook refuses to attach to any other build. The loader exits
+with status 0 only if the hook then reports `active` or `waiting`, with its
+guards registered, GPU initialization allowed and `retirement_failed` 0.
+`swap.sh` relies on that status: it loads the modules and starts the services
+that make NVIDIA initialize the GPU only after the loader succeeds.
 
 If the hook is loaded already, the loader only checks that, as
 `--check-loaded` does. `swap.sh` uses `--check-loaded` before it lets NVIDIA
@@ -666,6 +716,23 @@ before it runs depmod, and removes the new file when depmod fails
 (`/usr/sbin/dkms`, lines 1345-1380 in DKMS 3.0.11). After a failed install or
 check, the script installs the kernel's previous version again from DKMS's
 build of it, checks it in the same way, and reports whether that worked.
+
+A kernel that DKMS lists, but that has neither headers nor modules of its own in
+`/lib/modules/<kernel>/kernel`, was removed, as the [build.sh](#buildsh) section
+explains, and the running kernel never counts as removed. The script leaves such
+a kernel out and names it. It removes nvpcf-hook's install for the kernel with
+`dkms remove -m nvpcf-hook -v <version> -k <kernel>`, as
+`/etc/kernel/prerm.d/dkms` does when a kernel image is removed, and leaves the
+kernel's nvidia entries as they are. Counted as skipped, a removed kernel would
+keep every older version registered and end every run with status 1, and a
+version still installed for it would count as installed. When the removed kernel
+had the last build of a version, DKMS deletes that version from its tree, and
+the script removes its source directory: a rollback installs an older version
+from DKMS's build of it, and the last build of that version is gone. A failed
+removal ends the run with status 1 and keeps the older versions. A kernel that
+has its own modules but no headers is skipped. The initramfs hook copies only
+modules whose names start with `nvidia`, so the initramfs does not hold
+nvpcf_hook, and the script does not update it.
 
 An older version that is not installed for any kernel is removed only after
 every kernel in the run has the new version installed and checked, including
@@ -805,11 +872,12 @@ the number of deliveries.
   script parses.
   - The cases verify that the loader checks the file with the loaded build ID,
     or DKMS's copy when only that matches, and that it stops without a check
-    when neither matches. They verify that the version comes from the checked
-    file, that a file whose version differs from the loaded module's is
-    refused, and that `--check-disk` refuses a candidate whose build ID is
-    missing, malformed or longer than 64 bytes. They verify that the loader
-    passes the build ID to `nvpcf_hook` in lowercase.
+    when neither matches, with a message that names the initramfs update. They
+    verify that the version comes from the checked file, that a file whose
+    version differs from the loaded module's is refused, and that `--check-disk`
+    refuses a candidate whose build ID is missing, malformed or longer than 64
+    bytes. They verify that the loader passes the build ID to `nvpcf_hook` in
+    lowercase.
   - The loader downloads a missing archive over https into the cache without
     leaving a partial file. A failed download, a driver that the checker
     rejects, a missing source tree and a version string that is not a version
@@ -841,9 +909,12 @@ the number of deliveries.
 - `tests/check_install_hook.py` runs `install-hook.sh` as an ordinary user,
   against a mock `dkms` that follows DKMS 3.0.11. It keeps the added, built
   and installed versions. Its `build --force` drops the existing build, its
-  `install` copies the build over the kernel's installed file before depmod
-  and removes the new file when depmod fails, and its `remove` uninstalls a
-  version from every kernel that has it. The cases are:
+  `install` copies the build over the kernel's installed file before depmod and
+  removes the new file when depmod fails. Its `remove --all` uninstalls a
+  version from every kernel that has it, and its `remove -k` removes one
+  kernel's install and build, and deletes the version when no other kernel has a
+  build of it. Every kernel has modules of its own in
+  `/lib/modules/<kernel>/kernel` unless a case leaves them out. The cases are:
   - a fresh install, an upgrade that removes the old version only after the
     new one is installed everywhere, a second run with the same source, and a
     failed archive download;
@@ -852,6 +923,15 @@ the number of deliveries.
     has the new version installed and passes the check counts as done;
   - a kernel that DKMS lists only for nvpcf-hook, which gets the new version
     like the others, or counts as skipped when its headers are missing;
+  - a removed kernel that DKMS lists for nvidia and nvpcf-hook, or only for
+    nvpcf-hook, which gets no build, and whose nvpcf-hook install the script
+    removes with `dkms remove -k`, after which the old version goes; a removed
+    kernel that had the last install of the old version, after which DKMS
+    deletes that version and the script removes its source; and a failed
+    removal, which keeps the old version and ends the run with status 1. A
+    kernel with headers but without modules of its own gets the new version, and
+    a running kernel without headers stops the script also when it lacks modules
+    of its own;
   - an install that fails before the copy, which leaves the old module, and a
     depmod failure after the copy, after which the kernel gets its previous
     version back from DKMS's build. When depmod fails for that reinstall too,
@@ -908,10 +988,17 @@ the number of deliveries.
 - `make -C hook check` runs nvpcf_hook's own tests, which
   [hook/README.md](hook/README.md) describes.
 - `tests/check_build.py` runs `build.sh` as an ordinary user, against mock
-  commands and a fake `/usr/src` and `/lib/modules`. Its cases are a failing
-  `dkms status`, a version that DKMS lists only as `added`, missing headers for
-  the running kernel and for another kernel, a mistyped or extra argument, and a
-  full build for two kernels.
+  commands and a fake `/usr/src`, `/lib/modules` and `/boot`. Its cases are a
+  failing `dkms status`, a version that DKMS lists only as `added`, missing
+  headers for the running kernel and for another kernel, a mistyped or extra
+  argument, and a full build for two kernels. A mock `update-initramfs` writes a
+  new image and renames it over the old one, as `update-initramfs` does. The
+  full build has to update each kernel's image after that kernel's `dkms
+  install`. Further cases cover a kernel without an image, which gets no update,
+  an `update-initramfs` that fails and one that exits 0 without writing, which
+  both end the run with status 1, a removed kernel, which `build.sh` leaves out
+  without counting it as skipped, and a running kernel without headers or
+  modules of its own, which stops the run before any change.
 - `tests/check_layout.py` runs as an ordinary user, without a desktop. It checks
   how `reapply-layout.py` rebuilds current modes, mirrored monitors and
   underscanning, and that it sends the layout mode only when mutter supports

@@ -12,8 +12,11 @@ builds a missing build, copies the build over the kernel's installed file,
 and then runs depmod. When depmod fails, it removes the file it copied, so
 the kernel is left without an installed version. A case can also make install
 fail before the copy, or leave a file with another build ID while it reports
-success. remove uninstalls a version from every kernel that has
-it installed, so a premature remove shows up as a lost module. A module file
+success. remove --all uninstalls a version from every kernel that has
+it installed, so a premature remove shows up as a lost module. remove -k
+uninstalls the version from one kernel and drops that kernel's build, and
+deletes the version from the tree when no other kernel has a build of it, as
+DKMS's remove_module does. A module file
 holds its build ID as text, which the mock objcopy turns into the note that
 GNU ld writes. uname, modinfo, objcopy, systemctl and curl are mocks too. The
 copied load-hook.sh reads build IDs for install-hook.sh and downloads into the
@@ -49,6 +52,18 @@ source directory with an extra file. mkdir, cp, find and cmp are mocks only in
 the cases that need them. A running kernel without headers passes when it has
 the version installed and checked, and stops the script otherwise.
 
+Every kernel in a case has modules of its own in /lib/modules/<kernel>/kernel
+unless the case leaves them out. A kernel that DKMS lists without headers and
+without such modules was removed. It gets no build, the run names it, and its
+nvpcf-hook install is removed with dkms remove -m nvpcf-hook -v <version> -k
+<kernel>, as /etc/kernel/prerm.d/dkms does, while its nvidia entries stay. The
+old version then goes once the other kernels have the new one. When the
+removed kernel had the last install of a version, DKMS deletes that version,
+and the script removes its source. A failed removal keeps the old version and
+ends the run with status 1. A kernel with headers but without modules of its
+own gets the new version like the others, and a running kernel without
+headers stops the script also when it lacks modules of its own.
+
 One case builds hook/ with the real Kbuild between two installer runs, so the
 second run sees generated files such as nvpcf_hook.mod.c. The second run has to
 find the registered source unchanged, and a Kbuild build of the registered
@@ -79,6 +94,7 @@ BASE = Path(tempfile.mkdtemp(prefix='install-hook-test-'))
 RUNNING = '7.0.0-38-generic'
 OTHER = '6.8.0-147-generic'
 THIRD = '6.11.0-29-generic'  # a kernel that DKMS lists only for nvpcf-hook
+REMOVED = '6.8.0-146-generic'  # DKMS lists it, but its headers and modules are gone
 NVIDIA = (f'nvidia/615.71.09, {OTHER}, x86_64: installed\n'
           f'nvidia/615.71.09, {RUNNING}, x86_64: installed\n')
 OLD = '0.0.1'
@@ -178,6 +194,18 @@ if cmd == 'dkms':
             uninstall(st, k)
             save(st)
             sys.exit(6)
+    elif op == 'remove' and '-k' in args:
+        v, k = opt('-v'), opt('-k')
+        if k in cfg.get('remove_fails_for', []):
+            save(st)
+            sys.exit(4)
+        if st['installed'].get(k) == v:
+            uninstall(st, k)
+        if [v, k] in st['built']:
+            built_path(v, k).unlink(missing_ok=True)
+            st['built'].remove([v, k])
+        if not any(b[0] == v for b in st['built']):
+            st['added'] = [a for a in st['added'] if a != v]
     elif op == 'remove':
         v = args[1].split('/')[1]
         for k, iv in list(st['installed'].items()):
@@ -257,7 +285,7 @@ def kbuild(directory):
 
 
 def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, registered=None,
-        package_version=None, between=None, unregistered=None, prepare=None, mocks=()):
+        package_version=None, between=None, unregistered=None, prepare=None, mocks=(), without_modules=()):
     """installed maps kernels to an old version that is built and installed
     for them before the run. registered maps versions that are only added to
     the text of their nvpcf_hook.c, or to None for hook/'s text.
@@ -268,7 +296,8 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
     with the given files replaced, or deleted for None, or to 'file' for a
     regular file in place of the directory. prepare(root) runs once the
     throwaway tree exists. mocks names more commands for the mock, such as
-    mkdir or cp."""
+    mkdir or cp. RUNNING, OTHER and THIRD get modules of their own, except
+    those in without_modules; REMOVED never does."""
     root = BASE / name
     (root / 'bin').mkdir(parents=True)
     mock = root / 'mock'
@@ -278,6 +307,9 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
         (root / 'bin' / cmd).symlink_to(mock)
     for k in headers:
         (root / 'lib/modules' / k / 'build').mkdir(parents=True)
+    for k in (RUNNING, OTHER, THIRD):
+        if k not in without_modules:
+            (root / 'lib/modules' / k / 'kernel').mkdir(parents=True, exist_ok=True)
     st = {'added': [], 'built': [], 'installed': {}}
     for k, v in (installed or {}).items():
         if v not in st['added']:
@@ -352,6 +384,7 @@ def run(name, cfg, headers=(RUNNING, OTHER), args=(), installed=None, runs=1, re
     return {'case': name, 'exit': p.returncode, 'exits': exits, 'out': p.stdout, 'calls': named, 'state': st,
             'changing': [c for c in named if c in ('dkms add', 'dkms build', 'dkms install', 'dkms remove')],
             'removed': [a[1] for c, a in calls if c == 'dkms' and a[0] == 'remove'],
+            'dkms_args': [a for c, a in calls if c == 'dkms'],
             'installs': [(a[a.index('-v') + 1], a[a.index('-k') + 1]) for c, a in calls if c == 'dkms' and a[0] == 'install'],
             'new': NEW if NEW in st['added'] else None,
             'latest': max(st['added'], key=dkms_ver) if st['added'] else None,
@@ -521,6 +554,57 @@ r = run('hook-only-kernel-without-headers', {}, installed={RUNNING: OLD, OTHER: 
 check(r, r['exit'] == 1 and f'headers are missing, not built: {THIRD}' in r['out']
       and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW, THIRD: OLD} and r['removed'] == [],
       f"counts the kernel that DKMS lists only for nvpcf-hook as skipped, and keeps {OLD}, got {r['state']['installed']}")
+
+REMOVED_NVIDIA = NVIDIA + f'nvidia/615.71.09, {REMOVED}, x86_64: installed\n'
+
+r = run('removed-kernel', {'status': REMOVED_NVIDIA}, installed={RUNNING: OLD, OTHER: OLD, REMOVED: OLD})
+check(r, r['exit'] == 0 and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW},
+      f"installs the new version for the other kernels and removes the removed kernel's install, got status {r['exit']} and {r['state']['installed']}")
+check(r, 'leaving out removed kernels' in r['out'] and REMOVED in r['out'] and 'headers are missing' not in r['out'],
+      'names the removed kernel and does not count it as skipped')
+check(r, all(k != REMOVED for v, k in r['installs']) and all(k != REMOVED for v, k in r['state']['built']),
+      f"does not build or install for the removed kernel, got {r['installs']} and {r['state']['built']}")
+check(r, ['remove', '-m', 'nvpcf-hook', '-v', OLD, '-k', REMOVED] in r['dkms_args'],
+      f"removes {OLD}'s install for the removed kernel with dkms remove -k, got {r['dkms_args']}")
+check(r, OLD not in r['state']['added'] and f'nvpcf-hook-{OLD}' not in r['sources'] and r['removed'][-1:] == [f'nvpcf-hook/{OLD}'],
+      f"then removes {OLD} and its source, got {r['state']['added']}, {r['sources']} and {r['removed']}")
+check(r, all(a[:2] == ['status', 'nvidia'] or 'nvidia' not in ' '.join(a) for a in r['dkms_args']),
+      f"leaves the nvidia entries alone, got {r['dkms_args']}")
+latest_is_new(r)
+
+r = run('removed-kernel-hook-only', {}, installed={RUNNING: OLD, OTHER: OLD, REMOVED: OLD})
+check(r, r['exit'] == 0 and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW} and OLD not in r['state']['added'],
+      f"also leaves out a removed kernel that DKMS lists only for nvpcf-hook, got status {r['exit']} and {r['state']['installed']}")
+
+r = run('removed-kernel-had-the-last-install', {'status': REMOVED_NVIDIA}, registered={NEW: None},
+        installed={RUNNING: NEW, OTHER: NEW, REMOVED: OLD})
+check(r, r['exit'] == 0 and OLD not in r['state']['added'] and r['sources'] == [f'nvpcf-hook-{NEW}'],
+      f"removes the source of {OLD}, which DKMS deleted with the removed kernel's install, got status {r['exit']}, {r['state']['added']} and {r['sources']}")
+check(r, 'installed only for removed kernels' in r['out'], 'says why it removes that source')
+
+r = run('removed-kernel-remove-fails', {'status': REMOVED_NVIDIA, 'remove_fails_for': [REMOVED]},
+        installed={RUNNING: OLD, OTHER: OLD, REMOVED: OLD})
+check(r, r['exit'] == 1 and f'{REMOVED}: removing the install of nvpcf-hook/{OLD} for this removed kernel' in r['out'],
+      f"exits with status 1 and names the failed removal, got status {r['exit']}")
+check(r, r['state']['installed'] == {RUNNING: NEW, OTHER: NEW, REMOVED: OLD} and OLD in r['state']['added']
+      and f'nvpcf-hook-{OLD}' in r['sources'],
+      f"keeps {OLD}, which the removed kernel still has installed, got {r['state']['installed']} and {r['state']['added']}")
+
+r = run('kernel-with-headers-only', {}, headers=(RUNNING, OTHER, THIRD), without_modules=(THIRD,),
+        installed={RUNNING: OLD, OTHER: OLD, THIRD: OLD})
+check(r, r['exit'] == 0 and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW, THIRD: NEW},
+      f"installs the new version for a kernel with headers but without modules of its own, got {r['state']['installed']}")
+
+r = run('running-kernel-without-modules', {}, headers=(OTHER,), without_modules=(RUNNING,))
+check(r, r['exit'] == 1 and 'the headers of the running kernel' in r['out'] and r['changing'] == [],
+      f"stops when the running kernel lacks headers, also without modules of its own, got status {r['exit']} and {r['changing']}")
+
+r = run('running-kernel-installed-without-headers-or-modules', {}, headers=(OTHER,), without_modules=(RUNNING,),
+        registered={NEW: None}, installed={RUNNING: NEW, OTHER: NEW})
+check(r, r['exit'] == 0 and r['state']['installed'] == {RUNNING: NEW, OTHER: NEW}
+      and not any(a[:1] == ['remove'] for a in r['dkms_args']),
+      f"never counts the running kernel as removed, and keeps its checked install, got status {r['exit']}, "
+      f"{r['state']['installed']} and {r['dkms_args']}")
 
 r = run('installed-kernel-without-headers', {}, headers=(RUNNING,), registered={NEW: None},
         installed={RUNNING: OLD, OTHER: NEW})

@@ -9,19 +9,20 @@
 # The tag of the same version in NVIDIA's open-gpu-kernel-modules repository
 # on GitHub holds the source of that object. This script builds the object
 # from the tag with the patches, puts it in place of Ubuntu's copy (a dpkg
-# diversion keeps Ubuntu's copy as nv-kernel.o_binary.ubuntu), and rebuilds
-# the DKMS modules. The new modules load at the next boot, or now with
-# swap.sh.
+# diversion keeps Ubuntu's copy as nv-kernel.o_binary.ubuntu), rebuilds the
+# DKMS modules and updates each rebuilt kernel's initramfs, which can hold a
+# copy of the modules. The new modules load at the next boot.
 #
 # usage (as root): build.sh [version]
 #   version defaults to the newest nvidia version DKMS lists.
 #
 # build.sh rebuilds the modules for every kernel DKMS lists for this driver
-# version, plus the running kernel, which is the one swap.sh loads them
-# into. It works out these kernels first, and stops before it diverts and
-# replaces the object if dkms status fails or the running kernel's headers
-# are missing. When another kernel's headers are missing, it skips that
-# kernel and exits 1 at the end.
+# version, plus the running kernel. It works out these kernels first, and
+# stops before it diverts and replaces the object if dkms status fails or the
+# running kernel's headers are missing. When another kernel's headers are
+# missing, it skips that kernel and exits 1 at the end. A kernel that also
+# lacks modules of its own was removed, and build.sh leaves it out. WRITEUP.md
+# explains both rules and the initramfs update.
 set -eu
 usage() { echo "usage: build.sh [version]" >&2; exit 2; }
 [ $# -le 1 ] || usage
@@ -43,13 +44,23 @@ obj=$src/nvidia/nv-kernel.o_binary
 running=$(uname -r)
 ver_re=${ver//./\\.}
 mapfile -t kernels < <({ printf '%s\n' "$status" | sed -nE "s#^nvidia/$ver_re, ([^,]+),.*#\1#p"; echo "$running"; } | sort -u)
-targets=() skipped=()
+targets=() skipped=() removed=()
 for k in "${kernels[@]}"; do
-    if [ -d "/lib/modules/$k/build" ]; then targets+=("$k"); else skipped+=("$k"); fi
+    if [ -d "/lib/modules/$k/build" ]; then
+        targets+=("$k")
+    elif [ "$k" != "$running" ] && [ ! -d "/lib/modules/$k/kernel" ]; then
+        # Only the removal of a kernel image runs DKMS's /etc/kernel/prerm.d/dkms,
+        # so DKMS keeps listing a kernel whose headers went after its image.
+        removed+=("$k")
+    else
+        skipped+=("$k")
+    fi
 done
 [ -d "/lib/modules/$running/build" ] || { echo "the headers of the running kernel $running are missing"; exit 1; }
 echo "== target kernels: ${targets[*]}"
 [ ${#skipped[@]} -eq 0 ] || echo "== skipping kernels whose headers are missing: ${skipped[*]}"
+[ ${#removed[@]} -eq 0 ] ||
+    echo "== leaving out removed kernels, which DKMS still lists but which have neither headers nor modules in /lib/modules/<kernel>/kernel: ${removed[*]}"
 
 work=$(mktemp -d "/tmp/nvidia-nvpcf-$ver-XXXX")
 trap 'rm -rf "$work"' EXIT
@@ -95,9 +106,31 @@ for k in "${targets[@]}"; do
     else
         echo "   $ko lacks the patch"; exit 1
     fi
+    # The initramfs can hold its own copy of the nvidia modules, which the
+    # kernel loads before it mounts the root filesystem, and dkms install does
+    # not rebuild it. update-initramfs writes a new file and renames it over the
+    # old one, and exits 0 without writing when /boot is read-only or updates
+    # are turned off.
+    initrd=/boot/initrd.img-$k
+    if [ -e "$initrd" ]; then
+        before=$(stat -c '%i %Y' "$initrd")
+        if ! update-initramfs -u -k "$k" > "$work/initramfs-$k.log" 2>&1; then
+            tail -20 "$work/initramfs-$k.log"
+            echo "   update-initramfs failed for $k, so $initrd keeps the previous nvidia modules, which the next boot of $k loads"
+            exit 1
+        fi
+        if [ "$(stat -c '%i %Y' "$initrd")" = "$before" ]; then
+            tail -20 "$work/initramfs-$k.log"
+            echo "   update-initramfs did not write a new $initrd, so it keeps the previous nvidia modules, which the next boot of $k loads"
+            exit 1
+        fi
+        echo "   updated $initrd"
+    else
+        echo "   $k does not have an initramfs at $initrd"
+    fi
 done
 if [ ${#skipped[@]} -gt 0 ]; then
     echo "== these kernels were not rebuilt because their headers are missing: ${skipped[*]}"
     exit 1
 fi
-echo "== done; the patched modules load at the next boot, or now with $here/swap.sh"
+echo "== done; the patched modules load at the next boot"

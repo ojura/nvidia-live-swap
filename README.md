@@ -57,7 +57,10 @@ Run the scripts from the repository directory.
 - `sudo ./build.sh [version]` builds the patched driver for the installed
   kernels. Without a version, it builds the newest NVIDIA driver version that
   DKMS lists. DKMS is the system that rebuilds drivers for each installed
-  kernel. The patched driver loads at the next boot.
+  kernel. `build.sh` also updates each of these kernels' initramfs, the image
+  that the kernel runs before it mounts the root filesystem, because that
+  image can hold its own copy of the driver. The patched driver loads at the
+  next boot.
 - `sudo ./swap.sh --check` lists the programs that have the NVIDIA GPU open, and
   says whether a swap can go ahead now. It only reads the state of the system.
 - `sudo ./swap.sh` unloads the NVIDIA kernel modules and loads the modules
@@ -269,13 +272,14 @@ message again.
 
 A kernel update keeps the fix. DKMS builds the new kernel's modules from
 `/usr/src/nvidia-<version>`, which has the patched core as long as the dpkg
-diversion is in place.
+diversion is in place. The kernel package builds the new kernel's initramfs
+after DKMS has built the modules, so the initramfs gets the patched copies.
 
 ## Switching from build.sh to nvpcf_hook
 
 1. Run `sudo ./install-hook.sh`.
-2. Put Ubuntu's driver core back, and rebuild the driver for each kernel, with
-   the commands in [Restoring Ubuntu's driver
+2. Put Ubuntu's driver core back, and rebuild the driver and the initramfs for
+   each kernel, with the commands in [Restoring Ubuntu's driver
    core](#restoring-ubuntus-driver-core).
 3. Reboot. Ubuntu's unchanged driver loads, and `nvpcf-hook.service` checks it
    and loads the hook.
@@ -301,7 +305,10 @@ loaded.
    closed it.
 3. The package installation builds the new version through DKMS only for the
    running kernel. For each other kernel that should keep an NVIDIA driver, run
-   `sudo dkms install -m nvidia -v <version> -k <kernel>`.
+   `sudo dkms install -m nvidia -v <version> -k <kernel>`. Then run
+   `sudo update-initramfs -u -k <kernel>` for each of these kernels and for the
+   running kernel, if `/boot/initrd.img-<kernel>` exists, so that each
+   initramfs holds the new version's modules.
 4. With `build.sh`, run `sudo ./build.sh <version>`. With nvpcf_hook, skip this
    step.
 5. Reboot.
@@ -327,13 +334,18 @@ removes its files cleanly. Run these two commands as root:
     dpkg-divert --rename --remove /usr/src/nvidia-<version>/nvidia/nv-kernel.o_binary
 
 To remove the fix from a driver version, run the same two commands. Then run
-these two commands as root for each kernel:
+these commands as root for each kernel:
 
     dkms build -m nvidia -v <version> -k <kernel> --force
     dkms install -m nvidia -v <version> -k <kernel> --force
+    update-initramfs -u -k <kernel>
 
 Without `--force`, `dkms build` skips a kernel whose modules are already built.
-The modules without the fix load at the next boot.
+Leave out `update-initramfs` for a kernel that does not have
+`/boot/initrd.img-<kernel>`. The initramfs can hold its own copy of the nvidia
+modules, which the kernel loads before it mounts the root filesystem, so
+without the update the next boot still loads the modules with the fix. After
+these commands, the next boot loads the modules without the fix.
 
 ## Technical details
 

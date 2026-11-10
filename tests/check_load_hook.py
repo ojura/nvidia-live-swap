@@ -256,6 +256,8 @@ check(r, r['cache'] == [], f"removes the partial download from the cache, got {r
 r = run('no-matching-file', disk_id=OTHER)
 check(r, r['exit'] == 1 and 'cannot find an installed nvidia module file with the loaded build ID' in r['out'],
       f"exits with status 1 when neither candidate file matches the loaded build ID, got status {r['exit']}")
+check(r, f'update-initramfs -u -k {RUNNING} and a reboot' in r['out'],
+      'names the initramfs update for the running kernel, since an older copy in the initramfs is one cause')
 check(r, r['checker'] == [] and HOOK_LOAD not in r['modprobe'], 'does not check a different build or load the hook')
 
 r = run('dkms-copy-matches', disk_id=OTHER, dkms_id=LOADED)

@@ -8,12 +8,14 @@
 # The script registers the hook's source with DKMS as the version in
 # hook/dkms.conf, builds and installs it for every kernel that DKMS lists for
 # the NVIDIA driver or for nvpcf-hook and for the running kernel, and checks
-# the module that modprobe finds for each. It installs the files that lib.sh
-# lists in HOOK_TOOLS in /usr/local/lib/nvpcf-hook, enables
-# nvpcf-hook.service, which loads the hook at boot, and downloads NVIDIA's
-# source archive for each NVIDIA version that DKMS lists. It does not load the
-# hook. WRITEUP.md describes the rules for versions, source directories,
-# failed installs and old versions, and the exit statuses.
+# the module that modprobe finds for each. A kernel that DKMS still lists but
+# that was removed gets no build, and its leftover nvpcf-hook install is
+# removed. The script installs the files that lib.sh lists in HOOK_TOOLS in
+# /usr/local/lib/nvpcf-hook, enables nvpcf-hook.service, which loads the hook
+# at boot, and downloads NVIDIA's source archive for each NVIDIA version that
+# DKMS lists. It does not load the hook. WRITEUP.md describes the rules for
+# versions, source directories, kernels, failed installs and old versions, and
+# the exit statuses.
 set -u
 usage() { echo "usage: install-hook.sh [--no-enable]" >&2; exit 2; }
 # The arguments are checked by count and one by one, so that an empty
@@ -148,13 +150,28 @@ declare -A before=()
 while IFS= read -r line; do
     [[ $line =~ ^nvpcf-hook/([^,]+),\ ([^,]+),\ [^:]+:\ installed ]] && before[${BASH_REMATCH[2]}]=${BASH_REMATCH[1]}
 done <<<"$hook_status"
+# A kernel that DKMS lists but that has neither headers nor modules of its own
+# was removed. Only the removal of a kernel image runs DKMS's
+# /etc/kernel/prerm.d/dkms, so DKMS keeps listing what it installed for a
+# kernel whose headers went after its image. The running kernel never counts
+# as removed.
+targets=() removed=()
+for k in "${kernels[@]}"; do
+    if [ "$k" != "$running" ] && [ ! -d "/lib/modules/$k/build" ] && [ ! -d "/lib/modules/$k/kernel" ]; then
+        removed+=("$k")
+    else
+        targets+=("$k")
+    fi
+done
 # Headers are for building. The running kernel needs them unless it has
 # $ver installed already and passes the check, which reads only files.
 if [ ! -d "/lib/modules/$running/build" ]; then
     [ "${before[$running]:-}" = "$ver" ] && installed_is "$ver" "$running" ||
         fail "the headers of the running kernel $running are missing, and it does not have nvpcf-hook/$ver installed and checked"
 fi
-echo "== nvpcf-hook/$ver for kernels: ${kernels[*]}"
+echo "== nvpcf-hook/$ver for kernels: ${targets[*]}"
+[ ${#removed[@]} -eq 0 ] ||
+    echo "== leaving out removed kernels, which DKMS still lists but which have neither headers nor modules in /lib/modules/<kernel>/kernel: ${removed[*]}"
 
 # Another registered version that ranks equal to $ver or above it could be the
 # one that DKMS builds for the next kernel.
@@ -192,7 +209,7 @@ else
         fail "dkms add nvpcf-hook/$ver failed, before any module was built or installed. $src keeps hook/'s source, and the next run registers it while it still matches"
 fi
 
-for k in "${kernels[@]}"; do
+for k in "${targets[@]}"; do
     prev=${before[$k]:-}
     # The check reads the installed file and DKMS's build, so a kernel that
     # passes it does not need headers.
@@ -234,6 +251,24 @@ for k in "${kernels[@]}"; do
     fi
 done
 
+# Remove nvpcf-hook's install for each removed kernel, as /etc/kernel/prerm.d/dkms
+# does when a kernel image is removed, so that a version installed there does
+# not count as installed. The nvidia entries for those kernels stay.
+cleared=()
+for k in "${removed[@]}"; do
+    while IFS= read -r line; do
+        [[ $line =~ ^nvpcf-hook/([^,]+),\ ([^,]+),\ [^:]+:\ installed ]] && [ "${BASH_REMATCH[2]}" = "$k" ] || continue
+        v=${BASH_REMATCH[1]}
+        [[ $v =~ ^[0-9A-Za-z.+~-]+$ ]] || { failed+=("$k: nvpcf-hook/$v not removed, unexpected version"); continue; }
+        echo "== removing the install of nvpcf-hook/$v for the removed kernel $k"
+        if dkms remove -m nvpcf-hook -v "$v" -k "$k"; then
+            cleared+=("$v")
+        else
+            failed+=("$k: removing the install of nvpcf-hook/$v for this removed kernel")
+        fi
+    done <<<"$hook_status"
+done
+
 # Remove older versions only after every kernel in this run has $ver installed
 # and checked. After a failed build, install or check, or a kernel skipped for
 # missing headers, keep them, so that dkms install can still put an older
@@ -241,6 +276,14 @@ done
 # check above made every other registered version rank below $ver.
 hook_status=$(dkms status nvpcf-hook) || fail "dkms status nvpcf-hook failed after the install"
 mapfile -t old < <(sed -nE 's#^nvpcf-hook/([^,:]+)[,:].*#\1#p' <<<"$hook_status" | grep -vxF "$ver" | sort -u)
+# dkms remove -k deletes a version from the DKMS tree when no other kernel has
+# a build of it, and leaves its source. A rollback installs an older version
+# from DKMS's build of it, and the last build of that version is gone.
+for v in "${cleared[@]}"; do
+    [ "$v" != "$ver" ] && ! contains "$v" "${old[@]}" || continue
+    echo "== DKMS deleted nvpcf-hook/$v, which was installed only for removed kernels; removing its source"
+    remove_source "/usr/src/nvpcf-hook-$v"
+done
 if [ ${#failed[@]} -gt 0 ] || [ ${#skipped[@]} -gt 0 ]; then
     [ ${#old[@]} -eq 0 ] ||
         echo "== keeping ${old[*]/#/nvpcf-hook/} until every kernel, including the skipped ones, has nvpcf-hook/$ver"

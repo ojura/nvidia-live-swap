@@ -227,7 +227,7 @@ for f in "$(modinfo -n nvidia 2>/dev/null)" /var/lib/dkms/nvidia/"$loaded_ver"/"
         break
     fi
 done
-[ -n "$ko" ] || fail "cannot find an installed nvidia module file with the loaded build ID $id, so the loaded driver cannot be checked"
+[ -n "$ko" ] || fail "cannot find an installed nvidia module file with the loaded build ID $id, so the loaded driver cannot be checked. When the initramfs loads nvidia, its copy can be older than the installed files; sudo update-initramfs -u -k $(uname -r) and a reboot load the installed module"
 ver=$(copy_version "$ko")
 [ "$ver" = "$loaded_ver" ] ||
     fail "the module file with the loaded build ID reports version '$ver', but the loaded nvidia reports $loaded_ver"
