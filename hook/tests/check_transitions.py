@@ -105,6 +105,21 @@ typedef void *acpi_handle;
 #define GFP_KERNEL 0
 #define kmalloc(size, flags) malloc(size)
 #define kfree(ptr) free(ptr)
+#define NVPCF_NOTIFY_INDEX 177
+#define KPROBE_FLAG_DISABLED 2
+struct kretprobe_instance;
+struct pt_regs { unsigned long args[2]; };
+#define regs_get_kernel_argument(regs, n) ((regs)->args[n])
+struct kprobe { void *addr; const char *symbol_name; unsigned int flags; };
+struct kretprobe {
+    struct kprobe kp;
+    int (*handler)(struct kretprobe_instance *, struct pt_regs *);
+    int (*entry_handler)(struct kretprobe_instance *, struct pt_regs *);
+    int maxactive, nmissed;
+};
+/* What the kernel holds for the registered probe, and whether it is armed. */
+static struct kretprobe *kernel_probe;
+static bool kernel_probe_armed;
 static struct module helper, old_module, new_module;
 static struct driver driver;
 static struct pci_dev pci, root_port;
@@ -131,7 +146,8 @@ static bool joined_work, drain_complete, expect_old_symbols;
 static struct {
     int lock, action, delivery, guard_ops, event_ops;
     int starting_calls, opening_calls, shutdown_calls, redirected;
-    struct { struct { void *addr; } kp; } observer;
+    struct kretprobe observer;
+    u64 observer_missed_total;
     struct work_struct replay_work, resume_work;
     struct nh_state state;
     u64 scope_epoch;
@@ -257,7 +273,6 @@ static int stop_guards(void)
     if (!guard_error) h.guards_registered = false;
     return guard_error;
 }
-static void stop_observer(void) { h.observer_registered = false; }
 static void release_active(bool gone)
 { (void)gone; if (h.power_hold) { assert(linux_refs > 0); linux_refs--; h.power_hold = false; } }
 static int hold_active(void)
@@ -278,6 +293,41 @@ static void pm_runtime_put(struct device *dev)
 { (void)dev; assert(linux_refs > 0); linux_refs--; }
 static bool pci_device_is_present(struct pci_dev *dev)
 { assert(dev == &pci); endpoint_config_reads++; return present && linux_active; }
+/* register_kretprobe and unregister_kretprobe as Ubuntu's 7.0.0-42 kernel
+ * implements them (kernel/kprobes.c:1518-1523, 1683-1754, 1775-1842 and
+ * 2264-2333; 7.0.0-38 and 6.8.0-149 have the same rules). A probe with both
+ * an address and a symbol name is refused. Registration keeps
+ * KPROBE_FLAG_DISABLED from the caller's struct, clears the other flags,
+ * resolves the address, and arms the probe only if that flag is clear.
+ * Unregistration sets the flag and leaves the resolved address in the struct.
+ */
+static int register_kretprobe(struct kretprobe *probe)
+{
+    assert(!kernel_probe && probe->handler && probe->entry_handler && probe->maxactive > 0);
+    if (!probe->kp.addr == !probe->kp.symbol_name) return -EINVAL;
+    probe->kp.flags &= KPROBE_FLAG_DISABLED;
+    probe->kp.addr = &kernel_probe;
+    probe->nmissed = 0;
+    kernel_probe = probe;
+    kernel_probe_armed = !(probe->kp.flags & KPROBE_FLAG_DISABLED);
+    return 0;
+}
+static void unregister_kretprobe(struct kretprobe *probe)
+{
+    assert(kernel_probe == probe);
+    probe->kp.flags |= KPROBE_FLAG_DISABLED;
+    kernel_probe = NULL;
+    kernel_probe_armed = false;
+}
+/* NVIDIA's dispatcher runs and returns. Only an armed probe calls the hook's
+ * handlers, which record the dispatch.
+ */
+static void rm_dispatch(unsigned int index)
+{
+    struct pt_regs regs = { { 0, index } };
+    if (kernel_probe && kernel_probe_armed && !kernel_probe->entry_handler(NULL, &regs))
+        kernel_probe->handler(NULL, &regs);
+}
 static int block_fine(const unsigned char *uuid, void *stack)
 {
     (void)uuid; (void)stack;
@@ -286,7 +336,7 @@ static int block_fine(const unsigned char *uuid, void *stack)
     if (block_error) return block_error;
     native_refs++;
     internal_in_use = true;
-    if (power_emits_event) h.dispatch_seen = true;
+    if (power_emits_event) rm_dispatch(NVPCF_NOTIFY_INDEX);
     return 0;
 }
 static int unblock_fine(const unsigned char *uuid, void *stack)
@@ -304,7 +354,7 @@ static void original_callback(void *handle, unsigned int event, void *data)
     (void)handle; (void)data; assert(event == NVPCF_CHANGE && linux_active);
     if ((patched && !internal_in_use) || tls_failure) return;
     actual_dispatches++;
-    h.dispatch_seen = true;
+    rm_dispatch(NVPCF_NOTIFY_INDEX);
 }
 static void owner_put(const unsigned char *uuid, void *stack)
 { (void)uuid; (void)stack; assert(!native_refs && !h.fine_held && linux_refs > 0); owner_puts++; }
@@ -317,7 +367,6 @@ static void cancel_work_sync(struct work_struct *work)
 { (void)work; assert_old_symbols(); work_joins++; if (graces & 1u) { assert(wait_mask == 3); joined_work = true; drains++; } }
 static void schedule_work(struct work_struct *work) { (void)work; resume_queued++; }
 static int check_configuration(void) { config_checks++; return config_error; }
-static int register_kretprobe(void *probe) { (void)probe; return 0; }
 static int prepare_open_locked(void);
 static int quiesce_flush(void);
 static void unpin_nvidia(void) { h.nvidia_ref = false; }
@@ -381,6 +430,10 @@ static int register_ftrace_function(void *ops) { (void)ops; return 0; }
 '''
 
 FUNCTIONS = (
+    ('int', 'observer_entry', 'struct kretprobe_instance *instance, struct pt_regs *regs'),
+    ('int', 'observer_return', 'struct kretprobe_instance *instance, struct pt_regs *regs'),
+    ('int', 'start_observer', 'void'),
+    ('void', 'stop_observer', 'void'),
     ('int', 'verify_nvidia_build_id', 'void'),
     ('int', 'acquire_fine_reference', 'void'),
     ('int', 'release_fine_reference', 'void'),
@@ -425,6 +478,8 @@ TESTS = r'''
 static void reset(void)
 {
     memset(&h, 0, sizeof(h));
+    kernel_probe = NULL;
+    kernel_probe_armed = false;
     queued = capture_error = guard_error = rollback_error = drains = self_puts = 0;
     old_calls = new_calls = resolutions = 0;
     graces = wait_mask = invalidations = within_calls = redirects = 0;
@@ -496,7 +551,8 @@ static void test_disabled_handlers_without_module(void)
 static void test_actual_restore(void)
 {
     reset();
-    h.owner.held = h.observer_registered = h.guards_registered = h.legacy_safe = true;
+    h.owner.held = h.guards_registered = h.legacy_safe = true;
+    assert(!start_observer() && h.observer_registered);
     h.accepting = true;
     h.phase = QUIESCED;
     h.fine_verified = false;
@@ -589,7 +645,8 @@ static void prepare_delivery(bool use_patch)
     reset();
     patched = use_patch;
     h.owner.held = h.owner.stack_ready = h.nvidia_ref = true;
-    h.observer_registered = h.guards_registered = h.legacy_safe = true;
+    h.guards_registered = h.legacy_safe = true;
+    assert(!start_observer() && h.observer_registered && kernel_probe_armed);
     h.fine_verified = h.accepting = h.event_registered = h.replay.enabled = true;
     h.phase = ACTIVE;
     h.original = original_callback;
@@ -716,7 +773,8 @@ static void test_actual_build_id_admission(void)
      */
     h.owner.held = h.owner.stack_ready = true;
     h.phase = WAITING;
-    h.accepting = h.event_registered = h.observer_registered = h.legacy_safe = true;
+    h.accepting = h.event_registered = h.legacy_safe = true;
+    assert(!start_observer() && h.observer_registered);
     h.fine_verified = true;
     note_bytes[16] = 0xbb;
     {
@@ -823,6 +881,17 @@ static void test_actual_scope_resume(void)
         resume_work(NULL);
         assert(h.phase == ACTIVE && h.replay.enabled && h.owner.held);
         assert(!h.target_unavailable && !h.block_initialization && !linux_refs);
+        /* The observer was removed with the device reference and registered
+         * again. A notification captured now is delivered and observed.
+         */
+        {
+            int previous = actual_dispatches;
+            h.original = original_callback;
+            h.data = &token;
+            nh_receive(&h.state, false);
+            assert(!deliver_one(false) && !pending());
+            assert(actual_dispatches == previous + 1 && !h.state.failures);
+        }
     }
     /* A loss arriving after a successful scope check cannot be erased by
      * publishing the stale admission result, or by capture activation.
@@ -841,6 +910,45 @@ static void test_actual_scope_resume(void)
         h.starting_calls = 1;
         assert(guarded_start(NULL, NULL) == -EBUSY && !ordinary_starts);
     }
+}
+/* detach and resume, three times. Each detach unregisters the observer, and the
+ * kernel leaves KPROBE_FLAG_DISABLED in its struct. Each resume has to register
+ * a probe that is armed, or the next delivery is not observed.
+ */
+static void test_actual_observer_reattach(void)
+{
+    int round;
+    prepare_delivery(true);
+    h.nvidia_module = &new_module;
+    h.owner_ops.get = new_get;
+    h.self_ref = true;
+    gpu_info_text = "GPU UUID: GPU-00112233-4455-6677-8899-aabbccddeeff\n";
+    for (round = 0; round < 3; ++round) {
+        assert(kernel_probe == &h.observer && kernel_probe_armed);
+        assert(!(h.observer.kp.flags & KPROBE_FLAG_DISABLED));
+        assert(!preflight() && !pending());
+        assert(actual_dispatches == 2 * round + 1 && h.state.batches == (u64)(2 * round + 1));
+        nh_receive(&h.state, true);
+        assert(!quiesce_flush() && !h.owner.held && !h.observer_registered);
+        assert(!kernel_probe && (h.observer.kp.flags & KPROBE_FLAG_DISABLED) && h.observer.kp.addr);
+        assert(actual_dispatches == 2 * round + 2 && !pending());
+        h.phase = GUARD_ONLY;
+        assert(request_resume() == 1 && h.phase == STARTING);
+        resume_work(NULL);
+        assert(h.phase == ACTIVE && h.replay.enabled && h.owner.held && h.observer_registered);
+        h.original = original_callback;
+        h.data = &token;
+        nh_receive(&h.state, false);
+    }
+    assert(kernel_probe == &h.observer && kernel_probe_armed);
+    assert(!deliver_one(false) && !pending());
+    assert(actual_dispatches == 7 && h.state.batches == 7 && !h.state.failures && !linux_refs);
+    /* The kernel also refuses a struct that still has the resolved address. */
+    stop_observer();
+    assert(h.observer.kp.addr && h.observer.kp.symbol_name);
+    assert(register_kretprobe(&h.observer) == -EINVAL && !kernel_probe);
+    assert(!start_observer() && kernel_probe_armed);
+    puts("PASS: after each detach and resume the observer is registered armed, and the next delivery is observed");
 }
 static void test_actual_internal_classification(void)
 {
@@ -930,6 +1038,7 @@ int main(void)
     test_actual_build_id_admission();
     test_actual_waiting_for_uuid();
     test_actual_scope_resume();
+    test_actual_observer_reattach();
     test_actual_internal_classification();
     puts("PASS: target loss blocks resume; an eligible uninitialized GPU waits; recovery rechecks concurrent loss");
     puts("PASS: lifecycle functions handle restoration, failed unregistration, driver replacement, power-reference recovery, system PM and build-ID checks");
@@ -937,14 +1046,26 @@ int main(void)
 }
 '''
 
-def declarations(negative=False):
+# Each mutation puts a known defect into one production function. The test
+# built from it has to stop at an assertion.
+MUTATIONS = {
+    # Clearing NVIDIA's addresses before the redirected calls have finished.
+    'early-clearing': ('module_notify', 'drain_disabled_redirects();',
+                       '{ invalidate_nvidia_symbols(); drain_disabled_redirects(); }'),
+    # Version 0.1.1: the kretprobe is built once, and only kp.addr is cleared
+    # before a later registration, so KPROBE_FLAG_DISABLED stays set.
+    'stale-observer': ('start_observer', 'h.observer = (struct kretprobe){',
+                       'h.observer.kp.addr = NULL;\n\tif (!h.observer.kp.symbol_name)\n\t\th.observer = (struct kretprobe){'),
+}
+
+
+def declarations(mutation=None):
     result = []
     for result_type, name, args in FUNCTIONS:
         original = body(name)
-        if negative and name == 'module_notify':
-            assert original.count('drain_disabled_redirects();') == 1
-            original = original.replace('drain_disabled_redirects();',
-                                        '{ invalidate_nvidia_symbols(); drain_disabled_redirects(); }')
+        if mutation and name == mutation[0]:
+            assert original.count(mutation[1]) == 1, mutation
+            original = original.replace(mutation[1], mutation[2])
         compiled_name = 'invalidate_nvidia_symbols_impl' if name == 'invalidate_nvidia_symbols' else name
         result.append(f'static {result_type} {compiled_name}({args})\n{original}\n')
         if name == 'invalidate_nvidia_symbols':
@@ -968,15 +1089,17 @@ static void invalidate_nvidia_symbols(void)
 
 with tempfile.TemporaryDirectory(prefix='nvpcf-production-transitions-') as tmp:
     root = Path(tmp)
-    for negative in (False, True):
-        source = root / ('negative.c' if negative else 'transitions.c')
-        binary = root / ('negative' if negative else 'transitions')
-        source.write_text(PREFIX + declarations(negative) + TESTS)
+    for label in (None, *MUTATIONS):
+        source = root / f'{label or "transitions"}.c'
+        binary = root / (label or 'transitions')
+        source.write_text(PREFIX + declarations(MUTATIONS.get(label)) + TESTS)
         command = ['cc', '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror',
                    '-Wno-unused-parameter', '-Wno-cast-function-type', '-I', str(ROOT)]
-        if negative:
+        if label:
             command.append('-DNEGATIVE_ORDER_TEST')
         subprocess.run(command + [str(source), '-o', str(binary)], check=True)
-        execution = subprocess.run([str(binary)], check=False)
-        assert execution.returncode == (77 if negative else 0), execution.returncode
+        execution = subprocess.run([str(binary)], check=False,
+                                   stdout=subprocess.DEVNULL if label else None)
+        assert execution.returncode == (77 if label else 0), (label, execution.returncode)
     print('PASS: redirected calls finish before NVIDIA pointers are cleared; the test rejects early clearing')
+    print('PASS: the test rejects an observer that is registered again with the flags of its last unregistration')

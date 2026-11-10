@@ -37,8 +37,9 @@
 #error "nvpcf_hook requires x86-64, ftrace registers, kretprobes and system PM"
 #endif
 
-#if defined(CONFIG_X86_KERNEL_IBT) || defined(CONFIG_CFI_CLANG)
-#error "nvpcf_hook private function-pointer calls require kernel IBT and Clang CFI to be disabled"
+/* The kernel's CFI option is CONFIG_CFI in 7.0 and CONFIG_CFI_CLANG in 6.8. */
+#if defined(CONFIG_X86_KERNEL_IBT) || defined(CONFIG_CFI_CLANG) || defined(CONFIG_CFI)
+#error "nvpcf_hook private function-pointer calls require kernel IBT and kernel CFI to be disabled"
 #endif
 
 #define NVPCF_CHANGE 0xc0
@@ -866,6 +867,30 @@ static int put_gpu(void)
 	return 0;
 }
 
+/* Build the kretprobe again before every registration. unregister_kretprobe
+ * leaves two things in it that the next registration would use: the resolved
+ * address in kp.addr, which register_kretprobe refuses beside symbol_name, and
+ * KPROBE_FLAG_DISABLED in kp.flags, which register_kprobe keeps, so that the
+ * probe is registered without being armed and never sees a dispatch.
+ */
+static int start_observer(void)
+{
+	int ret;
+
+	if (h.observer_registered)
+		return 0;
+	h.observer = (struct kretprobe){
+		.kp.symbol_name = "nvidia:gpuNotifySubDeviceEvent_IMPL",
+		.entry_handler = observer_entry,
+		.handler = observer_return,
+		.maxactive = 64,
+	};
+	ret = register_kretprobe(&h.observer);
+	if (!ret)
+		h.observer_registered = true;
+	return ret;
+}
+
 static void stop_observer(void)
 {
 	if (h.observer_registered) {
@@ -1359,14 +1384,11 @@ static int attach_locked(bool activate)
 	if (ret)
 		return ret;
 	if (!h.observer_registered) {
-		/* unregister_kretprobe leaves the resolved address in kp.addr. */
-		h.observer.kp.addr = NULL;
-		ret = register_kretprobe(&h.observer);
+		ret = start_observer();
 		if (ret) {
 			pr_err("nvpcf_hook: RM dispatch observer registration failed: %d\n", ret);
 			return ret;
 		}
-		h.observer_registered = true;
 		new_observer = true;
 	}
 	if (!h.event_registered) {
@@ -2225,10 +2247,6 @@ static int __init hook_init(void)
 	h.guard_ops.func = guard_hook;
 	h.guard_ops.flags = h.event_ops.flags;
 	h.module_nb.notifier_call = module_notify;
-	h.observer.kp.symbol_name = "nvidia:gpuNotifySubDeviceEvent_IMPL";
-	h.observer.entry_handler = observer_entry;
-	h.observer.handler = observer_return;
-	h.observer.maxactive = 64;
 	h.pm_nb.notifier_call = pm_notify;
 	h.pm_nb.priority = INT_MAX;
 	h.bus_nb.notifier_call = bus_notify;
@@ -2329,6 +2347,6 @@ static void __exit hook_exit(void)
 module_init(hook_init);
 module_exit(hook_exit);
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.1.1");
+MODULE_VERSION("0.1.2");
 MODULE_DESCRIPTION("Defer NVPCF changes with a kernel-client reference and explicit detach");
 MODULE_SOFTDEP("pre: nvidia");

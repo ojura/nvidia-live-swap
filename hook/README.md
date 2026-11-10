@@ -38,8 +38,10 @@ The hook attaches only when these conditions hold:
   handles.
 - The kernel supports x86-64, ftrace with register saving and instruction-pointer
   modification, kretprobes, system PM, tasks RCU and the required exported
-  runtime-PM APIs and tracepoints. Kernel IBT and Clang CFI must be disabled; the
-  private function-pointer calls have not been ported to those configurations.
+  runtime-PM APIs and tracepoints. Kernel IBT and kernel CFI must be disabled;
+  the private function-pointer calls have not been ported to those
+  configurations. The build stops when `CONFIG_X86_KERNEL_IBT`,
+  `CONFIG_CFI_CLANG` (6.8) or `CONFIG_CFI` (7.0) is set.
 - NVIDIA retains the private function declarations and call boundaries described
   under [NVIDIA interfaces and compatibility checks](#nvidia-interfaces-and-compatibility-checks).
   Symbol resolution does not verify a C prototype.
@@ -394,8 +396,8 @@ runs NVIDIA's checked `single_release` wrapper.
 with `tests/expected_procfs_wrappers.h`. It checks the show-function declarations
 and requires the linked show and wrapper symbols and calls to `single_open`,
 `seq_read` and `single_release`. The three kernels listed in the build commands
-below export `seq_read_iter` with its matching iterator API. Ubuntu kernel
-commit `102c85de1d6726aa44823e8f9740eea74216c7a5`, `fs/read_write.c:508-550` and
+below export `seq_read_iter`. Ubuntu kernel commit
+`102c85de1d6726aa44823e8f9740eea74216c7a5`, `fs/read_write.c:508-550` and
 `fs/proc/inode.c:554-568,658-667`, defines the legacy/iterator distinction.
 
 ## Dispatch completion and replay
@@ -417,6 +419,18 @@ filtering excludes subscribers or listeners are absent. The counter records
 completion of the dispatch loop; it does not confirm receipt by a subscriber.
 If the probe misses the return, requests remain pending and a retry can deliver
 them twice.
+
+The hook registers the kretprobe at attachment and unregisters it before it
+releases the device reference, so `detach` followed by `resume` registers it
+again. It builds the `struct kretprobe` again before every registration. The
+kernel leaves two things in a struct that it unregistered: the resolved address
+in `kp.addr`, which `register_kretprobe` refuses beside a symbol name, and
+`KPROBE_FLAG_DISABLED` in `kp.flags`. `register_kprobe` keeps that flag and
+arms a probe only when it is clear, so a struct that is registered again as it
+was would be registered without being armed. The hook would then see no
+dispatch return, count every delivery as failed and keep the requests pending
+(Ubuntu's 7.0.0-42 `kernel/kprobes.c:1707`, `1738` and `1809`; 7.0.0-38 and
+6.8.0-149 have the same rules). Version 0.1.1 had this defect.
 
 A replay trigger requires `rpm_resume` entry from `SUSPENDED`, followed by an
 `rpm_return_int` event that reports `ACTIVE` under the PM lock. Idle and put
@@ -445,8 +459,9 @@ The device-reference, stack-allocation and guard declarations and their source
 implementations were checked in 595.99.02, 610.57.04, 615.71.09 and 615.78.08.
 The dispatcher body is identical in those tags; NVPCF is 177 and MAXCOUNT is
 199, 200, 202 and 202. Stock-core ELF inspection used Ubuntu's 615.71.09
-`nv-kernel.o_binary.ubuntu`. Linked NVIDIA modules for the three kernels listed
-below retained the required symbols, entry instrumentation and guard calls.
+`nv-kernel.o_binary.ubuntu`. The linked 615.71.09 modules for the three kernels
+listed under [Building and tests](#building-and-tests) have the required
+symbols, entry instrumentation and guard calls.
 
 The source locations below refer to NVIDIA 615.71.09 unless stated otherwise:
 
@@ -558,9 +573,9 @@ From the repository root:
 
 ```
 make -C hook check
-make -C hook modules KDIR=/usr/src/linux-headers-6.8.0-147-generic
-make -C hook modules KDIR=/usr/src/linux-headers-7.0.0-34-generic
+make -C hook modules KDIR=/usr/src/linux-headers-6.8.0-149-generic
 make -C hook modules KDIR=/usr/src/linux-headers-7.0.0-38-generic
+make -C hook modules KDIR=/usr/src/linux-headers-7.0.0-42-generic
 python3 -I -B hook/tests/check_nvidia.py --source-tar /path/to/NVIDIA-tag.tar.gz
 python3 -I -B hook/tests/check_nvidia.py --kernel-source /usr/src/nvidia-615.71.09
 python3 -I -B hook/tests/check_nvidia.py --core-object /usr/src/nvidia-615.71.09/nvidia/nv-kernel.o_binary.ubuntu
@@ -618,6 +633,16 @@ and recovery of the temporary NVIDIA FINE reference. PM tests retain the device
 reference through suspend and notifier rollback, and check restoration after a
 failed detach.
 
+The same program registers the observer through a model of the kernel's
+kretprobe rules: a struct with both an address and a symbol name is refused,
+registration keeps `KPROBE_FLAG_DISABLED` and arms the probe only without it,
+and unregistration sets the flag and leaves the address. The mocked NVIDIA
+dispatcher reaches the hook only through an armed probe, which runs the hook's
+own entry and return handlers. One case runs `detach` and `resume` three times
+and requires an observed delivery after each. A version of the hook that
+clears only `kp.addr` before a later registration, as 0.1.1 did, must fail the
+test.
+
 The source checker reads archives without extracting or executing their code.
 It compares the dispatcher's complete C token sequence with
 `tests/expected_dispatcher.c`. Backslash-newline splicing runs before removal of
@@ -634,10 +659,15 @@ notices and missing pahole or vmlinux do not prevent module linking; BTF
 generation is skipped without vmlinux. `dkms.conf` describes how DKMS builds the
 package. These commands do not install DKMS configuration or load modules.
 
-## Tests required before deployment
+## Tests on the GPU
 
 The userspace tests run shared logic and mocked kernel operations. They do not
-load the hook or exercise ACPI, runtime PM or NVIDIA on a GPU.
+load the hook or exercise ACPI, runtime PM or NVIDIA on a GPU. Two defects
+reached a running kernel because a mock assumed more than the kernel does:
+0.1 passed `misc_open`'s `private_data` to `single_open`, and 0.1.1 registered
+its kretprobe again with the flags that the kernel had left in it. The
+control-open test and the observer model now follow the kernel's source for
+those calls. The other mocked kernel calls return fixed results.
 
 The control-open test compiles the production `control_open` body with the
 non-NULL miscdevice pointer that `misc_open` supplies. It checks that the unused
@@ -648,7 +678,37 @@ also keeps DKMS and module version metadata consistent. Kernel references are
 `drivers/char/misc.c:153-163` and `fs/seq_file.c:58-89,573-590` at Ubuntu commit
 `102c85de1d6726aa44823e8f9740eea74216c7a5`.
 
-Before deployment, test both Ubuntu's unpatched driver core and the patched core
-on the GPU. A patched core can hide an interception defect. Verify idle
-behavior, delivery during an external wake, system suspend and rollback, final
-detach and shutdown, and recovery after a failed swap.
+These tests have run on the Legion, all with the patched driver core
+(615.71.09 with PR #1299) and with boot loading disabled:
+
+- 0.1 on kernel 7.0.0-38, loaded on 2026-11-03: the hook attached and reported
+  `active`. Every open of the control device logged a kernel warning, which
+  0.1.1 fixed. The laptop suspended to RAM three times in the following five
+  days, and the hook attached again after each resume.
+- 0.1.1 on kernel 7.0.0-42, loaded on 2026-11-09:
+  - Install with `--no-enable` and load: `active`, expected and loaded build
+    IDs equal, and the control device opens without a warning.
+  - A 60-second `trace.sh` with the GPU suspended: nine firmware notifications
+    6.97 seconds apart, each handled in 5 to 15 microseconds. The GPU stayed
+    suspended, and the hook held all nine.
+  - A wake with `tests/check_egl.c`: the GPU was active 2.5 seconds after the
+    program started and suspended again after 33 seconds. The hook delivered
+    the 22 requests it held or received in that time in five batches, with
+    `dispatch_failures` and `observer_missed` at 0.
+  - `detach` left the hook `guard-only` without its device reference, and
+    `resume` brought it back to `active`. Every delivery after that `resume`
+    counted as failed, because the kretprobe was registered without being
+    armed. 0.1.2 fixes that.
+  - The laptop suspended to RAM twice, and the hook attached again after each
+    resume.
+  - UPower started a hybrid sleep at 2% battery, and the kernel wrote the
+    hibernation image with the hook loaded. The later resume from that image
+    failed in the restore kernel, where the hook is not loaded: NVIDIA's
+    driver refused to freeze the GPU there.
+
+These tests have not run: 0.1.2 on the GPU, Ubuntu's unpatched driver core,
+loading at boot through `nvpcf-hook.service`, a reboot or poweroff with the
+hook attached, a resume from hibernation, and recovery after a failed swap,
+which cannot run while `swap.sh` refuses every swap. A patched core can hide an
+interception defect, so the unpatched core has to be tested before the patched
+core is given up.
