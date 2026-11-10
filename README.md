@@ -40,8 +40,10 @@ them on after a wake, and gone through `detach` and `resume` twice. It has not
 been tested with Ubuntu's unchanged driver core, which is the case it is for,
 and not with loading at boot, a reboot or a resume from hibernation.
 [hook/README.md](hook/README.md#tests-on-the-gpu) lists the tests that have
-run. Until the remaining ones pass, install with `--no-enable`, load the hook by
-hand, and keep the patched driver core.
+run. [Switching from build.sh to
+nvpcf_hook](#switching-from-buildsh-to-nvpcf_hook) describes the first boot
+with Ubuntu's core, a check of the hook that runs once after that boot, and how
+to boot without the hook or go back to the patched core.
 
 nvpcf_hook supports only the Legion 7 16IRX9 configuration that
 [hook/README.md](hook/README.md#supported-pci-configuration) specifies: DMI
@@ -94,6 +96,9 @@ Run the scripts from the repository directory.
 Loading nvpcf_hook applies the fix to the running driver without a swap. For a
 live test, run `sudo ./install-hook.sh --no-enable`, then
 `sudo /usr/local/lib/nvpcf-hook/load-hook.sh`, which reports the hook's state.
+`sudo python3 -I -B tests/check_hook_live.py` then checks the hook on the GPU.
+It switches to Balanced for about three minutes, traces the firmware's messages
+with the GPU asleep, wakes the GPU once, and switches back.
 
 `swap.sh` needs gdb, the GNU debugger, which it uses to take the GPU away from
 running programs. It also runs `reapply-layout.py`, which needs Ubuntu's
@@ -283,10 +288,21 @@ after DKMS has built the modules, so the initramfs gets the patched copies.
 2. Put Ubuntu's driver core back, and rebuild the driver and the initramfs for
    each kernel, with the commands in [Restoring Ubuntu's driver
    core](#restoring-ubuntus-driver-core).
-3. Reboot. Ubuntu's unchanged driver loads, and `nvpcf-hook.service` checks it
+3. Run `sudo python3 -I -B tests/check_hook_live.py --at-next-boot`. This
+   installs a systemd unit that runs the check of the hook once after the next
+   boot. When the check ends, it sends the desktop user a notification with the
+   result, and `journalctl -t nvpcf-hook-live-check` shows its output.
+4. Reboot. Ubuntu's unchanged driver loads, and `nvpcf-hook.service` checks it
    and loads the hook.
-4. Run `sudo ./hook/nvpcf-hookctl status`, and check that the state is
-   `active`.
+5. Read the result of the check, or run `sudo ./hook/nvpcf-hookctl status` and
+   check that the state is `active`.
+
+If the boot hangs, boot once without the hook: in the GRUB menu, press `e` on
+the boot entry, add `module_blacklist=nvpcf_hook` to the end of the line that
+starts with `linux`, and press Ctrl-X. The kernel then refuses to load the hook,
+and Ubuntu's driver wakes the GPU every 7 seconds in Balanced. To go back to the
+patched core without the hook, for example after a failed check, run `sudo
+systemctl disable nvpcf-hook.service` and `sudo ./build.sh`, and reboot.
 
 ## Changing the driver version
 

@@ -1159,3 +1159,27 @@ the number of deliveries.
   expected pixel is 64 128 191 255, with one unit of tolerance per channel. The
   test checks only programs started after a swap, because programs started
   before a swap keep the old libraries.
+- `tests/check_hook_live.py` runs as root, with nvpcf_hook loaded on the
+  Legion. It reports the kernel, whether the boot resumed from hibernation,
+  the end of the previous boot's journal and the time between the two boots,
+  the loaded driver core and module, the run of `nvpcf-hook.service` and the
+  boot's NVIDIA events. Then it switches to Balanced, waits until the GPU has
+  been suspended for 15 seconds, and checks a 60-second `trace.sh`: the
+  firmware raised query 0x48, every call of `nv_acpi_nvpcf_event` returned
+  within 1000 microseconds, the GPU stayed suspended, `received_requests` grew
+  by at least the number of queries, and `dispatch_attempts` stayed the same.
+  When the GPU woke during a trace and every call returned within 100
+  milliseconds, something other than the firmware's notifications woke it, and
+  the check traces again, up to three times in all. Then it wakes the GPU with
+  `tests/check_egl.c`, run as the desktop user, and checks that the GPU
+  suspends again within 90 seconds, that `requests_dispatched` grew by at
+  least the `pending_requests` held before the wake, that the error counts are
+  0, and that the kprobe is still armed. At the end it switches the profile
+  back, unless the profile is no longer Balanced. `--at-next-boot` installs
+  `nvpcf-hook-live-check.service`, which runs the check once after the next
+  boot, waits for the desktop user's login before it traces, and sends that
+  user a notification with the result. That run also fails when the loaded
+  core has patch 0001, when the loaded nvidia module differs from the
+  installed one, and when `nvpcf-hook.service` has not run. A run by hand on
+  2026-11-10 with the patched core and hook 0.1.2 passed its 12 criteria in
+  2 minutes 40 seconds.

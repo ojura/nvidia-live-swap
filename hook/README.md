@@ -723,13 +723,22 @@ These tests have run on the Legion, all with the patched driver core
     the end the hook had received 64 requests and delivered 64 in 36 batches,
     with `dispatch_failures` and `observer_missed` at 0, and the kernel log
     held only the hook's three `attached` lines.
+  - `tests/check_hook_live.py`, run by hand: a 60-second trace in balanced
+    with eight notifications, each held in 5 to 8 microseconds while the GPU
+    stayed suspended, and a wake with `tests/check_egl.c`, after which the GPU
+    suspended again 40.9 seconds after it became active. The wake delivered
+    the 12 requests that the hook held, every error count stayed at 0, and all
+    12 criteria passed.
 
 These tests have not run: Ubuntu's unpatched driver core, loading at boot
 through `nvpcf-hook.service`, a system suspend with 0.1.2, a reboot or poweroff
 with the hook attached, a resume from hibernation, and recovery after a failed
 swap, which cannot run while `swap.sh` refuses every swap. A patched core can
 hide an interception defect, so the unpatched core has to be tested before the
-patched core is given up.
+patched core is given up. `tests/check_hook_live.py --at-next-boot` runs the
+check once after the next boot. That run also checks that the unpatched core
+is loaded and that `nvpcf-hook.service` ran, and it reports how the previous
+boot ended.
 
 At a reboot or poweroff, NVIDIA's `nv_pci_shutdown` calls
 `nv_pci_remove_helper(pci_dev, false)`, which returns before it shuts the
