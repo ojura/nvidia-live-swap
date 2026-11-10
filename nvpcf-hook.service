@@ -9,6 +9,11 @@ After=network-online.target
 Type=oneshot
 ExecStart=/usr/local/lib/nvpcf-hook/load-hook.sh
 RemainAfterExit=yes
+# A oneshot unit has no start timeout by default, and multi-user.target waits
+# for this one, so a loader that hangs would hold back multi-user.target and
+# graphical.target, and every unit ordered after them, for good. The loader's
+# longest run is a download, which curl ends after 600 seconds.
+TimeoutStartSec=15min
 
 [Install]
 WantedBy=multi-user.target

@@ -19,15 +19,22 @@ no longer balanced. A criterion prints PASS or FAIL, a fact prints INFO, and
 the check exits with status 1 when a criterion fails. --user names the desktop
 user, by default the owner of the repository.
 
---at-next-boot installs nvpcf-hook-live-check.service, which runs the check
-after the next boot. That run removes the service before it starts checking,
-so that it runs only once. It also requires Ubuntu's unpatched driver core,
-the installed nvidia module and a run of nvpcf-hook.service, which a run
-started by hand only reports. Before it waits for the hook, it waits up to 30
-minutes for the desktop user's graphical session and then one more minute. The
-hook stays waiting until a program initializes the GPU, which at boot can be
-the login, and the login must not wake the GPU during a trace. At the end the
-run sends the desktop user a notification with the result.
+--at-next-boot copies the check, tests/check_egl.c, trace.sh, lib.sh and
+hook/nvpcf-hookctl to /usr/local/lib/nvpcf-hook/live-check, owned by root, and
+installs nvpcf-hook-live-check.service, which runs that copy after the next
+boot. So the run at boot is the code that was scheduled, and root does not run
+files that the desktop user can change. That run disables the service before
+it starts checking, so that a crash or a hang during the check does not repeat
+it at the following boot. When a signal ends the run, for example at a
+shutdown, it enables the service again, so that the check runs at the
+following boot. Otherwise it removes the service and the copy at the end. The
+run also requires Ubuntu's unpatched driver core, the installed nvidia module
+and a run of nvpcf-hook.service, which a run started by hand only reports.
+Before it waits for the hook, it waits up to 30 minutes for the desktop user's
+graphical session and then one more minute. The hook stays waiting until a
+program initializes the GPU, which at boot can be the login, and the login
+must not wake the GPU during a trace. At the end the run sends the desktop
+user a notification with the result.
 journalctl -t nvpcf-hook-live-check shows its output."""
 import argparse
 import glob
@@ -48,6 +55,11 @@ import traceback
 REPO = Path(__file__).resolve().parent.parent
 UNIT = 'nvpcf-hook-live-check.service'
 UNIT_PATH = Path('/etc/systemd/system') / UNIT
+LOG_ID = 'nvpcf-hook-live-check'
+# --at-next-boot copies these files of the repository to LIVE_DIR, with the
+# same layout, and the unit runs the copy.
+LIVE_DIR = Path('/usr/local/lib/nvpcf-hook/live-check')
+LIVE_FILES = ('tests/check_hook_live.py', 'tests/check_egl.c', 'trace.sh', 'lib.sh', 'hook/nvpcf-hookctl')
 HOOKCTL = '/usr/local/lib/nvpcf-hook/nvpcf-hookctl'
 LOADER = '/usr/local/lib/nvpcf-hook/load-hook.sh'
 PATCH_SYMBOLS = ('RmDeferNvpcfNotifyIfIdle', 'RmReplayNvpcfNotify')
@@ -271,7 +283,8 @@ def report_events():
     pattern = re.compile(r'NVRM: loading|Initialized nvidia-drm|nvpcf-hook\.service|nvpcf_hook: |gdm\.service - '
                          r'|lactd\.service - |Reached target graphical\.target|New session \S+ of user')
     for line in journal('-b', '0', '-o', 'short-monotonic'):
-        if pattern.search(line):
+        # The check's own lines name nvpcf-hook.service too.
+        if pattern.search(line) and f' {LOG_ID}[' not in line:
             info(f'event: {line}')
 
 
@@ -471,6 +484,7 @@ def wake(gpu, user, before):
 
 
 def check(args, profile):
+    info(f'the check runs from {REPO}')
     report_boot()
     report_driver(args.boot_run)
     report_unit(args.boot_run)
@@ -493,16 +507,54 @@ def check(args, profile):
         wake(gpu, args.user, after)
 
 
-def remove_trigger():
+def disable_trigger():
+    """Remove the unit's link in graphical.target.wants, so that a crash or a
+    hang during the check does not run it again at the following boot. The
+    unit file stays until the end of the run: after a daemon-reload without
+    the file, systemd would load the running unit again with the default
+    KillMode, and a stop would then send SIGTERM to trace.sh too."""
     p = run(['systemctl', 'disable', '--no-reload', UNIT], timeout=30)
+    info(f'disabled {UNIT}, so that the check does not run again at the next boot'
+         + (f'; systemctl disable: {p.stderr.strip()}' if p.returncode else ''))
+
+
+def enable_trigger():
+    p = run(['systemctl', 'enable', '--no-reload', UNIT], timeout=30)
+    info(f'enabled {UNIT} again, so that the check runs at the next boot' if p.returncode == 0
+         else f'could not enable {UNIT} again: {p.stderr.strip()}')
+
+
+def remove_trigger():
     try:
         UNIT_PATH.unlink()
     except FileNotFoundError:
         pass
+    copy = REPO == LIVE_DIR
+    if copy:
+        shutil.rmtree(LIVE_DIR, ignore_errors=True)
     r = run(['systemctl', 'daemon-reload'], timeout=30)
-    info(f'removed {UNIT}, so the check does not run at the next boot'
-         + (f'; systemctl disable: {p.stderr.strip()}' if p.returncode else '')
+    info(f'removed {UNIT_PATH}' + (f' and {LIVE_DIR}' if copy else '')
          + (f'; systemctl daemon-reload: {r.stderr.strip()}' if r.returncode else ''))
+
+
+def end_boot_run(user, stopped):
+    """Send the result and remove the unit and the copy, or, when a signal
+    ended the check, enable the unit again, so that the check runs at the next
+    boot."""
+    if stopped is None:
+        text = (f'{len(failed)} of {len(passed) + len(failed)} checks failed.' if failed
+                else f'All {len(passed)} checks passed.')
+        try:
+            notify(user, text + ' journalctl -t nvpcf-hook-live-check shows the details.',
+                   'critical' if failed else 'normal')
+        except Stopped as e:
+            info(f'received {e} while it waited to send the notification')
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, signal.SIG_IGN)
+    if stopped is None:
+        remove_trigger()
+    else:
+        enable_trigger()
 
 
 def notify(user, text, urgency):
@@ -520,14 +572,27 @@ def notify(user, text, urgency):
 
 
 def schedule(user):
+    if REPO == LIVE_DIR:
+        sys.exit(f'run --at-next-boot from the repository; {LIVE_DIR} holds the copy that it installs')
+    for f in (HOOKCTL, LOADER):
+        if not os.access(f, os.X_OK):
+            sys.exit(f'{f} is missing; install the hook with install-hook.sh first')
+    shutil.rmtree(LIVE_DIR, ignore_errors=True)
+    for rel in LIVE_FILES:
+        src, dst = REPO / rel, LIVE_DIR / rel
+        for d in reversed(dst.relative_to(LIVE_DIR.parent).parents[:-1]):
+            (LIVE_DIR.parent / d).mkdir(exist_ok=True)
+            (LIVE_DIR.parent / d).chmod(0o755)
+        shutil.copyfile(src, dst)
+        dst.chmod(0o755 if os.access(src, os.X_OK) else 0o644)
     UNIT_PATH.write_text(f"""[Unit]
 Description=One run of nvidia-live-swap's check of nvpcf_hook after boot
 After=nvpcf-hook.service graphical.target
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/python3 -I -B {Path(__file__).resolve()} --boot-run --user {user}
-SyslogIdentifier=nvpcf-hook-live-check
+ExecStart=/usr/bin/python3 -I -B {LIVE_DIR / LIVE_FILES[0]} --boot-run --user {user}
+SyslogIdentifier={LOG_ID}
 KillMode=mixed
 
 [Install]
@@ -536,8 +601,8 @@ WantedBy=graphical.target
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
     subprocess.run(['systemctl', 'enable', UNIT], check=True)
     hook = run(['systemctl', 'is-enabled', 'nvpcf-hook.service']).stdout.strip()
-    print(f'{UNIT} runs the check once after the next boot; journalctl -t nvpcf-hook-live-check shows its output. '
-          f'nvpcf-hook.service, which the check expects to load the hook at boot, is {hook}.')
+    print(f'{UNIT} runs the copy in {LIVE_DIR} once after the next boot; journalctl -t nvpcf-hook-live-check '
+          f'shows its output. nvpcf-hook.service, which the check expects to load the hook at boot, is {hook}.')
 
 
 def main():
@@ -560,7 +625,7 @@ def main():
     stopped = None
     try:
         if args.boot_run:
-            remove_trigger()
+            disable_trigger()
         check(args, profile)
     except Stopped as e:
         stopped = str(e)
@@ -573,13 +638,8 @@ def main():
         info(f'{len(passed)} criteria passed and {len(failed)} failed')
         for text in failed:
             info(f'failed: {text}')
-        if args.boot_run and stopped is None:
-            if failed:
-                notify(args.user, f'{len(failed)} of {len(passed) + len(failed)} checks failed. '
-                                  'journalctl -t nvpcf-hook-live-check shows the details.', 'critical')
-            else:
-                notify(args.user, f'All {len(passed)} checks passed. '
-                                  'journalctl -t nvpcf-hook-live-check shows the details.', 'normal')
+        if args.boot_run:
+            end_boot_run(args.user, stopped)
 
 
 if __name__ == '__main__':

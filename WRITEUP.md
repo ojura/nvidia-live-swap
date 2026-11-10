@@ -784,6 +784,11 @@ accept the same IDs.
 is up, because a new driver version can need its archive. A unit runs it rather
 than `/etc/modules-load.d`, and `swap.sh` calls the loader directly rather than
 `modprobe`, because a plain `modprobe nvpcf_hook` lacks the build ID and fails.
+The unit gives the loader 15 minutes to finish. A oneshot unit has no start
+timeout by default, and `multi-user.target` waits for the units it wants, so a
+loader that hung would hold back `multi-user.target`, `graphical.target` and
+every unit ordered after them. The loader's longest run is a download, which
+curl ends after 600 seconds.
 
 ### install-hook.sh
 
@@ -1175,11 +1180,27 @@ the number of deliveries.
   suspends again within 90 seconds, that `requests_dispatched` grew by at
   least the `pending_requests` held before the wake, that the error counts are
   0, and that the kprobe is still armed. At the end it switches the profile
-  back, unless the profile is no longer Balanced. `--at-next-boot` installs
-  `nvpcf-hook-live-check.service`, which runs the check once after the next
-  boot, waits for the desktop user's login before it traces, and sends that
-  user a notification with the result. That run also fails when the loaded
-  core has patch 0001, when the loaded nvidia module differs from the
-  installed one, and when `nvpcf-hook.service` has not run. A run by hand on
-  2026-11-10 with the patched core and hook 0.1.2 passed its 12 criteria in
-  2 minutes 40 seconds.
+  back, unless the profile is no longer Balanced.
+
+  `--at-next-boot` copies the check and the files it runs, `tests/check_egl.c`,
+  `trace.sh`, `lib.sh` and `hook/nvpcf-hookctl`, to
+  `/usr/local/lib/nvpcf-hook/live-check`, owned by root. It installs
+  `nvpcf-hook-live-check.service`, which runs that copy after the next boot.
+  So the run at boot is the code that was scheduled, and root does not run
+  files that the desktop user can change. That run disables the unit first, so
+  that a crash or a hang during the check does not repeat it at the following
+  boot. It keeps the unit file until the end, because after a `daemon-reload`
+  without the file, systemd loads the running unit again with the default
+  `KillMode`, and a stop would send SIGTERM to `trace.sh` as well. It waits for
+  the desktop user's login before it waits for the hook, and sends that user a
+  notification with the result. Then it removes the unit and the copy. When a
+  signal ends the run, for example at a shutdown, it enables the unit again
+  instead, so that the check runs at the following boot. That run also fails
+  when the loaded core has patch 0001, when the loaded nvidia module differs
+  from the installed one, and when `nvpcf-hook.service` has not run. A run by
+  hand on 2026-11-10 with the patched core and hook 0.1.2 passed its 12
+  criteria in 2 minutes 40 seconds. Started through the unit on the same day,
+  the check ran from the copy, failed only the three criteria that need
+  Ubuntu's core and a boot, and removed the unit and the copy. Stopped with
+  `systemctl stop` during its trace, it left the tracing settings, the EC debug
+  lines and the profile as they were, and enabled the unit again.

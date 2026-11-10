@@ -289,9 +289,11 @@ after DKMS has built the modules, so the initramfs gets the patched copies.
    each kernel, with the commands in [Restoring Ubuntu's driver
    core](#restoring-ubuntus-driver-core).
 3. Run `sudo python3 -I -B tests/check_hook_live.py --at-next-boot`. This
-   installs a systemd unit that runs the check of the hook once after the next
-   boot. When the check ends, it sends the desktop user a notification with the
-   result, and `journalctl -t nvpcf-hook-live-check` shows its output.
+   copies the check to `/usr/local/lib/nvpcf-hook/live-check`, and installs a
+   systemd unit that runs the copy once after the next boot. When the check
+   ends, it sends the desktop user a notification with the result, and
+   `journalctl -t nvpcf-hook-live-check` shows its output. If a shutdown
+   interrupts the check, it runs again at the following boot.
 4. Reboot. Ubuntu's unchanged driver loads, and `nvpcf-hook.service` checks it
    and loads the hook.
 5. Read the result of the check, or run `sudo ./hook/nvpcf-hookctl status` and
