@@ -374,7 +374,7 @@ problem, the two patches, the measurements, and how each script and test works.
 It also describes two things about NVIDIA's 615.71.09 driver on this laptop
 that the repository does not fix: [other wakes of the
 GPU](WRITEUP.md#other-wakes-of-the-gpu), and a [resume from
-hibernation](WRITEUP.md#resume-from-hibernation) that fails.
+hibernation](WRITEUP.md#resume-from-hibernation) that failed.
 [hook/README.md](hook/README.md) describes nvpcf_hook's design and its checks.
 
 [pr1299]: https://github.com/NVIDIA/open-gpu-kernel-modules/pull/1299

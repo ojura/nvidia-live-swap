@@ -247,8 +247,10 @@ detaching fences. Such a change has not been written or tested.
 
 ## Resume from hibernation
 
-With 615.71.09 the laptop writes a hibernation image, but resuming from it
-fails. The repository does not fix this.
+With 615.71.09 the laptop writes a hibernation image. On 2026-11-10 the resume
+from it failed, because the boot kernel's initramfs held NVIDIA's modules.
+Since a rebuild later that day it does not hold them, and a resume has not run
+since then.
 
 UPower's `CriticalPowerAction` is `HybridSleep`, its default, so at 2% battery
 systemd starts a hybrid sleep: the kernel writes a hibernation image and then
@@ -269,9 +271,12 @@ PM: hibernation: resume failed (-5)
 
 The boot continued as a fresh boot, and the session in the image was lost. Two
 earlier hybrid sleeps with 615.71.09, on 2026-11-08 and 2026-11-09, left no
-image. Their kernel logs end after the filesystems were synced, and the battery
-was at 2% when they started. Whether the battery ran out while the image was
-being written is not determinable.
+image: the next boot logged `PM: Image not found (code -22)` both times. Their
+kernel logs end after the filesystems were synced, and the battery was at 2%
+when they started. In the hour before each of the three hybrid sleeps, the
+laptop drew about 50 to 60 W on battery, so 2% of its 88 Wh battery lasted
+about two minutes. Whether the battery ran out or the laptop was switched off
+while the image was being written is not determinable.
 
 Before the kernel that loaded the image hands over to the kernel in the image,
 it stops its own devices. `software_resume` first runs the PM notifiers with
@@ -290,13 +295,12 @@ refuses (`nv.c:4816-4826`), and the kernel abandons the resume. The notifier is
 the same in 615.78.08 and on the main branch of NVIDIA's
 open-gpu-kernel-modules repository on 2026-11-10.
 
-The callback only runs because the boot kernel has NVIDIA's driver loaded and
-the GPU initialized that early. 7.0.0-42's initramfs holds the five NVIDIA
+The callback only ran because the boot kernel had NVIDIA's driver loaded and
+the GPU initialized that early. 7.0.0-42's initramfs then held the five NVIDIA
 modules, for the reasons in the [build.sh](#buildsh) section: Ubuntu's
 initramfs hook copies the uncompressed `nvidia*.ko` files of `updates/dkms`,
-and DKMS built 7.0.0-42's modules uncompressed. The kernel log shows the driver
-loading and the resume attempt before the root filesystem is mounted.
-7.0.0-38's modules are compressed, and its initramfs holds none of them.
+and DKMS had built 7.0.0-42's modules uncompressed. The kernel log shows the
+driver loading and the resume attempt before the root filesystem is mounted.
 
 nvpcf_hook is not involved in the failure. It is not in the initramfs, so the
 boot kernel does not have it loaded. The image of 2026-11-10 was written with
@@ -311,15 +315,17 @@ the same error, the kernel abandoned the hibernation, the suspend that systemd
 tried next failed in the same way, and the laptop ran until the battery was
 empty.
 
-Two changes could make the resume work, and neither has been tried:
+Two changes could make the resume work:
 
 - Keep NVIDIA's modules out of the initramfs, so that the boot kernel does not
   bind the GPU. The built-in screen runs on the Intel GPU, so the disk
-  passphrase prompt does not need them there. The next DKMS build for 7.0.0-42
-  compresses the modules, and an initramfs update after it leaves them out, as
-  `build.sh` does. A new kernel can bring them back: DKMS built 7.0.0-42's
-  first modules uncompressed. A dpkg diversion of the hook keeps them out for
-  every kernel.
+  passphrase prompt does not need them there. This is the state since
+  2026-11-10: the DKMS rebuild for Ubuntu's driver core compressed 7.0.0-42's
+  modules, the initramfs update after it left them out, and both 7.0 images
+  still have the resume setting, `RESUME=UUID=` of the swap partition, in
+  `conf/conf.d/zz-resume-auto`. A new kernel can bring the modules back: DKMS
+  built 7.0.0-42's first modules uncompressed. A dpkg diversion of the hook
+  keeps them out for every kernel.
 - Patch `nv_pm_notifier` to treat `PM_RESTORE_PREPARE` as it treats
   `PM_HIBERNATION_PREPARE`, and `PM_POST_RESTORE` as it treats
   `PM_POST_HIBERNATION`. The second event matters when the resume fails for
@@ -327,8 +333,12 @@ Two changes could make the resume work, and neither has been tried:
   GPU. This changes NVIDIA's kernel-open source, which `build.sh` does not
   patch today.
 
-Either change needs a deliberate hibernation and resume as its test, and a
-failed test loses the running session.
+The next hybrid sleep at low battery tests the first change, if its image
+write finishes and the battery runs out before the charger is connected. A
+failed restore then loses only the session that the empty battery would end
+anyway. With the charger connected in time, the laptop resumes from RAM, and
+the restore does not run. At UPower's `PercentageAction` of 2%, two of the
+three image writes above did not finish.
 
 ## Scripts
 
@@ -652,10 +662,11 @@ modules from before the rebuild.
 
 DKMS compresses a kernel's modules with zstd when that kernel's `modules.dep`
 lists compressed modules at build time (`/usr/sbin/dkms`, lines 218-227), and
-the hook skips compressed files. On the Legion, the 7.0.0-42 initramfs holds
-the five nvidia modules, which DKMS built uncompressed, and the 7.0.0-38
-initramfs holds none, because DKMS compressed them. `build.sh` updates every
-image either way, so that each matches the installed files.
+the hook skips compressed files. On the Legion, DKMS built the first 7.0.0-42
+modules uncompressed, and that kernel's initramfs held the five nvidia modules.
+The rebuild for Ubuntu's driver core on 2026-11-10 built them compressed, like
+7.0.0-38's, and since then neither 7.0 initramfs holds an nvidia module. `build.sh` updates every image either way, so that each matches the
+installed files.
 
 `build.sh` runs `update-initramfs -u -k <kernel>` for each kernel whose
 `/boot/initrd.img-<kernel>` exists, right after that kernel's `dkms install`.
