@@ -33,13 +33,15 @@ There are two ways to install the fix:
   also guards NVIDIA's shutdown of the GPU against a hang described in
   [Limitations](#limitations).
 
-nvpcf_hook is experimental. Version 0.1.1 passes the automated tests and builds
-for kernels 6.8.0-147, 7.0.0-34 and 7.0.0-38, but has not been loaded into a
-running kernel. Live tests of idle deferral, delivery after a wake, detach and
-resume, system suspend and recovery, and operation with Ubuntu's unpatched
-driver core remain incomplete. During testing, install with `--no-enable` and
-load the hook by hand. Leave the existing driver-core patch in place for the
-initial tests.
+nvpcf_hook is experimental. Version 0.1.2 passes the automated tests and builds
+for kernels 6.8.0-149, 7.0.0-38 and 7.0.0-42. On the Legion, with the patched
+driver core also loaded, it has held the messages while the GPU slept, passed
+them on after a wake, and gone through `detach` and `resume` twice. It has not
+been tested with Ubuntu's unchanged driver core, which is the case it is for,
+and not with loading at boot, a reboot or a resume from hibernation.
+[hook/README.md](hook/README.md#tests-on-the-gpu) lists the tests that have
+run. Until the remaining ones pass, install with `--no-enable`, load the hook by
+hand, and keep the patched driver core.
 
 nvpcf_hook supports only the Legion 7 16IRX9 configuration that
 [hook/README.md](hook/README.md#supported-pci-configuration) specifies: DMI
@@ -351,6 +353,10 @@ these commands, the next boot loads the modules without the fix.
 
 [WRITEUP.md](WRITEUP.md) describes the firmware and driver code behind the
 problem, the two patches, the measurements, and how each script and test works.
+It also describes two things about NVIDIA's 615.71.09 driver on this laptop
+that the repository does not fix: [other wakes of the
+GPU](WRITEUP.md#other-wakes-of-the-gpu), and a [resume from
+hibernation](WRITEUP.md#resume-from-hibernation) that fails.
 [hook/README.md](hook/README.md) describes nvpcf_hook's design and its checks.
 
 [pr1299]: https://github.com/NVIDIA/open-gpu-kernel-modules/pull/1299

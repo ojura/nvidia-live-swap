@@ -65,7 +65,7 @@ modes keep the existing notification path.
 ## Measurements
 
 All measurements are from the Legion 7 16IRX9 in the `balanced` profile. Each of
-the following three entries is a one-minute trace of the EC queries, the
+the following four entries is a one-minute trace of the EC queries, the
 notifications and the GPU's power state.
 
 - Unpatched 595.91.07: two of the eight notifications take 2.0 and 2.1 seconds.
@@ -77,6 +77,10 @@ notifications and the GPU's power state.
 - 615.71.09 with both patches: the EC raises query 0x48 every 6.98 seconds, and
   the nine notifications take 10 to 29 microseconds each. Once the GPU is
   asleep, it stays asleep through the remaining four queries of the trace.
+- 615.71.09 with both patches and nvpcf_hook 0.1.2: the EC raises query 0x48
+  every 6.97 seconds, and the hook's replacement for the handler takes 5 to 11
+  microseconds for each of the nine notifications. The GPU is asleep through
+  the whole trace, and the hook holds all nine.
 
 A swap from the unpatched 595.99.02 to 595.99.02 with patch 0001 takes 6.7
 seconds. A swap from that build to 615.71.09 with both patches takes 6.8
@@ -88,6 +92,47 @@ During the second of the two 615.71.09 swaps, rtkit-daemon refuses four of
 mutter's requests, and mutter reads the state of the reloaded display device
 with its KMS thread still real-time. The 20-second wait in `swap.sh` prevents
 this case.
+
+## Other wakes of the GPU
+
+The fix removes one cause of wakes, the NVPCF notification. Two other things
+decide how long the GPU is awake, and neither the patches nor nvpcf_hook
+change them.
+
+After a wake, the GPU stays awake for a while. In the tests of 2026-11-10 with
+nvpcf_hook 0.1.2 and the patched core, it went back to sleep 20 seconds after
+it became active in `performance`, where the EC does not raise query 0x48, and
+20 to 55 seconds after it became active in `balanced`. The difference fits
+how NVIDIA's driver detects idleness. It declares the GPU idle only after two
+idle checks, five seconds apart, have both found it unused, and any use in
+between starts the wait again
+(`src/nvidia/arch/nvalloc/unix/src/dynamic-power.c:106`, `1497-1532` and
+`1542-1610` in 615.71.09). A notification that is delivered while the GPU is
+awake counts as use: NVIDIA's handler takes a power reference for the dispatch,
+and so does the hook.
+
+The firmware also notifies the GPU's own ACPI device, `\_SB.PC00.PEG1.PEGP`,
+and NVIDIA's driver wakes the GPU for each of these notifications. The handler
+is `nv_acpi_notify_event` (`kernel-open/nvidia/nv-acpi.c:251-281`). The driver
+installs it on that device when it binds the GPU, and it calls `rm_acpi_notify`
+in the driver core. On 2026-11-10, a stack trace of the kernel's `rpm_resume`
+event for the GPU showed this path for the wake that follows a switch of the
+platform profile: `acpi_ev_notify_dispatch`, `nv_acpi_notify_event`,
+`rm_acpi_notify`, `RmUnixRmApiPrologue`, `os_ref_dynamic_power`,
+`nv_indicate_not_idle`. Each switch between `balanced` and `performance` woke
+the GPU once. In the firmware's SSDT4 and DSDT tables, several methods send
+such notifications: `SSFM`, which sets the profile, sends 0xC0, and the EC
+query methods `_Q0E` and `_Q1D` send 0xD1 and 0xD1 to 0xD5.
+
+On 2026-11-09, with nvpcf_hook 0.1.1 loaded, the GPU was awake at every NVPCF
+notification from 19:50:47, when the charger was plugged in, until the laptop
+suspended at 22:58. The hook logged a failed delivery, the defect of 0.1.1, for
+nearly every notification in that time, and it attempts a delivery only while
+the GPU is awake. The logs do not show what kept the GPU awake. Repeated
+notifications to the GPU's device are one possible cause, and a program that
+used the GPU is another. `trace.sh` does not record why the GPU wakes. The
+stack trace above came from the `rpm_resume` event with a `stacktrace` trigger,
+filtered to the GPU, in a separate tracing instance.
 
 ## Old firmware package during a version change
 
@@ -199,6 +244,91 @@ to cover fences that exist before the unload begins or are created while it
 runs, and signaled fences, which keep their references. It has to work on the
 6.8 and 7.0.0-34 kernels as well, whose headers lack 7.0.0-38's rules for
 detaching fences. Such a change has not been written or tested.
+
+## Resume from hibernation
+
+With 615.71.09 the laptop writes a hibernation image, but resuming from it
+fails. The repository does not fix this.
+
+UPower's `CriticalPowerAction` is `HybridSleep`, its default, so at 2% battery
+systemd starts a hybrid sleep: the kernel writes a hibernation image and then
+suspends to RAM. If the battery runs out during the suspend, the next boot
+finds the image and tries to resume from it.
+
+On 2026-11-10 that resume failed. The boot kernel loaded the image and then
+gave it up:
+
+```
+PM: Image successfully loaded
+NVRM: GPU 0000:01:00.0: PreserveVideoMemoryAllocations module parameter is set. System Power Management attempted without driver procfs suspend interface. [...]
+nvidia 0000:01:00.0: PM: pci_pm_freeze(): nv_pmops_freeze [nvidia] returns -5
+nvidia 0000:01:00.0: PM: failed to quiesce async: error -5
+PM: hibernation: Failed to load image, recovering.
+PM: hibernation: resume failed (-5)
+```
+
+The boot continued as a fresh boot, and the session in the image was lost. Two
+earlier hybrid sleeps with 615.71.09, on 2026-11-08 and 2026-11-09, left no
+image. Their kernel logs end after the filesystems were synced, and the battery
+was at 2% when they started. Whether the battery ran out while the image was
+being written is not determinable.
+
+Before the kernel that loaded the image hands over to the kernel in the image,
+it stops its own devices. `software_resume` first runs the PM notifiers with
+`PM_RESTORE_PREPARE`, and `hibernation_restore` then calls every driver's
+`freeze` callback (`kernel/power/hibernate.c:1080` and `599` in Ubuntu's
+7.0.0-42 kernel). NVIDIA's driver saves and suspends the GPU from its PM
+notifier when `NVreg_UseKernelSuspendNotifiers` is 1, which is the default in
+615.71.09 (`nv-reg.h:1101`; in 595.99.02 the default is 0). That notifier
+handles `PM_SUSPEND_PREPARE` and `PM_HIBERNATION_PREPARE`, but returns
+`NOTIFY_DONE` for `PM_RESTORE_PREPARE` (`nv.c:4630-4664`). So in the boot
+kernel the `freeze` callback, `nv_pmops_freeze` (`nv.c:5200-5212`), finds a GPU
+that the notifier has not suspended. With
+`NVreg_PreserveVideoMemoryAllocations=1`, which Ubuntu's
+`/etc/modprobe.d/nvidia-graphics-drivers-kms.conf` sets, `nvidia_suspend` then
+refuses (`nv.c:4816-4826`), and the kernel abandons the resume. The notifier is
+the same in 615.78.08 and on the main branch of NVIDIA's
+open-gpu-kernel-modules repository on 2026-11-10.
+
+The callback only runs because the boot kernel has NVIDIA's driver loaded and
+the GPU initialized that early. 7.0.0-42's initramfs holds the five NVIDIA
+modules, for the reasons in the [build.sh](#buildsh) section: Ubuntu's
+initramfs hook copies the uncompressed `nvidia*.ko` files of `updates/dkms`,
+and DKMS built 7.0.0-42's modules uncompressed. The kernel log shows the driver
+loading and the resume attempt before the root filesystem is mounted.
+7.0.0-38's modules are compressed, and its initramfs holds none of them.
+
+nvpcf_hook is not involved in the failure. It is not in the initramfs, so the
+boot kernel does not have it loaded. The image of 2026-11-10 was written with
+hook 0.1.1 loaded.
+
+With 595.99.02, the four hybrid sleeps in the retained kernel logs (2026-10-15
+to 2026-10-30) all failed earlier, in the running kernel. That driver suspends
+the GPU when `/usr/bin/nvidia-sleep.sh` writes to
+`/proc/driver/nvidia/suspend`, and NVIDIA's systemd units run that script for
+suspend and hibernate, but not for hybrid sleep. `nv_pmops_freeze` returned
+the same error, the kernel abandoned the hibernation, the suspend that systemd
+tried next failed in the same way, and the laptop ran until the battery was
+empty.
+
+Two changes could make the resume work, and neither has been tried:
+
+- Keep NVIDIA's modules out of the initramfs, so that the boot kernel does not
+  bind the GPU. The built-in screen runs on the Intel GPU, so the disk
+  passphrase prompt does not need them there. The next DKMS build for 7.0.0-42
+  compresses the modules, and an initramfs update after it leaves them out, as
+  `build.sh` does. A new kernel can bring them back: DKMS built 7.0.0-42's
+  first modules uncompressed. A dpkg diversion of the hook keeps them out for
+  every kernel.
+- Patch `nv_pm_notifier` to treat `PM_RESTORE_PREPARE` as it treats
+  `PM_HIBERNATION_PREPARE`, and `PM_POST_RESTORE` as it treats
+  `PM_POST_HIBERNATION`. The second event matters when the resume fails for
+  another reason: without it the boot kernel would continue with a suspended
+  GPU. This changes NVIDIA's kernel-open source, which `build.sh` does not
+  patch today.
+
+Either change needs a deliberate hibernation and resume as its test, and a
+failed test loses the running session.
 
 ## Scripts
 

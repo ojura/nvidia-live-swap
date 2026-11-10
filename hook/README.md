@@ -703,12 +703,38 @@ These tests have run on the Legion, all with the patched driver core
     resume.
   - UPower started a hybrid sleep at 2% battery, and the kernel wrote the
     hibernation image with the hook loaded. The later resume from that image
-    failed in the restore kernel, where the hook is not loaded: NVIDIA's
-    driver refused to freeze the GPU there.
+    failed in the boot kernel, where the hook is not loaded, for the reason in
+    [WRITEUP.md](../WRITEUP.md#resume-from-hibernation).
+- 0.1.2 on kernel 7.0.0-42, loaded on 2026-11-10:
+  - Install with `--no-enable` and load: `active`, and
+    `/sys/kernel/debug/kprobes/list` shows the probe on
+    `gpuNotifySubDeviceEvent_IMPL` without `[DISABLED]`.
+  - A 60-second `trace.sh` with the GPU suspended: nine firmware notifications
+    6.97 seconds apart, each handled in 5 to 11 microseconds. The GPU stayed
+    suspended, and the hook held all nine.
+  - A wake with `tests/check_egl.c`: the GPU was active after 2.0 seconds and
+    suspended again after 22.7 seconds, and the hook had then delivered all 27
+    requests it had received.
+  - `detach`, which removed the probe from the kprobe list, and `resume`,
+    after which the list showed it again without `[DISABLED]`. The next three
+    notifications were delivered and observed while the GPU was still awake,
+    and four more batches after a second wake.
+  - A second `detach` and `resume` and a third wake, with the same result. At
+    the end the hook had received 64 requests and delivered 64 in 36 batches,
+    with `dispatch_failures` and `observer_missed` at 0, and the kernel log
+    held only the hook's three `attached` lines.
 
-These tests have not run: 0.1.2 on the GPU, Ubuntu's unpatched driver core,
-loading at boot through `nvpcf-hook.service`, a reboot or poweroff with the
-hook attached, a resume from hibernation, and recovery after a failed swap,
-which cannot run while `swap.sh` refuses every swap. A patched core can hide an
-interception defect, so the unpatched core has to be tested before the patched
-core is given up.
+These tests have not run: Ubuntu's unpatched driver core, loading at boot
+through `nvpcf-hook.service`, a system suspend with 0.1.2, a reboot or poweroff
+with the hook attached, a resume from hibernation, and recovery after a failed
+swap, which cannot run while `swap.sh` refuses every swap. A patched core can
+hide an interception defect, so the unpatched core has to be tested before the
+patched core is given up.
+
+At a reboot or poweroff, NVIDIA's `nv_pci_shutdown` calls
+`nv_pci_remove_helper(pci_dev, false)`, which returns before it shuts the
+adapter down while the GPU's usage count is not zero
+(`kernel-open/nvidia/nv-pci.c:2799-2804` and `2965-2990` in 615.71.09). The
+hook's device reference is part of that count, so with the hook attached a
+reboot skips NVIDIA's adapter shutdown. This is read from the source and has
+not been observed.
